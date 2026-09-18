@@ -1,4 +1,4 @@
-COGITATOR deliverables
+Nanites-chat
 
 Files:
 - index.html
