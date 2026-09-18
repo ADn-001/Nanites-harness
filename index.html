@@ -268,6 +268,22 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
       <label>SOUL-MODEL</label>
       <select id="set-model"><option value="">— connect to fetch models —</option></select>
     </div>
+    <div class="field" id="profiles-ops">
+      <label>PROVIDER PROFILES — SAVED ENDPOINT PRESETS</label>
+      <div class="row">
+        <input id="prof-name" placeholder="Profile name (e.g. deepseek-tunnel)">
+      </div>
+      <div class="row">
+        <select id="prof-list" style="flex:1"><option value="">— saved profiles —</option></select>
+        <button class="tbtn" id="prof-load">LOAD</button>
+        <button class="tbtn" id="prof-del" style="color:var(--danger);border-color:rgba(255,59,59,.5)">&#10005; DELETE</button>
+      </div>
+      <button class="tbtn" id="prof-save" style="border-color:var(--phos);width:100%;margin-top:8px">&#10133; SAVE CURRENT AS PROFILE</button>
+      <div id="prof-result" style="font-size:10px;margin-top:4px;letter-spacing:.15em"></div>
+      <div style="font-size:9.5px;color:var(--phos-dim);letter-spacing:.12em;line-height:1.8;margin-top:6px">
+        A PROFILE SNAPSHOTS THE BACKEND RITE, ENDPOINT, AND SOUL-MODEL ABOVE. LOAD RESTORES THEM AND RE-FETCHES MODELS.
+      </div>
+    </div>
     <div class="field" id="lmstudio-ops" style="display:none">
       <label>LM STUDIO MODEL RITES (native /api/v1 — requires LM Studio 0.4+)</label>
       <div class="row">
@@ -362,9 +378,10 @@ const LS_CHATS='cogitator.chats', LS_SET='cogitator.settings', LS_ACTIVE='cogita
 const DEF_SETTINGS={endpoint:'',model:'',system:'',backend:'auto',
   temperature:0.7,topP:0.9,presence:0,frequency:0,ctxLimit:131072,compactAt:70,autoCompact:true,
   flashAttention:false,kvOffload:false,workdir:null,autoBridge:true,
-  agent:false,autoApproveRead:true,bridgePort:8931};
+  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:''};
 let settings={...DEF_SETTINGS};
 try{Object.assign(settings,JSON.parse(localStorage.getItem(LS_SET)||'{}'));}catch(e){}
+try{settings.profiles=(window.CogCore&&CogCore.profileStore)?CogCore.profileStore.list(localStorage):(settings.profiles||[]);}catch(e){}
 let chats=[]; try{chats=JSON.parse(localStorage.getItem(LS_CHATS)||'[]');}catch(e){}
 let activeId=localStorage.getItem(LS_ACTIVE)||null;
 let abortCtl=null, generating=false, sidebarOpen=false, backendType='unknown';
@@ -1053,8 +1070,49 @@ $('open-settings').onclick=()=>{
   $('set-freq').value=settings.frequency;$('freq-val').textContent=settings.frequency;
   $('test-result').textContent='';
   refreshWorkdirUI();refreshBridgeChip();
+  refreshProfileList();
   $('settings-modal').classList.add('open');
   testConnection(true);
+};
+/* ================= PROFILE OPS ================= */
+function refreshProfileList(){
+  const sel=$('prof-list');if(!sel)return;
+  sel.innerHTML='';
+  const profs=(window.CogCore&&CogCore.profileStore)?CogCore.profileStore.list(localStorage):(settings.profiles||[]);
+  for(const p of profs){
+    const opt=document.createElement('option');
+    opt.value=p.id;opt.textContent=p.name+(p.id===settings.activeProfile?' (ACTIVE)':'');
+    sel.appendChild(opt);
+  }
+}
+$('prof-save').onclick=()=>{
+  const name=($('prof-name').value||'').trim()||'UNNAMED PROFILE';
+  const rec=CogCore.profileStore.save(localStorage,{
+    id:settings.activeProfile||undefined,
+    name:name,backend:$('set-backend').value,endpoint:$('set-endpoint').value,model:$('set-model').value
+  });
+  settings.activeProfile=rec.id;saveSet();
+  refreshProfileList();
+  $('prof-result').innerHTML='<span style="color:var(--phos)">&#10003; PROFILE INSCRIBED: '+esc(name)+'</span>';
+};
+$('prof-load').onclick=()=>{
+  const id=$('prof-list').value;if(!id)return;
+  const p=CogCore.profileStore.apply(localStorage,id);if(!p)return;
+  $('set-endpoint').value=p.endpoint;
+  $('set-backend').value=p.backend;
+  $('set-model').value=p.model||'';
+  settings.activeProfile=p.id;
+  settings.endpoint=p.endpoint;settings.backend=p.backend;settings.model=p.model;
+  saveSet();refreshProfileList();
+  $('prof-result').innerHTML='<span style="color:var(--phos-dim)">LOADED: '+esc(p.name)+' &#8594; '+esc(p.endpoint)+(p.model?' / '+esc(p.model):'')+'</span>';
+  testConnection(true);
+};
+$('prof-del').onclick=()=>{
+  const id=$('prof-list').value;if(!id)return;
+  CogCore.profileStore.remove(localStorage,id);
+  if(settings.activeProfile===id){settings.activeProfile='';settings.endpoint='';settings.backend='auto';settings.model='';}
+  saveSet();refreshProfileList();
+  $('prof-result').innerHTML='<span style="color:var(--phos-dim)">PROFILE PURGED.</span>';
 };
 $('set-temp').oninput=e=>$('temp-val').textContent=e.target.value;
 $('set-topp').oninput=e=>$('topp-val').textContent=e.target.value;

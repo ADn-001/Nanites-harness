@@ -64,10 +64,11 @@ function fakeStorage() {
  * If a URL is not in routes, fetch rejects with a TypeError (network-failure behaviour) so the
  * app's error handling exercises the real code path.
  */
-function launchApp({ url = 'http://localhost:8080/index.html', routes = {} } = {}) {
+function launchApp({ url = 'http://localhost:8080/index.html', routes = {}, seed = null } = {}) {
   const html = inlineAppcore(fs.readFileSync(INDEX_HTML, 'utf8'));
   const events = [];
   const storage = fakeStorage();
+  if (seed) storage._seed(seed);
   const bootErrors = [];
 
   const dom = new JSDOM(html, {
@@ -83,7 +84,11 @@ function launchApp({ url = 'http://localhost:8080/index.html', routes = {} } = {
         const key = typeof input === 'string' ? input : (input && input.url) || String(input);
         const method = ((init && init.method) || 'GET').toUpperCase();
         events.push({ url: key, method: method, body: init && init.body ? String(init.body) : null });
-        const hit = routes[key];
+        // Match mocks keyed by pathname (e.g. '/v1/models') regardless of host, so
+        // path-keyed route tables work with absolute or relative fetch URLs.
+        let pathname = key;
+        try { pathname = new URL(key, url).pathname; } catch (e) { pathname = key; }
+        const hit = routes[pathname] !== undefined ? routes[pathname] : routes[key];
         if (typeof hit === 'function') return hit({ url: key, method, body: init && init.body });
         if (hit) return Promise.resolve({
           ok: hit.status ? hit.status < 400 : true,
