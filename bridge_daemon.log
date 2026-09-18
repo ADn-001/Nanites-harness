@@ -9,3 +9,11 @@
 [2026-09-18 06:21:27] foreign bridge.py in /tmp/cogwd2-yu0npp89 backed up to /tmp/cogwd2-yu0npp89/bridge.py.cogitator-bak (never destroyed)
 [2026-09-18 06:21:27] wrote bridge.py -> /tmp/cogwd2-yu0npp89/bridge.py
 [2026-09-18 06:21:27] daemon shut down
+[2026-09-18 12:55:07] daemon listening on http://127.0.0.1:18930
+[2026-09-18 12:55:07] wrote bridge.py -> /tmp/cogwd1-0y7wgb0g/bridge.py
+[2026-09-18 12:55:07] bridge worker spawned (pid 653258) in /tmp/cogwd1-0y7wgb0g
+[2026-09-18 12:55:08] bridge worker stopped
+[2026-09-18 12:55:08] removed managed bridge.py from old workdir: /tmp/cogwd1-0y7wgb0g
+[2026-09-18 12:55:08] foreign bridge.py in /tmp/cogwd2-d9i56d2n backed up to /tmp/cogwd2-d9i56d2n/bridge.py.cogitator-bak (never destroyed)
+[2026-09-18 12:55:08] wrote bridge.py -> /tmp/cogwd2-d9i56d2n/bridge.py
+[2026-09-18 12:55:08] daemon shut down

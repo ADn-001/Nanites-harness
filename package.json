@@ -1,21 +1,18 @@
 {
   "name": "nanites-harness",
   "version": "1.0.0",
-  "description": "",
+  "description": "COGITATOR — WH40K-styled local chat frontend with a tool bridge.",
+  "type": "commonjs",
   "main": "sw.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test:front": "node tests/frontend/run.js",
+    "test:py": "python3 test_e2e.py",
+    "test": "npm run test:front && npm run test:py"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ADn-001/Nanites-harness.git"
   },
-  "keywords": [],
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/ADn-001/Nanites-harness/issues"
-  },
-  "homepage": "https://github.com/ADn-001/Nanites-harness#readme",
   "dependencies": {
     "jsdom": "^30.1.0"
   }
