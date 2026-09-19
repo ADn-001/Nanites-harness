@@ -56,25 +56,69 @@ Plan ref: `PLAN.md` Phase 1
 ---
 
 ## Phase 2 — Agentic system prompt + workdir context
-Status: **NOT STARTED**
+Status: **DONE**
 Plan ref: `PLAN.md` Phase 2
 
+- [x] 2.1 `appcore.js`: `buildAgentSystemPrompt({workdir})` — short, precise, cheap for small
+      contexts; states bridge jail = workdir, all paths relative to it, `list_dir(".")` = workdir
+      contents, absolute host paths refused.
+- [x] 2.2 `appcore.js`: `buildSystemMessages({system, summary, workdirCtx})` — inserts agent prompt
+      + `[WORKDIR CONTEXT]` system block (path + fresh listing) when agent mode on.
+- [x] 2.3 Frontend `buildMessages()`: refresh workdir listing from bridge `list_dir(".")` at
+      send/agent-turn time; inject path + listing. Code fix for the folder-read bug.
+- [x] 2.4 E2E `tests/frontend/phase2_sysprompt.test.js` green (0 failures); phase0+phase1+python
+      regression green.
+
 ### info to know (Phase 2)
-- (filled at gate)
+- **Gate was RED on pickup, implementation already scaffolded.** `appcore.js` already had
+  `buildAgentSystemPrompt` and `buildSystemMessages` (unit-level), and `index.html` already had
+  `getWorkdirListing()` (line 533), `buildMessages()` (line 542), `runAgentLoop` + agent-mode
+  tool injection in `callOpenAI` (line 726: `body.tools=TOOL_SCHEMAS;body.tool_choice='auto'`),
+  and the `stream()` → `runAgentLoop` vs single call dispatch. The phase2 test file was also
+  already written. Nothing was implemented from scratch this cycle — the only blocker was a
+  syntax error that prevented the inline script from parsing at all.
+- **Root cause (syntax error):** `index.html` line 536, the `getWorkdirListing()` fetch call,
+  had an extra `}` in the closing brace/paren sequence — `}}})});` (4 braces + 2 parens) instead
+  of `}}}` `)` `}` `)` `;` (3 braces + 2 parens). Specifically, after `path:'.'` the ending was
+  `}` `}` `}` `)` `}` `)` `;` instead of `}` `}` `)` `}` `)` `;`. The extra `}` prematurely
+  closed the fetch options object, causing `SyntaxError: missing ) after argument list` which
+  broke the ENTIRE inline `<script>` — Phase 0 smoke, Phase 1 save/load, and Phase 2 agent
+  payload all failed at boot because the script couldn't parse.
+- **Fix:** removed the single extra `}` from line 536. Verified balanced: braces 4 open /
+  4 close, parens 4 open / 4 close. All suites green after fix.
+- **`buildMessages()` flow (index.html:542):** calls `getWorkdirListing()` (fetches
+  `list_dir` with `path:"."` from bridge at `bridgePort||8931`) only when
+  `settings.agent && settings.workdir`. Passes `{path: settings.workdir, listing: <result>}`
+  as `workdirCtx` to `CogCore.buildSystemMessages()`. In non-agent mode, `settings.system`
+  (user canticle) is passed directly — no workdir block, no tools, no orient prompt.
+- **`callOpenAI` (index.html:726):** already checks `settings.agent` and sets
+  `body.tools=TOOL_SCHEMAS;body.tool_choice='auto'`. No change needed.
 
 ---
 
 ## Phase 3 — Attachments
-Status: **NOT STARTED**
+Status: **DONE**
 Plan ref: `PLAN.md` Phase 3
 
+- [x] 3.1 Composer `[+]` ATTACH menu (file / image / folder / "from workdir") wired to hidden inputs.
+- [x] 3.2 Attachment chips row `#attach-chips` above the textarea with a per-chip remove (×).
+- [x] 3.3 Text files/folders inlined as fenced, path-labelled blocks (`<ATTACHMENT [name]>` + code fence) with a 20k-char cap and binary skip.
+- [x] 3.4 Images attached as multimodal `image_url` data-URL parts in a `content` array; `tok()`/`contentText()`/`autoTitle`/renderer all handle array content.
+- [x] 3.5 "From workdir" picker: bridge `list_dir` lists root files, picking one `read_file`s it and attaches it.
+- [x] 3.6 E2E `tests/frontend/phase3_attachments.test.js` green (0 failures); phases 0-2 + python regression green.
+
 ### info to know (Phase 3)
-- (filled at gate)
+- **jsdom ships working `File`/`FileReader`/`Blob`, including `readAsDataURL`** — the e2e drives the real code path by constructing `new app.window.File([...], 'x.png', {type})` and passing it to the window-scoped `attachFiles()`. No special stubbing needed for file reading.
+- **Function-valued fetch routes must return a Response-LIKE object** (`{ok,status,json:async()=>...}`). The harness `helpers.js` wraps only the *object* form of a route into a `Response`; a function route's return value is used verbatim, so returning `{json: <plain data>}` makes `r.json` "not a function" at runtime and the picker shows `r.json is not a function` in its error line.
+- **A closed jsdom window still returns stale DOM nodes.** Reusing one `getElementById` helper (`$a`) across separate `launchApp()` instances silently drives the *previous, closed* app: `send()` fires on the old app and its POST lands in the OLD app's `events`, so the NEW app's `events` looks empty. Make a fresh helper per app.
+- **Cap marker is deliberately long** (`[\n… TRUNCATED — …]`, ~65 chars). The test's length bound stays generous (`<= 100`) — assert truncation *happens* (length < input) and a `TRUNCATED` marker, not an exact size.
+- Agent mode passes array `content` straight into `messages` (no change needed in `buildMessages` since it forwards `content` verbatim); `tok()` was taught to sum array text parts + a flat 85-token image cost so the context gauge/budget stay sane.
+- Attachments are ephemeral (cleared on send); they are not persisted into the chat message beyond the built `content`, matching the plan.
 
 ---
 
 ## Phase 4 — Integration close-out
-Status: **NOT STARTED**
+Status: **PENDING (next agent)**
 Plan ref: `PLAN.md` Phase 4
 
 ### info to know (Phase 4)

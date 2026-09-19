@@ -29,9 +29,145 @@
         .replace(/"/g, '&quot;');
     },
 
-    /** Rough token estimate used by the context gauge (4 chars ~ 1 token). */
+    /**
+     * Rough token estimate used by the context gauge (4 chars ~ 1 token).
+     * Accepts a plain string OR a multimodal content array (attachment messages):
+     * for arrays it sums the visible text parts and counts images as a fixed cost.
+     */
     tok: function (s) {
+      if (Array.isArray(s)) {
+        var total = 0, imgs = 0;
+        for (var i = 0; i < s.length; i++) {
+          var p = s[i] || {};
+          if (p.type === 'image_url') imgs++;
+          else total += String(p.text == null ? '' : p.text).length;
+        }
+        return Math.max(1, Math.ceil(total / 4) + imgs * 85);
+      }
       return Math.max(1, Math.ceil((s == null ? '' : String(s)).length / 4));
+    },
+
+    /** True when the file name looks like a raster image (by extension). */
+    isImageName: function (name) {
+      return /\.(png|jpe?g|gif|webp|bmp|svg|avif|ico|heic)$/i.test(String(name || ''));
+    },
+
+    /** Cheap binary sniff: NUL bytes (or the Unicode replacement char) mean the
+     *  decoded text is not a UTF-8 text file the model should be shown. */
+    looksBinary: function (text) {
+      var s = text == null ? '' : String(text);
+      return s.indexOf('\x00') !== -1 || s.indexOf('\uFFFD') !== -1 && /[\uFFFD]/.test(s);
+    },
+
+    /** Truncate an inlined text attachment to `cap` chars, marking the cut. */
+    capText: function (text, cap) {
+      var s = text == null ? '' : String(text);
+      var c = cap && cap > 0 ? cap : 20000;
+      if (s.length <= c) return s;
+      return s.slice(0, c) + '[\n… TRUNCATED — FILE TOO LARGE TO EMBED FULLY, REFER TO THE WORKDIR]';
+    },
+
+    /**
+     * Build one labelled, fenced block for a text attachment:
+     *   <ATTACHMENT [src/app.py]>
+     *   ```
+     *   <content>
+     *   ```
+     * Returns null when the attachment should be skipped (binary, or a kind we
+     * don't inline) so the caller can drop it from the message.
+     */
+    attachmentBlock: function (att, cap) {
+      att = att || {};
+      if (att.kind === 'image') return null; // handled as image_url, not inlined text
+      var content = att.data == null ? '' : String(att.data);
+      // non-image but binary-by-content OR binary file name we refuse to inline
+      if (CogCore.looksBinary('' + content)) return null;
+      var body = CogCore.capText(content, cap);
+      return '<ATTACHMENT [' + (att.name || 'file') + ']>\n```\n' + body + '\n```';
+    },
+
+    /**
+     * Compose the `content` for a user message given a prompt and attachments.
+     *   opts.text   the prompt text the operator typed
+     *   opts.files  [{name, kind:'text'|'image', data}]  (data = text or data URL)
+     *   opts.cap    max chars to inline per text attachment (default 20000)
+     * Returns a plain string when there are no files (message unchanged), else a
+     * multimodal array: [ {type:'text',text:prompt}, ...{type:'text',text:block}
+     * (skipping binary), {type:'image_url',image_url:{url}} ].
+     */
+    buildAttachmentContent: function (opts) {
+      opts = opts || {};
+      var files = Array.isArray(opts.files) ? opts.files : [];
+      var text = opts.text == null ? '' : String(opts.text);
+      var cap = opts.cap;
+      if (!files.length) return text;
+      var out = [{ type: 'text', text: text }];
+      for (var i = 0; i < files.length; i++) {
+        var f = files[i] || {};
+        if (f.kind === 'image') {
+          out.push({ type: 'image_url', image_url: { url: f.data || '' } });
+        } else {
+          var block = CogCore.attachmentBlock(f, cap);
+          if (block !== null) out.push({ type: 'text', text: block });
+        }
+      }
+      return out;
+    },
+
+    /** Plain-text rendering of a message `content` (string or array) for the UI
+     *  and auto-title. Images render as a short marker, text parts joined. */
+    contentText: function (content) {
+      if (!Array.isArray(content)) return content == null ? '' : String(content);
+      return content.map(function (p) {
+        p = p || {};
+        if (p.type === 'image_url') return '[IMAGE]';
+        return p.text == null ? '' : String(p.text);
+      }).join('\n');
+    },
+
+    /**
+     * Agent-mode orient prompt. Deliberately SHORT: it must stay effective for
+     * both large- and small-context models. Jails the agent to one working
+     * directory and teaches it how to drive the tool loop. `opts.workdir` is the
+     * bound directory taken from the user's settings.
+     */
+    buildAgentSystemPrompt: function (opts) {
+      opts = opts || {};
+      var workdir = opts.workdir || '(the bound working directory)';
+      return [
+        'You are COGITATOR, an autonomous coding agent. You use a tool loop: emit tool calls, observe the results returned between turns, and keep going until the task is done.',
+        'FILESYSTEM JAIL: your ONLY reachable filesystem root is WORKDIR below. Every path you place in a tool argument MUST be project-RELATIVE to WORKDIR (e.g. "src/app.py", "readme.md", or "." for the root itself). You will never be handed host-absolute paths such as /home/..., /etc/passwd, or C:\\...; do not invent them. If a step genuinely requires a path outside the workdir, refuse and ask the user to remount.',
+        'WORKDIR: ' + workdir,
+        'TOOLS available this session: list_dir, grep, read_file, write_file, shell_exec, and clipboard access. Tool results are returned verbatim between turns. Prefer tools over prose; keep prose concise.',
+        'STOPPING: ask for help only when you are blocked, lack a capability, or need a clarification you cannot resolve from the workdir listing.'
+      ].join('\n');
+    },
+
+    /**
+     * Build the system-message prefix for a model request.
+     *   opts.system    base system string (agent orient prompt, or user canticle)
+     *   opts.summary   compressed transcript summary -> [PRIOR COMMUNION] block
+     *   opts.workdirCtx {path, listing} -> [WORKDIR CONTEXT] block (agent mode only)
+     */
+    buildSystemMessages: function (opts) {
+      opts = opts || {};
+      var msgs = [];
+      if (opts.system) msgs.push({ role: 'system', content: opts.system });
+      if (opts.summary) msgs.push({
+        role: 'system',
+        content: '[PRIOR COMMUNION — COMPRESSED RECORD. Treat as established fact, do not re-derive]: ' + opts.summary
+      });
+      if (opts.workdirCtx) {
+        var l = opts.workdirCtx.listing || '';
+        if (Array.isArray(l)) l = l.join('\n');
+        msgs.push({
+          role: 'system',
+          content: '[WORKDIR CONTEXT] Working directory (your ONLY reachable root):\n' +
+            opts.workdirCtx.path + '\n\nCurrent listing of "' + opts.workdirCtx.path + '":\n' +
+            (l || '(no listing available)')
+        });
+      }
+      return msgs;
     },
 
     /*
