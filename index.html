@@ -116,6 +116,18 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
 #compact-note{max-width:860px;margin:0 auto 10px;font-size:10.5px;color:var(--amber);letter-spacing:.15em;
   border:1px dashed rgba(255,179,71,.5);padding:6px 10px;display:flex;justify-content:space-between;gap:8px;align-items:center}
 #composer{max-width:860px;margin:0 auto;width:100%;padding:10px 14px 14px}
+#attach-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+#attach-chips .chip{display:inline-flex;align-items:center;gap:6px;background:rgba(0,0,0,.4);border:1px solid var(--phos-dim);color:var(--phos);font-size:11px;padding:4px 8px;border-radius:4px;letter-spacing:.05em;max-width:100%}
+#attach-chips .chip button{background:none;border:none;color:var(--danger);cursor:pointer;font-size:13px;line-height:1;padding:0 2px}
+#attach-chips .chip .chip-tag{color:var(--amber);font-size:9px;margin-left:4px}
+#attach-menu{display:flex;flex-direction:column;background:#0a0d10;border:1px solid var(--phos-dim);border-radius:4px;padding:4px;gap:2px;z-index:30}
+#attach-menu.hidden{display:none}
+#attach-menu button{background:none;border:none;color:var(--phos);text-align:left;font-size:11px;padding:6px 10px;letter-spacing:.1em;cursor:pointer}
+#attach-menu button:hover{background:var(--phos-dark);color:#fff}
+#wd-list{max-height:260px;overflow:auto;font-size:12px}
+#wd-list button{display:block;width:100%;text-align:left;background:none;border:none;border-bottom:1px solid rgba(255,255,255,.06);color:var(--phos);padding:7px 6px;letter-spacing:.05em;cursor:pointer}
+#wd-list button:hover{background:rgba(0,0,0,.35);color:#fff}
+#wd-list .wd-empty{color:var(--phos-dim);font-style:italic;letter-spacing:.08em}
 #input-wrap{border:1px solid var(--phos-dim);background:var(--panel);position:relative;
   box-shadow:inset 0 0 20px rgba(57,255,107,.06),0 0 18px rgba(57,255,107,.07)}
 #input-wrap:focus-within{box-shadow:inset 0 0 24px rgba(57,255,107,.1),var(--glow-soft)}
@@ -232,9 +244,20 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
     <div id="messages"></div>
 
     <div id="composer">
+      <div id="attach-chips"></div>
       <div id="input-wrap">
         <textarea id="ta" rows="1" placeholder="&gt; transmit query to the machine-spirit..._"></textarea>
         <div id="comp-row">
+          <button id="attach-btn" class="tbtn" title="ATTACH FILE / IMAGE / FOLDER / FROM WORKDIR" aria-label="Attach">&#10133;</button>
+          <div id="attach-menu" class="hidden">
+            <button id="ati-file" type="button">&#128196; ATTACH FILE</button>
+            <button id="ati-img" type="button">&#128444; ATTACH IMAGE</button>
+            <button id="ati-folder" type="button">&#128193; ATTACH FOLDER</button>
+            <button id="ati-wd" type="button">&#128448; FROM WORKDIR</button>
+          </div>
+          <input type="file" id="file-input" multiple style="display:none">
+          <input type="file" id="img-input" accept="image/*" multiple style="display:none">
+          <input type="file" id="folder-input" webkitdirectory multiple style="display:none">
           <span id="comp-hint">ENTER &rsaquo; SEND // SHIFT+ENTER &rsaquo; NEW LINE // ESC &rsaquo; HALT</span>
           <button id="stop-btn">&#9632; HALT</button>
           <button id="send-btn" aria-label="Send"><span class="send-txt">TRANSMIT &#9658;</span><span class="send-ico">&#10148;</span></button>
@@ -242,6 +265,17 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
       </div>
     </div>
   </main>
+</div>
+
+<div class="modal" id="wd-picker">
+  <div class="modal-box">
+    <h2>&#128448; SEIZE FROM THE WORKDIR</h2>
+    <div style="font-size:11px;color:var(--phos-dim);margin-bottom:8px;letter-spacing:.12em">SELECT A FILE — ITS CONTENTS ARE INLINED INTO THE NEXT MESSAGE</div>
+    <div id="wd-list"></div>
+    <div class="row" style="margin-top:10px;justify-content:flex-end">
+      <button class="tbtn" id="wd-close">CLOSE</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal" id="settings-modal">
@@ -267,6 +301,22 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
     <div class="field">
       <label>SOUL-MODEL</label>
       <select id="set-model"><option value="">— connect to fetch models —</option></select>
+    </div>
+    <div class="field" id="profiles-ops">
+      <label>PROVIDER PROFILES — SAVED ENDPOINT PRESETS</label>
+      <div class="row">
+        <input id="prof-name" placeholder="Profile name (e.g. deepseek-tunnel)">
+      </div>
+      <div class="row">
+        <select id="prof-list" style="flex:1"><option value="">— saved profiles —</option></select>
+        <button class="tbtn" id="prof-load">LOAD</button>
+        <button class="tbtn" id="prof-del" style="color:var(--danger);border-color:rgba(255,59,59,.5)">&#10005; DELETE</button>
+      </div>
+      <button class="tbtn" id="prof-save" style="border-color:var(--phos);width:100%;margin-top:8px">&#10133; SAVE CURRENT AS PROFILE</button>
+      <div id="prof-result" style="font-size:10px;margin-top:4px;letter-spacing:.15em"></div>
+      <div style="font-size:9.5px;color:var(--phos-dim);letter-spacing:.12em;line-height:1.8;margin-top:6px">
+        A PROFILE SNAPSHOTS THE BACKEND RITE, ENDPOINT, AND SOUL-MODEL ABOVE. LOAD RESTORES THEM AND RE-FETCHES MODELS.
+      </div>
     </div>
     <div class="field" id="lmstudio-ops" style="display:none">
       <label>LM STUDIO MODEL RITES (native /api/v1 — requires LM Studio 0.4+)</label>
@@ -354,6 +404,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
   </div>
 </div>
 
+<script src="appcore.js"></script>
 <script>
 "use strict";
 /* ================= STATE ================= */
@@ -361,9 +412,10 @@ const LS_CHATS='cogitator.chats', LS_SET='cogitator.settings', LS_ACTIVE='cogita
 const DEF_SETTINGS={endpoint:'',model:'',system:'',backend:'auto',
   temperature:0.7,topP:0.9,presence:0,frequency:0,ctxLimit:131072,compactAt:70,autoCompact:true,
   flashAttention:false,kvOffload:false,workdir:null,autoBridge:true,
-  agent:false,autoApproveRead:true,bridgePort:8931};
+  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:''};
 let settings={...DEF_SETTINGS};
 try{Object.assign(settings,JSON.parse(localStorage.getItem(LS_SET)||'{}'));}catch(e){}
+try{settings.profiles=(window.CogCore&&CogCore.profileStore)?CogCore.profileStore.list(localStorage):(settings.profiles||[]);}catch(e){}
 let chats=[]; try{chats=JSON.parse(localStorage.getItem(LS_CHATS)||'[]');}catch(e){}
 let activeId=localStorage.getItem(LS_ACTIVE)||null;
 let abortCtl=null, generating=false, sidebarOpen=false, backendType='unknown';
@@ -398,7 +450,7 @@ function deleteChat(id,ev){ev.stopPropagation();
 function clearActive(){const c=active();if(!c)return;if(!confirm('WIPE MESSAGES IN THIS LOG?'))return;
   c.messages=[];c.summary='';c.updated=Date.now();save();renderMessages();renderList();}
 function autoTitle(c){if(c.titled)return;const m=c.messages.find(m=>m.role==='user');
-  if(m){c.title=m.content.replace(/\s+/g,' ').trim().slice(0,42)+(m.content.length>42?'…':'');c.titled=true;}}
+  if(m){const t=CogCore.contentText(m.content);c.title=t.replace(/\s+/g,' ').trim().slice(0,42)+(t.length>42?'…':'');c.titled=true;}}
 
 /* ================= RENDER ================= */
 function renderList(){
@@ -444,7 +496,7 @@ function msgHTML(m,i){
     try{args=JSON.stringify(JSON.parse(args));}catch(e){}
     return `<div class="rite-call">&#9881; INVOKED RITE: ${esc(t.name||'unknown')} ${esc(args)}</div>`;
   }).join('');
-  const body=isUser||isTool?esc(m.content):renderMd(m.content);
+  const body=isUser||isTool?esc(CogCore.contentText(m.content)):renderMd(m.content);
   const msgs=active()?.messages||[];
   const caret=(generating&&i===msgs.length-1&&m.role==='assistant')?'<span class="caret"></span>':'';
   const acts=`<div class="acts">
@@ -512,11 +564,27 @@ function refreshLast(){const c=active();const box=$('messages');
 }
 
 /* ================= CONTEXT ASSEMBLY (with sacred summary + tool rites) ================= */
-function buildMessages(opts={}){
+async function getWorkdirListing(){
+  if(!settings.workdir)return null;
+  try{
+    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(8000),body:JSON.stringify({name:'list_dir',arguments:{path:'.'}})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false)return null;
+    return String(j.result??'');
+  }catch(e){return null;}
+}
+async function buildMessages(opts={}){
   const c=active();if(!c)return[];
-  const sys=[];
-  if(settings.system)sys.push({role:'system',content:settings.system});
-  if(c.summary)sys.push({role:'system',content:'[PRIOR COMMUNION — COMPRESSED RECORD. Treat as established fact, do not re-derive]: '+c.summary});
+  let workdirCtx=null;
+  if(settings.agent && settings.workdir){
+    const listing=await getWorkdirListing();
+    if(listing!==null)workdirCtx={path:settings.workdir,listing:listing};
+  }
+  const sys=CogCore.buildSystemMessages({
+    system: settings.agent ? CogCore.buildAgentSystemPrompt({workdir:settings.workdir||'(the bound working directory)'}) : settings.system,
+    summary: c.summary,
+    workdirCtx: workdirCtx
+  });
   const reserve=Math.ceil(settings.ctxLimit*0.25);
   let budget=settings.ctxLimit-reserve-sys.reduce((a,m)=>a+tok(m.content),0);
   let used=0,msgs=[];
@@ -886,7 +954,7 @@ function finalizeToolCalls(acc,msgIndex){
 async function runAgentLoop(c,m,sig){
   for(let iter=0;iter<12;iter++){
     if(sig.aborted)throw new DOMException('Aborted','AbortError');
-    const acc=await callModel(buildMessages({excludeLastAssistant:true}),opts(),false,sig);
+    const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
     m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=finalizeToolCalls(acc,m.ts||Date.now());
     m.ts=m.ts||Date.now();refreshLast();
     if(!m.toolCalls.length)return;
@@ -901,13 +969,82 @@ async function runAgentLoop(c,m,sig){
   }
   m.content=(m.content?m.content+'\n\n':'')+'[ AGENT RITE LIMIT REACHED — 12 INVOCATIONS WITHOUT FINAL DECREE ]';refreshLast();
 }
+/* ================= ATTACHMENTS (files / images / folders / from workdir) ================= */
+const ATTACH_CAP=20000;
+let attachments=[];
+async function readFileAs(f,as){
+  return new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;as==='data'?fr.readAsDataURL(f):fr.readAsText(f);});
+}
+function attachFiles(files,opts={}){
+  opts=opts||{};
+  const jobs=[];
+  for(const f of (files||[])){
+    if(CogCore.isImageName(f.name)){
+      jobs.push(readFileAs(f,'data').then(data=>attachments.push({id:CogCore.uid(),name:f.name,kind:'image',data,size:f.size})));
+    }else{
+      jobs.push(readFileAs(f,'text').then(text=>{
+        if(CogCore.looksBinary(text))return; // binary text: skip silently (don't inline)
+        attachments.push({id:CogCore.uid(),name:f.name,kind:'text',data:text,size:f.size,note:text.length>ATTACH_CAP?'TRUNCATED':''});
+      }));
+    }
+  }
+  return Promise.all(jobs).then(()=>{renderChips();});
+}
+function addAttachment(name,kind,data,note){
+  attachments.push({id:CogCore.uid(),name,kind,data,note:note||''});
+}
+function removeAttachment(id){
+  attachments=attachments.filter(a=>a.id!==id);renderChips();
+}
+function renderChips(){
+  const box=$('attach-chips');if(!box)return;
+  box.innerHTML=attachments.map(a=>{
+    const tag=a.kind==='image'?'<span class="chip-tag">IMG</span>':(a.note?'<span class="chip-tag">'+esc(a.note)+'</span>':'');
+    return `<span class="chip" data-id="${esc(a.id)}">${esc(a.name)}${tag}<button class="chip-x" title="remove">&#10005;</button></span>`;
+  }).join('');
+  box.querySelectorAll('.chip-x').forEach(b=>b.onclick=()=>removeAttachment(b.closest('.chip').dataset.id));
+}
+/* From-workdir picker: browse bridge list_dir, read selected via read_file. */
+function parseWorkingList(res){
+  const lines=String(res||'').split('\n');
+  const out=[];
+  for(const l of lines){const m=String(l).match(/^(\S)\s+(\S.*)$/);if(m)out.push({tag:m[1].trim(),name:m[2].trim()});}
+  return out.filter(e=>(e.tag==='f'||e.tag==='d'));
+}
+async function openWorkdirPicker(){
+  const list=$('wd-list');
+  if($('wd-picker'))$('wd-picker').classList.add('open');
+  list.innerHTML='<div class="wd-empty">SUMMONING THE ARCHIVE&hellip;</div>';
+  try{
+    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(8000),body:JSON.stringify({name:'list_dir',arguments:{path:'.'}})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false){list.innerHTML='<div class="wd-empty">&#10007; BRIDGE REFUSED THE LISTING</div>';return;}
+    const entries=parseWorkingList(String(j.result??'')).filter(e=>e.tag==='f');
+    if(!entries.length){list.innerHTML='<div class="wd-empty">NO FILES IN THE BOUND WORKDIR</div>';return;}
+    list.innerHTML=entries.map(e=>`<button type="button" class="wd-file" data-name="${esc(e.name)}">&#128196; ${esc(e.name)}</button>`).join('');
+    list.querySelectorAll('.wd-file').forEach(btn=>btn.onclick=async()=>{
+      const name=btn.dataset.name;
+      btn.disabled=true;btn.textContent='READING '+name+'&hellip;';
+      try{
+        const rr=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(8000),body:JSON.stringify({name:'read_file',arguments:{path:name}})});
+        const jj=await rr.json().catch(()=>({}));
+        if(!rr.ok||jj.ok===false){btn.disabled=false;btn.textContent='&#10007; READ REFUSED';return;}
+        addAttachment(name,'text',String(jj.result??''),(String(jj.result??'').length>ATTACH_CAP?'TRUNCATED':''));
+        renderChips();
+        $('wd-picker')?.classList.remove('open');
+      }catch(e){btn.disabled=false;btn.textContent='&#10007; '+esc(e.message||e);}
+    });
+  }catch(e){list.innerHTML='<div class="wd-empty">&#10007; '+esc(e.message||e)+'</div>';}
+}
 async function send(){
   if(generating)return;
-  const text=$('ta').value.trim();if(!text)return;
+  const text=$('ta').value.trim();if(!text&&!attachments.length)return;
   if(!active())newChat();
   const cur=active();
-  cur.messages.push({role:'user',content:text,ts:Date.now()});
+  const content=CogCore.buildAttachmentContent({text,files:attachments.map(a=>({name:a.name,kind:a.kind,data:a.data})),cap:ATTACH_CAP});
+  cur.messages.push({role:'user',content,ts:Date.now()});
   cur.updated=Date.now();
+  attachments=[];renderChips();
   if(cur.messages.filter(m=>m.role==='user').length===1)autoTitle(cur);
   $('ta').value='';autosize();save();renderList();renderMessages();
   await stream(cur,settings.agent);
@@ -921,7 +1058,7 @@ async function stream(c,agentMode=false){
   let m=c.messages[c.messages.length-1];
   try{
     if(agentMode)await runAgentLoop(c,m,sig);
-    else{const acc=await callModel(buildMessages({excludeLastAssistant:true}),opts(),false,sig);
+    else{const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
       m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=[];refreshLast();}
   }catch(e){m=c.messages[c.messages.length-1];
     if(e.name==='AbortError'){m.content+='\n\n[ TRANSMISSION HALTED BY OPERATOR ]';}
@@ -930,7 +1067,7 @@ async function stream(c,agentMode=false){
       if(currentBackend()==='lmstudio'){
         m.content+='\n[ ATTEMPTING SOUL-LOAD RITE... ]';refreshLast();
         try{const lr=await fetch(api('/api/v1/models/load'),{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(120000),body:JSON.stringify(loadBody())});
-          if(lr.ok){m.content='';m.thinking='';refreshLast();await callModel(buildMessages({excludeLastAssistant:true}),opts(),false,sig);m=c.messages[c.messages.length-1];}
+          if(lr.ok){m.content='';m.thinking='';refreshLast();await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);m=c.messages[c.messages.length-1];}
           else m.content+='\n[ SOUL-LOAD RITE REFUSED: HTTP '+lr.status+' ]';
         }catch(e2){m.content+='\n[ SOUL-LOAD RITE FAILED: '+(e2.message||e2)+' ]';}
       }
@@ -1023,6 +1160,18 @@ $('ta').addEventListener('keydown',e=>{
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}
   if(e.key==='Escape')halt();});
 $('send-btn').onclick=send;$('stop-btn').onclick=halt;
+/* ATTACHMENT wiring */
+$('attach-btn').onclick=e=>{e.stopPropagation();const m=$('attach-menu');const was=m.classList.contains('hidden');m.classList.toggle('hidden',!was);};
+document.addEventListener('click',e=>{const m=$('attach-menu');if(m&&e.target.id!=='attach-btn'&&!m.contains(e.target))m.classList.add('hidden');});
+$('ati-file').onclick=()=>{$('file-input').click();$('attach-menu').classList.add('hidden');};
+$('ati-img').onclick=()=>{$('img-input').click();$('attach-menu').classList.add('hidden');};
+$('ati-folder').onclick=()=>{$('folder-input').click();$('attach-menu').classList.add('hidden');};
+$('ati-wd').onclick=()=>{openWorkdirPicker();$('attach-menu').classList.add('hidden');};
+$('file-input').onchange=e=>{attachFiles(e.target.files).then(()=>{e.target.value='';});};
+$('img-input').onchange=e=>{attachFiles(e.target.files).then(()=>{e.target.value='';});};
+$('folder-input').onchange=e=>{attachFiles(e.target.files,{folder:true}).then(()=>{e.target.value='';});};
+$('wd-close').onclick=()=>{if($('wd-picker'))$('wd-picker').classList.remove('open');};
+$('wd-picker').onclick=e=>{if(e.target.id==='wd-picker')e.target.classList.remove('open');};
 $('new-chat').onclick=()=>newChat();
 $('search').oninput=renderList;
 $('clear-btn').onclick=clearActive;
@@ -1052,8 +1201,49 @@ $('open-settings').onclick=()=>{
   $('set-freq').value=settings.frequency;$('freq-val').textContent=settings.frequency;
   $('test-result').textContent='';
   refreshWorkdirUI();refreshBridgeChip();
+  refreshProfileList();
   $('settings-modal').classList.add('open');
   testConnection(true);
+};
+/* ================= PROFILE OPS ================= */
+function refreshProfileList(){
+  const sel=$('prof-list');if(!sel)return;
+  sel.innerHTML='';
+  const profs=(window.CogCore&&CogCore.profileStore)?CogCore.profileStore.list(localStorage):(settings.profiles||[]);
+  for(const p of profs){
+    const opt=document.createElement('option');
+    opt.value=p.id;opt.textContent=p.name+(p.id===settings.activeProfile?' (ACTIVE)':'');
+    sel.appendChild(opt);
+  }
+}
+$('prof-save').onclick=()=>{
+  const name=($('prof-name').value||'').trim()||'UNNAMED PROFILE';
+  const rec=CogCore.profileStore.save(localStorage,{
+    id:settings.activeProfile||undefined,
+    name:name,backend:$('set-backend').value,endpoint:$('set-endpoint').value,model:$('set-model').value
+  });
+  settings.activeProfile=rec.id;saveSet();
+  refreshProfileList();
+  $('prof-result').innerHTML='<span style="color:var(--phos)">&#10003; PROFILE INSCRIBED: '+esc(name)+'</span>';
+};
+$('prof-load').onclick=()=>{
+  const id=$('prof-list').value;if(!id)return;
+  const p=CogCore.profileStore.apply(localStorage,id);if(!p)return;
+  $('set-endpoint').value=p.endpoint;
+  $('set-backend').value=p.backend;
+  $('set-model').value=p.model||'';
+  settings.activeProfile=p.id;
+  settings.endpoint=p.endpoint;settings.backend=p.backend;settings.model=p.model;
+  saveSet();refreshProfileList();
+  $('prof-result').innerHTML='<span style="color:var(--phos-dim)">LOADED: '+esc(p.name)+' &#8594; '+esc(p.endpoint)+(p.model?' / '+esc(p.model):'')+'</span>';
+  testConnection(true);
+};
+$('prof-del').onclick=()=>{
+  const id=$('prof-list').value;if(!id)return;
+  CogCore.profileStore.remove(localStorage,id);
+  if(settings.activeProfile===id){settings.activeProfile='';settings.endpoint='';settings.backend='auto';settings.model='';}
+  saveSet();refreshProfileList();
+  $('prof-result').innerHTML='<span style="color:var(--phos-dim)">PROFILE PURGED.</span>';
 };
 $('set-temp').oninput=e=>$('temp-val').textContent=e.target.value;
 $('set-topp').oninput=e=>$('topp-val').textContent=e.target.value;
