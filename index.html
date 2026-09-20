@@ -296,6 +296,10 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
         <input id="set-endpoint" placeholder="https://xxxx.trycloudflare.com">
         <button class="tbtn" id="test-conn">TEST</button>
       </div>
+      <div class="row" style="margin-top:6px">
+        <input id="set-apikey" type="password" placeholder="API KEY (bearer, optional for OpenAI-compatible endpoints)">
+        <button class="tbtn" id="api-key-eye" title="show/hide API key">&nbsp;&#128065;&nbsp;</button>
+      </div>
       <div id="test-result" style="font-size:10px;margin-top:4px;letter-spacing:.15em"></div>
     </div>
     <div class="field">
@@ -412,7 +416,7 @@ const LS_CHATS='cogitator.chats', LS_SET='cogitator.settings', LS_ACTIVE='cogita
 const DEF_SETTINGS={endpoint:'',model:'',system:'',backend:'auto',
   temperature:0.7,topP:0.9,presence:0,frequency:0,ctxLimit:131072,compactAt:70,autoCompact:true,
   flashAttention:false,kvOffload:false,workdir:null,autoBridge:true,
-  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:''};
+  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:'',apiKey:''};
 let settings={...DEF_SETTINGS};
 try{Object.assign(settings,JSON.parse(localStorage.getItem(LS_SET)||'{}'));}catch(e){}
 try{settings.profiles=(window.CogCore&&CogCore.profileStore)?CogCore.profileStore.list(localStorage):(settings.profiles||[]);}catch(e){}
@@ -421,6 +425,7 @@ let activeId=localStorage.getItem(LS_ACTIVE)||null;
 let abortCtl=null, generating=false, sidebarOpen=false, backendType='unknown';
 const $=id=>document.getElementById(id);
 const api=path=>{let e=(settings.endpoint||'').trim().replace(/\/+$/,'');return e+path;};
+const authHeaders=()=>{const k=(settings.apiKey||'').trim();return k?{'Authorization':'Bearer '+k}:{};};
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const tok=s=>Math.max(1,Math.ceil((s||'').length/4));
 const fmtK=n=>n<1000?String(Math.round(n)):(n/1000).toFixed(1)+'k';
@@ -758,7 +763,7 @@ async function callModel(messages,options,nonStream,signal){
 async function callOpenAI(messages,options,nonStream,signal){
   const body={model:settings.model,messages,stream:!nonStream,...options};
   if(settings.agent){body.tools=TOOL_SCHEMAS;body.tool_choice='auto';}
-  const r=await fetch(api('/v1/chat/completions'),{method:'POST',headers:{'Content-Type':'application/json'},
+  const r=await fetch(api('/v1/chat/completions'),{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},
     signal:signal||undefined,body:JSON.stringify(body)});
   if(!r.ok)throw new Error('HTTP '+r.status);
   if(nonStream){
@@ -804,7 +809,7 @@ async function readSSE(body,m){
   m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=acc.toolCalls;
   return acc;
 }
-async function fetchLMSModels(){const r=await fetch(api('/api/v1/models'),{signal:apiSig()});
+async function fetchLMSModels(){const r=await fetch(api('/api/v1/models'),{signal:apiSig(),headers:authHeaders()});
   if(!r.ok)return null;const d=await r.json();const arr=d.models||d.data||[];
   const names=arr.map(m=>typeof m==='string'?m:(m.id||m.key||m.model_key||m.name)).filter(Boolean);
   return names.length?names:null;}
@@ -815,17 +820,17 @@ function fetchBlocked(e){return e&&(e.name==='TypeError'||/failed to fetch|netwo
 async function detectBackend(){
   const errors=[];
   try{
-    const r=await fetch(api('/v1/models'),{signal:apiSig()});
+    const r=await fetch(api('/v1/models'),{signal:apiSig(),headers:authHeaders()});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const d=await r.json();
     const n=(Array.isArray(d.data)?d.data:[]).map(m=>m.id||m.name||m.model).filter(Boolean);
     if(!n.length)throw new Error('EMPTY MODEL LIST');
     let lms=false;
-    try{const q=await fetch(api('/api/v0/models'),{signal:apiSig()});if(q.ok){const qd=await q.json();if(qd&&qd.object==='list')lms=true;}}catch(e){}
+    try{const q=await fetch(api('/api/v0/models'),{signal:apiSig(),headers:authHeaders()});if(q.ok){const qd=await q.json();if(qd&&qd.object==='list')lms=true;}}catch(e){}
     return{backend:lms?'lmstudio':'openai',names:n};
   }catch(e){errors.push('/v1/models: '+(fetchBlocked(e)?'FETCH BLOCKED':(e.message||'NO RESPONSE')));}
   try{
-    const r=await fetch(api('/api/tags'),{signal:apiSig()});
+    const r=await fetch(api('/api/tags'),{signal:apiSig(),headers:authHeaders()});
     if(r.ok){const d=await r.json().catch(()=>null);
       const n=(d&&Array.isArray(d.models)?d.models:[]).map(m=>m.name).filter(Boolean);
       if(n.length)return{backend:'ollama',names:n};
@@ -1184,6 +1189,7 @@ document.addEventListener('click',e=>{
 
 $('open-settings').onclick=()=>{
   $('set-endpoint').value=settings.endpoint;
+  $('set-apikey').value=settings.apiKey||'';
   $('set-backend').value=settings.backend||'auto';
   toggleLMStudioOps();
   $('set-model').value=settings.model;
@@ -1220,9 +1226,11 @@ $('prof-save').onclick=()=>{
   const name=($('prof-name').value||'').trim()||'UNNAMED PROFILE';
   const rec=CogCore.profileStore.save(localStorage,{
     id:settings.activeProfile||undefined,
-    name:name,backend:$('set-backend').value,endpoint:$('set-endpoint').value,model:$('set-model').value
+    name:name,backend:$('set-backend').value,endpoint:$('set-endpoint').value,model:$('set-model').value,apiKey:$('set-apikey').value
   });
-  settings.activeProfile=rec.id;saveSet();
+  settings.activeProfile=rec.id;
+  settings.apiKey=$('set-apikey').value;
+  saveSet();
   refreshProfileList();
   $('prof-result').innerHTML='<span style="color:var(--phos)">&#10003; PROFILE INSCRIBED: '+esc(name)+'</span>';
 };
@@ -1232,8 +1240,9 @@ $('prof-load').onclick=()=>{
   $('set-endpoint').value=p.endpoint;
   $('set-backend').value=p.backend;
   $('set-model').value=p.model||'';
+  $('set-apikey').value=p.apiKey||'';
   settings.activeProfile=p.id;
-  settings.endpoint=p.endpoint;settings.backend=p.backend;settings.model=p.model;
+  settings.endpoint=p.endpoint;settings.backend=p.backend;settings.model=p.model;settings.apiKey=p.apiKey||'';
   saveSet();refreshProfileList();
   $('prof-result').innerHTML='<span style="color:var(--phos-dim)">LOADED: '+esc(p.name)+' &#8594; '+esc(p.endpoint)+(p.model?' / '+esc(p.model):'')+'</span>';
   testConnection(true);
@@ -1241,10 +1250,11 @@ $('prof-load').onclick=()=>{
 $('prof-del').onclick=()=>{
   const id=$('prof-list').value;if(!id)return;
   CogCore.profileStore.remove(localStorage,id);
-  if(settings.activeProfile===id){settings.activeProfile='';settings.endpoint='';settings.backend='auto';settings.model='';}
+  if(settings.activeProfile===id){settings.activeProfile='';settings.endpoint='';settings.backend='auto';settings.model='';settings.apiKey='';}
   saveSet();refreshProfileList();
   $('prof-result').innerHTML='<span style="color:var(--phos-dim)">PROFILE PURGED.</span>';
 };
+if($('api-key-eye'))$('api-key-eye').onclick=()=>{$('set-apikey').type=($('set-apikey').type==='password'?'text':'password');};
 $('set-temp').oninput=e=>$('temp-val').textContent=e.target.value;
 $('set-topp').oninput=e=>$('topp-val').textContent=e.target.value;
 $('set-pres').oninput=e=>$('pres-val').textContent=e.target.value;
@@ -1253,6 +1263,7 @@ $('set-thresh').oninput=e=>$('set-thresh-val').textContent=e.target.value+'%';
 $('set-ctx').oninput=e=>$('ctx-limit-val').textContent='('+e.target.value+')';
 $('save-settings').onclick=()=>{
   settings.endpoint=$('set-endpoint').value.trim()||DEF_SETTINGS.endpoint;
+  settings.apiKey=$('set-apikey').value||'';
   settings.backend=$('set-backend').value;
   toggleLMStudioOps();
   const chosenModel=$('set-model').value;

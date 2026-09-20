@@ -138,3 +138,93 @@ Plan ref: `PLAN.md` Phase 4
   action after an all-green state is a **read-only code review** of the finished codebase,
   saved to `codereview.md`. That review is the follow-up step for the next agent call.
 - Fresh commit made for this phase: `phase4: integration close-out`.
+---
+
+## Phase 5 — Dynamic per-endpoint API key (bearer auth)
+Status: **DONE**
+Plan ref: `PLAN.md` Phase 5
+
+- [x] 5.1 `profileStore` shape → `{id,name,backend,endpoint,model,apiKey}`; backward-compatible (missing key defaults `''`; upsert without new key preserves the stored one).
+- [x] 5.2 Settings modal: `#set-apikey` password input + show/hide eye toggle (`#api-key-eye`) in the endpoint block.
+- [x] 5.3 `settings.apiKey` in blob (`saveSet()` round-trips); masked (`type=password`), never echoed into `[WORKDIR CONTEXT]`/system blocks.
+- [x] 5.4 `authHeaders()` → `Authorization: Bearer <key>` when key non-empty, else `{}`; merged into `/v1/chat/completions` + model-fetch endpoints (`/v1/models`, `/api/v1/models`, `/api/v0/models`, `/api/tags`); local no-key backends send no header.
+- [x] 5.5 Save/Load/DELETE include the key (LOAD restores into input + blob; DEL clears it when it deleted the active profile).
+- [x] 5.6 E2E `tests/frontend/phase5_apikey.test.js` green (0 failures); phases 0-4 + python regression green.
+
+Gate: **Satisfied — phase 5 suite green + phases 0-4 + `python3 test_e2e.py` 0 FAILURES.**
+
+### info to know (Phase 5)
+- **The key was genuinely never implemented in any revision** (recon of full history incl. `90e51f8`); this phase added it as greenfield. `gate` was RED first (profileStore had no `apiKey`; no `#set-apikey` input existed) — TDD RED verified before any implementation.
+- `authHeaders()` is a shared helper (index.html, next to `api()`), so all model fetches send the bearer header from one seam. The tool bridge (`127.0.0.1:8931 /tools/execute`) is **not** given the key — only the model endpoint gets it. Verified by inspection; the bridge calls never reference `authHeaders()`.
+- **Upsert semantics for `apiKey`:** `save()` preserves an existing stored key when an update omits `apiKey` (update without touching the key); pass an explicit `''` to clear. Backward-compatible with pre-existing profiles (they simply have no key → `''`).
+- **Pitfall honored:** `codereview.md` #2 already flags silent-drop UX generally, but for a **secret** the key is `type=password` + only ever put in the `Authorization` header; it is not written into `[WORKDIR CONTEXT]`/system blocks or chat payloads.
+- Phase 5 was implemented directly (tight TDD red→green) rather than delegated: the diff is small and precisely test-gated; same rationale as Phase 1's process note. `claude` CLI for subagent handoff is not authenticated in this env.
+- Fresh commit made for this phase: `phase5: dynamic per-endpoint API key (bearer auth) + e2e`.
+
+## Phase 6 — Agentic system prompt redesign + structured-output contract
+Status: **RECON DONE — NOT STARTED**
+Plan ref: `PLAN.md` Phase 6
+
+- [ ] 6.1 Tool roster derived from real `TOOL_SCHEMAS` (read_file, write_file, list_dir, grep, git, run_command); note `run_command` requires `--allow-exec`.
+- [ ] 6.2 Structured tool-call contract (JSON shape, inline escaped-JSON `arguments`, one call/turn, observe→continue/stop).
+- [ ] 6.3 Keep workdir-jail + relative-path + `[WORKDIR CONTEXT]` block; orient on `settings.workdir`.
+- [ ] 6.4 E2E `tests/frontend/phase6_sysprompt.test.js`.
+
+Gate: phase 6 suite green + phase 5 + regression green.
+
+### info to know (Phase 6 — recon)
+- **Current prompt is WRONG about tools.** `buildAgentSystemPrompt` (appcore.js:134) tells the
+  model tools are `list_dir, grep, read_file, write_file, shell_exec, clipboard access`. The
+  bridge (`bridge.py:204 TOOLS`) actually exposes **read_file, write_file, list_dir, grep, git,
+  run_command** — so the prompt advertises two nonexistent tools (`shell_exec`, `clipboard`) and
+  omits two real ones (`git`, `run_command`). THIS IS THE CORE BUG this phase fixes.
+- No structured-output template exists; prompt is prose-only. A small-context model has no
+  explicit JSON contract to follow → free-form responses instead of parseable tool calls.
+- `TOOL_SCHEMAS` live in `index.html:667` (name/desc/params for all six real tools) and are
+  attached to the body as `body.tools; tool_choice:'auto'` when `settings.agent`. The prompt
+  must derive its roster from these so it can never drift from reality again.
+- `[WORKDIR CONTEXT]` injection already works (buildSystemMessages, appcore.js:152) — preserve.
+- The past folder-read bug (model reading project root instead of bound workdir) was fixed in
+  Phase 2/3 via prompt + code; the redesign must keep that relative-path rule prominent.
+
+## Phase 7 — Structured output validator (deterministic protection layer)
+Status: **RECON DONE — NOT STARTED**
+Plan ref: `PLAN.md` Phase 7
+
+- [ ] 7.1 `validateStructuredOutput(result, allowedTools)` — pure parse/schema/allow-list check → `{ok, errors, sanitized}`.
+- [ ] 7.2 `sanitizeToolCalls / rejectBeforeDispatch` — reject before `executeTool`; feed `role:'tool'` error back to the model loop.
+- [ ] 7.3 Wire into `runAgentLoop`/`callOpenAI` dispatch path.
+- [ ] 7.4 E2E `tests/frontend/phase7_validator.test.js`.
+
+Gate: phase 7 suite green + phases 5-6 + regression green.
+
+### info to know (Phase 7 — recon)
+- Today the agent loop (`runAgentLoop`, index.html ~955) trusts the model: any `tool_calls` in
+  the assistant delta are melted by `mergeToolDelta` (index.html ~695) and dispatched to
+  `executeTool` (index.html:943 → `POST /tools/execute`) with **no schema/allow-list gate**.
+  Malformed `arguments`, unknown tool names, or non-JSON args currently flow straight to the bridge.
+- A pure (network/fs-free) validator is the right seam — testable in jsdom via `appcore.js`.
+- **Design note:** rejection must be *recoverable* — feed a `{role:'tool', name:…, content:'ERROR …'}`
+  message back so the model corrects and retries, rather than hard-failing the whole loop.
+- Keep the allowed set derived from `TOOL_SCHEMAS` names (single source), same as Phase 6, so the
+  validator and the prompt can never disagree about what tools exist.
+
+## Phase 8 — Codereview #1 fix + close-out
+Status: **RECON DONE — NOT STARTED**
+Plan ref: `PLAN.md` Phase 8
+
+- [ ] 8.1 Fix `index.html:707` `acc.content+=o.content||acc.content` → `o.content||''`.
+- [ ] 8.2 E2E case: content-less `message` in `chat.end` output does NOT duplicate prior content.
+- [ ] 8.3 Strike codereview #1 in `codereview.md` (mark FIXED, keep the rest).
+- [ ] 8.4 Full `npm test` green; README/PLAN/gatelog/REPORT updated; re-review pass.
+
+Gate: full `npm test` green and codereview #1 struck off.
+
+### info to know (Phase 8 — recon)
+- The most severe recorded defect (codereview.md #1, index.html:707) is the `chat.end` aggregate
+  stream shape: `o.content||acc.content` self-appends the buffer when a message has empty content.
+  One-character-class fix to `o.content||''`. It does not fire on the default OpenAI SSE path
+  (which streams `choices[].delta`), so it is latent — but it is the top item to strike off.
+- Other codereview items (2 UX silent-drop, 3 folder-opt ignored, 4 workdir picker files-only,
+  5 port duplication, 6 magic numbers, 8 redundant looksBinary cond, 9 remove-by-name) are
+  NOT in scope for Phase 8 unless re-triaged; #1 is the operator-requested fix.

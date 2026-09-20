@@ -174,8 +174,8 @@
      * providerProfileStore — persisted list of provider endpoint profiles.
      * DOM-free. Operates over an injected storage adapter that satisfies
      * {getItem,setItem,removeItem} (localStorage in the browser, fake in tests).
-     * Profile shape: {id, name, backend, endpoint, model}.
-     * A profile is a saved snapshot of {backend, endpoint, model}; "applying" it
+     * Profile shape: {id, name, backend, endpoint, model, apiKey}.
+     * A profile is a saved snapshot of {backend, endpoint, model, apiKey}; "applying" it
      * returns that slice so the caller can rewrite the live settings.
      */
     profileStore: {
@@ -206,12 +206,14 @@
       /** Insert (no id) or update in place (with id). Returns the saved profile. */
       save: function (storage, profile) {
         var a = this._read(storage);
+        var existing = (profile && profile.id) ? this.get(storage, profile.id) : null;
         var rec = {
           id: profile && profile.id ? profile.id : CogCore.uid(),
           name: String((profile && profile.name) || '').trim() || 'UNNAMED PROFILE',
           backend: (profile && profile.backend) || 'auto',
           endpoint: (profile && profile.endpoint) || '',
-          model: (profile && profile.model) || ''
+          model: (profile && profile.model) || '',
+          apiKey: profile && profile.apiKey !== undefined ? String(profile.apiKey) : (existing ? String(existing.apiKey || '') : '')
         };
         var i = a.findIndex(function (p) { return p.id === rec.id; });
         if (i >= 0) a[i] = rec; else a.push(rec);
