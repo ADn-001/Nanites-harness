@@ -77,3 +77,17 @@ Pure, provider-agnostic logic lives in a shared `appcore.js` (loaded by index.ht
 by tests) so logic is unit-testable and shared, not duplicated.
 
 Regression gate for every phase: `python3 test_e2e.py` still reports `0 FAILURES`.
+
+## Post-implementation status (2026-09-20)
+
+All four plan phases are **COMPLETE** and every suite is green.
+
+- **Phase 0** readiness + frontend jsdom rig (`appcore.js`, `tests/frontend/`).
+- **Phase 1** provider endpoint profiles (create/save/list/load/delete, activate).
+- **Phase 2** agentic system prompt + injected workdir-context block (fixes the
+  captured folder-read failure class).
+- **Phase 3** attachments (files / folders / images / from-workdir picker).
+- **Phase 4** integration close-out: CI single command (`npm test`), docs updated.
+
+Full verification: `npm test` → frontend suite `ALL GREEN`, `python3 test_e2e.py` → `0 FAILURES`.
+See `gatelog.md` for per-phase notes, root causes, and "info to know".

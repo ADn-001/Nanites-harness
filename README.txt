@@ -32,6 +32,37 @@ It is built as a small static web app plus two Python helper programs:
 - Local bridge daemon for project-directory tool execution
 - Path jail, origin checks, request size caps, and read-only git restrictions by default
 
+### Provider endpoint profiles
+
+In **RITES/CONFIG** → **PROVIDER PROFILES**, you can name and save a
+`{name, backend, endpoint, model}` combination, list saved profiles, load one to apply it
+live, or delete it. Profiles persist in `localStorage`. This replaces the old workflow of
+re-typing the backend + endpoint + model every time you switch providers — e.g. save a
+"DeepSeek" profile and an "LM Studio" profile and flip between them from the dropdown.
+
+### Agentic system prompt + workdir context
+
+In agent mode the app now injects a short, precise system-orientation prompt telling the
+model that the bridge jail **is** the bound workdir, that all paths are **project-relative**
+to it, that `list_dir "."` shows the workdir contents, and that host-absolute paths are
+refused. It also injects a `[WORKDIR CONTEXT]` block carrying the bound workdir path plus a
+fresh listing of its contents, re-read at send time.
+
+This fixes the earlier failure where the model read the host project's root files instead of
+the bound workdir's contents.
+
+### Attachments (files / folders / images)
+
+Use the **`[+]`** ATTACH menu next to the composer to add:
+
+- **File** / **Image** — pick a file from your local disk. Text files/folders are inlined
+  into the message as fenced, path-labelled blocks (capped at ~20k chars; binary is skipped).
+  Images are sent as multimodal `image_url` data-URL parts.
+- **From workdir** — browse the bridge's bound workdir and pick a file to attach (read via
+  `read_file`).
+
+Each attachment becomes a removable chip above the textarea and is sent with your prompt.
+
 ## What the bridge does
 
 The bridge is the **hands** of the system. It does not decide anything by itself; it only executes requested rites inside a chosen project directory.
@@ -214,12 +245,14 @@ On Windows, the daemon prefers `pythonw.exe` for autostart to avoid a console wi
 ```text
 cogitator/
   index.html
+  appcore.js
   bridge.py
   bridge_daemon.py
   sw.js
   manifest.webmanifest
   icon.svg
   test_e2e.py
+  tests/frontend/      (jsdom e2e suites: phase0-3)
   README.txt
 ```
 
@@ -301,6 +334,17 @@ Run it with:
 ```powershell
 python test_e2e.py
 ```
+
+The frontend improvements (profiles, agent prompt, attachments) are covered by the Node/jsdom
+e2e suites in `tests/frontend/` (run with `node tests/frontend/run.js`). To run **everything**
+— the full frontend suite then the full Python bridge/daemon suite — in one command:
+
+```powershell
+npm test
+```
+
+Expected result: frontend suite prints `ALL GREEN` and the Python suite prints `0 FAILURES`.
+(Requires Node.js + `npm install` once for the jsdom dependency.)
 
 ## License / usage
 

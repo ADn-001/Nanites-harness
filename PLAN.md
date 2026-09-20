@@ -56,7 +56,8 @@ Gate: phase 2 suite green + phase 1 + regression green.
 Gate: phase 3 suite green + phases 1-2 + regression green. **COMPLETE.**
 
 ## Phase 4 — Integration close-out
-- [ ] 4.1 Full frontend suite + full python suite in CI-style one command.
-- [ ] 4.2 `gatelog.md` final pass; `REPORT.md`/`PLAN.md` statuses updated.
-- [ ] 4.3 README updated for new features (profiles, agent prompt, attachments).
-Gate: every plan checkbox above checked and all suites green.
+- [x] 4.1 Full frontend suite + full python suite in CI-style one command.
+- [x] 4.2 `gatelog.md` final pass; `REPORT.md`/`PLAN.md` statuses updated.
+- [x] 4.3 README updated for new features (profiles, agent prompt, attachments).
+Status: **COMPLETE (all phases 0-4 done; all suites green).**
+Gate: every plan checkbox above checked and all suites green. — **Satisfied: `npm test` full run green.**

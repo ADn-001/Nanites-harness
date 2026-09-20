@@ -118,8 +118,23 @@ Plan ref: `PLAN.md` Phase 3
 ---
 
 ## Phase 4 — Integration close-out
-Status: **PENDING (next agent)**
+Status: **DONE**
 Plan ref: `PLAN.md` Phase 4
 
+- [x] 4.1 Full frontend suite + full python suite in CI-style one command (`npm test`).
+- [x] 4.2 gatelog final pass; `REPORT.md`/`PLAN.md` statuses updated.
+- [x] 4.3 README updated for new features (profiles, agent prompt, attachments).
+
 ### info to know (Phase 4)
-- (filled at gate)
+- Gate was green FROM THE START of this cycle: all of Phase 0-3 suites plus the Python
+  regression were already passing when Phase 4 was picked up. Phase 4 is documentation /
+  harness close-out only — no product code changed this phase.
+- `npm test` (package.json) already chains `node tests/frontend/run.js` then
+  `python3 test_e2e.py`; it is the single CI-style command 4.1 calls for. Verified via a full
+  `npm test` run (frontend ALL GREEN + python 0 FAILURES).
+- All plan checkboxes (Phase 0-3 in PLAN.md) were already `[x]`; only Phase 4's three were
+  `[ ]`. All are now checked.
+- **All phases 0-4 are DONE.** Per the operator's standing directive, the next (non-gate)
+  action after an all-green state is a **read-only code review** of the finished codebase,
+  saved to `codereview.md`. That review is the follow-up step for the next agent call.
+- Fresh commit made for this phase: `phase4: integration close-out`.
