@@ -92,28 +92,29 @@ any committed revision. This phase makes the key a first-class, per-profile, dyn
       simulated reload; auto-detected/keyless backends still send no header.
 Gate: phase 5 suite green + phases 0-4 + python regression green.
 
-## Phase 6 — Agentic system prompt redesign + structured-output contract [RECON DONE, NOT STARTED]
+## Phase 6 — Agentic system prompt redesign + structured-output contract [DONE]
 **Why:** `buildAgentSystemPrompt` advertises tools that **do not exist** (`shell_exec`,
 `clipboard access`) and **omits** tools that do (`git`, `run_command`). There is no explicit
 tool-call output template and no instruction to emit only valid JSON, so a small-context
 model can free-form a response instead of a machine-parseable tool call. Redesign for correct,
 robust agentic priming that works for small or large contexts.
-- [ ] 6.1 Replace the hardcoded tool list in `buildAgentSystemPrompt` with a roster derived
+- [x] 6.1 Replace the hardcoded tool list in `buildAgentSystemPrompt` with a roster derived
       from the actual `TOOL_SCHEMAS` (read_file, write_file, list_dir, grep, git,
       run_command) and note `run_command` is disabled unless the bridge runs `--allow-exec`
       (mirror `bridge.py` `ALLOW_EXEC`). Never hardcode a stale tool name.
-- [ ] 6.2 Add an explicit **structured tool-call contract** to the prompt: the exact JSON
+- [x] 6.2 Add an explicit **structured tool-call contract** to the prompt: the exact JSON
       shape of a function call (`{"type":"function","function":{"name":…,"arguments":"{…}"}}`
       — inline escaped-JSON `arguments`, exactly as `/v1/chat/completions` expects), a rule
       that arguments must be valid JSON, one tool call per turn, observe the returned result,
       then continue or stop. Cost-aware phrasing for small contexts.
-- [ ] 6.3 Keep (and verify) the workdir-jail rule, relative-path rule, `list_dir(".")`=workdir
+- [x] 6.3 Keep (and verify) the workdir-jail rule, relative-path rule, `list_dir(".")`=workdir
       contents, absolute-host-path refusal, and the injected `[WORKDIR CONTEXT]` block.
       Orient on the bound workdir (`settings.workdir`), not the project root.
-- [ ] 6.4 E2E `tests/frontend/phase6_sysprompt.test.js`: prompt names all six real tools,
+- [x] 6.4 E2E `tests/frontend/phase6_sysprompt.test.js`: prompt names all six real tools,
       names **none** of `shell_exec`/`clipboard`, contains the JSON tool-call template, still
       contains the relative-path + workdir rules, and the agent-mode payload includes the
       tool schemas + `tool_choice:'auto'`.
+Status: **DONE (all suites green; commit `phase6: ...`).**
 Gate: phase 6 suite green + phase 5 + regression green.
 
 ## Phase 7 — Structured output validator (deterministic protection layer) [RECON DONE, NOT STARTED]

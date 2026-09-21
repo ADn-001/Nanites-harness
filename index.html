@@ -586,7 +586,7 @@ async function buildMessages(opts={}){
     if(listing!==null)workdirCtx={path:settings.workdir,listing:listing};
   }
   const sys=CogCore.buildSystemMessages({
-    system: settings.agent ? CogCore.buildAgentSystemPrompt({workdir:settings.workdir||'(the bound working directory)'}) : settings.system,
+    system: settings.agent ? CogCore.buildAgentSystemPrompt({workdir:settings.workdir||'(the bound working directory)',tools:TOOL_SCHEMAS}) : settings.system,
     summary: c.summary,
     workdirCtx: workdirCtx
   });

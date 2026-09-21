@@ -162,30 +162,23 @@ Gate: **Satisfied — phase 5 suite green + phases 0-4 + `python3 test_e2e.py` 0
 - Fresh commit made for this phase: `phase5: dynamic per-endpoint API key (bearer auth) + e2e`.
 
 ## Phase 6 — Agentic system prompt redesign + structured-output contract
-Status: **RECON DONE — NOT STARTED**
+Status: **DONE**
 Plan ref: `PLAN.md` Phase 6
 
-- [ ] 6.1 Tool roster derived from real `TOOL_SCHEMAS` (read_file, write_file, list_dir, grep, git, run_command); note `run_command` requires `--allow-exec`.
-- [ ] 6.2 Structured tool-call contract (JSON shape, inline escaped-JSON `arguments`, one call/turn, observe→continue/stop).
-- [ ] 6.3 Keep workdir-jail + relative-path + `[WORKDIR CONTEXT]` block; orient on `settings.workdir`.
-- [ ] 6.4 E2E `tests/frontend/phase6_sysprompt.test.js`.
+- [x] 6.1 `appcore.js`: tool roster derived from the LIVE `TOOL_SCHEMAS` (read_file, write_file, list_dir, grep, git, run_command) via `CogCore._toolNames(opts.tools)`; no phantom `shell_exec`/`clipboard`; `run_command` flagged as requiring bridge `--allow-exec`.
+- [x] 6.2 Structured tool-call contract added to the prompt: exact JSON shape `{"type":"function","function":{"name":"<tool>","arguments":"{...}"}}` with inline escaped-JSON `arguments`, exactly one call per turn, STOP → observe → continue-or-stop.
+- [x] 6.3 Workdir-jail + project-relative + host-absolute-refusal rules + `[WORKDIR CONTEXT]` block preserved; orient on `settings.workdir`; `index.html` passes `tools:TOOL_SCHEMAS` so the prompt cannot drift.
+- [x] 6.4 E2E `tests/frontend/phase6_sysprompt.test.js` green (0 failures); phases 0-5 + python regression green.
 
-Gate: phase 6 suite green + phase 5 + regression green.
+Gate: **Satisfied — phase 6 suite green; `npm test` full run ALL GREEN (frontend) + 0 FAILURES (python).**
 
-### info to know (Phase 6 — recon)
-- **Current prompt is WRONG about tools.** `buildAgentSystemPrompt` (appcore.js:134) tells the
-  model tools are `list_dir, grep, read_file, write_file, shell_exec, clipboard access`. The
-  bridge (`bridge.py:204 TOOLS`) actually exposes **read_file, write_file, list_dir, grep, git,
-  run_command** — so the prompt advertises two nonexistent tools (`shell_exec`, `clipboard`) and
-  omits two real ones (`git`, `run_command`). THIS IS THE CORE BUG this phase fixes.
-- No structured-output template exists; prompt is prose-only. A small-context model has no
-  explicit JSON contract to follow → free-form responses instead of parseable tool calls.
-- `TOOL_SCHEMAS` live in `index.html:667` (name/desc/params for all six real tools) and are
-  attached to the body as `body.tools; tool_choice:'auto'` when `settings.agent`. The prompt
-  must derive its roster from these so it can never drift from reality again.
-- `[WORKDIR CONTEXT]` injection already works (buildSystemMessages, appcore.js:152) — preserve.
-- The past folder-read bug (model reading project root instead of bound workdir) was fixed in
-  Phase 2/3 via prompt + code; the redesign must keep that relative-path rule prominent.
+### info to know (Phase 6)
+- **Gate was RED on pickup with a real correctness bug.** The old `buildAgentSystemPrompt` (appcore.js:141) advertised `shell_exec` and `clipboard access` — neither exists on the bridge — and silently omitted `git` and `run_command`, the two real tools it was missing. Phase 6's RED test exposed exactly this (14 failures: phantom names present, git/run_command absent, no contract). This was the core bug the recon flagged; now fixed.
+- **Roster is derived, not hardcoded.** `_toolNames(tools)` reads names off TOOL_SCHEMAS-shaped entries (`{type:'function',function:{name}}`) and dedupes. Falling back to the six real names when `tools` is empty/absent keeps `buildAgentSystemPrompt()` testable and non-drifting, so a future harness can't silently narrow the roster by passing nothing.
+- **Contract phrasing is deliberately compact** — "emit EXACTLY ONE function call ... `{"type":"function","function":{"name":"<tool>","arguments":"{...}"}}` ... STOP and wait for the tool result. Observe ... then continue or stop." Stays short enough for small-ctx models (asserted `< 2200` chars).
+- **`run_command` law is explicit:** "run_command is DISABLED unless the bridge was started with --allow-exec; if the model calls it and it is refused, do not retry it — choose another tool or report the limitation." This mirrors `bridge.py` `ALLOW_EXEC=False` default and prevents the agent from spinning on a tool that will always refuse.
+- **The live wiring is one seam:** `index.html` `buildMessages()` now passes `tools:TOOL_SCHEMAS` into `buildAgentSystemPrompt`. Since the prompt and the `body.tools` payload now share the same source, prompt-routing and tool-allow-list can never disagree.
+- Process: implemented directly (tight TDD red→green), same rationale as Phases 1/5 — the change is small, precisely test-gated, and `claude` CLI is unauthenticated in this env.
 
 ## Phase 7 — Structured output validator (deterministic protection layer)
 Status: **RECON DONE — NOT STARTED**

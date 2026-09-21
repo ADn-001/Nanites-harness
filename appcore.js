@@ -126,22 +126,47 @@
     },
 
     /**
-     * Agent-mode orient prompt. Deliberately SHORT: it must stay effective for
-     * both large- and small-context models. Jails the agent to one working
-     * directory and teaches it how to drive the tool loop. `opts.workdir` is the
-     * bound directory taken from the user's settings.
-     */
-    buildAgentSystemPrompt: function (opts) {
-      opts = opts || {};
-      var workdir = opts.workdir || '(the bound working directory)';
-      return [
-        'You are COGITATOR, an autonomous coding agent. You use a tool loop: emit tool calls, observe the results returned between turns, and keep going until the task is done.',
-        'FILESYSTEM JAIL: your ONLY reachable filesystem root is WORKDIR below. Every path you place in a tool argument MUST be project-RELATIVE to WORKDIR (e.g. "src/app.py", "readme.md", or "." for the root itself). You will never be handed host-absolute paths such as /home/..., /etc/passwd, or C:\\...; do not invent them. If a step genuinely requires a path outside the workdir, refuse and ask the user to remount.',
-        'WORKDIR: ' + workdir,
-        'TOOLS available this session: list_dir, grep, read_file, write_file, shell_exec, and clipboard access. Tool results are returned verbatim between turns. Prefer tools over prose; keep prose concise.',
-        'STOPPING: ask for help only when you are blocked, lack a capability, or need a clarification you cannot resolve from the workdir listing.'
-      ].join('\n');
-    },
+         * Agent-mode orient prompt. Deliberately SHORT: it must stay effective for
+         * both large- and small-context models. Jails the agent to one working
+         * directory, teaches it how to drive the tool loop, and pins the tool roster
+         * to the LIVE TOOL_SCHEMAS passed in as `opts.tools`. `opts.workdir` is the
+         * bound directory taken from the user's settings.
+         */
+        _toolNames: function (tools) {
+          var names = [];
+          if (Array.isArray(tools)) {
+            for (var i = 0; i < tools.length; i++) {
+              var t = tools[i] || {};
+              var inner = t.function || t;
+              if (inner && typeof inner.name === 'string' && inner.name) {
+                names.push(inner.name);
+              }
+            }
+          }
+          if (!names.length) {
+            names = ['read_file', 'write_file', 'list_dir', 'grep', 'git', 'run_command'];
+          }
+          return names.filter(function (n, idx, arr) { return arr.indexOf(n) === idx; });
+        },
+
+        buildAgentSystemPrompt: function (opts) {
+          opts = opts || {};
+          var workdir = opts.workdir || '(the bound working directory)';
+          var toolNames = CogCore._toolNames(opts.tools);
+          var hasRunCmd = toolNames.indexOf('run_command') !== -1;
+          var toolsLine = 'TOOLS available this session: ' + toolNames.join(', ') + '.';
+          if (hasRunCmd) {
+            toolsLine += ' run_command is DISABLED unless the bridge was started with --allow-exec; if the model calls it and it is refused, do not retry it — choose another tool or report the limitation.';
+          }
+          return [
+            'You are COGITATOR, an autonomous coding agent. You use a tool loop: emit tool calls, observe the results returned between turns, and keep going until the task is done.',
+            'FILESYSTEM JAIL: your ONLY reachable filesystem root is WORKDIR below. Every path you place in a tool argument MUST be project-RELATIVE to WORKDIR (e.g. "src/app.py", "readme.md", or "." for the root itself). You will never be handed host-absolute paths such as /home/..., /etc/passwd, or C:\\\\...; do not invent them. If a step genuinely requires a path outside the workdir, refuse and ask the user to remount.',
+            'WORKDIR: ' + workdir,
+            toolsLine,
+            'TOOL-CALL CONTRACT: to call a tool, emit EXACTLY ONE function call as a JSON object {"type":"function","function":{"name":"<tool>","arguments":"{...}"}} where "arguments" is an inline, escaped JSON string (a plain object of the tool\'s parameters, not a narrative). Emit exactly one tool call per turn, then STOP and wait for the tool result. Observe the returned result, then either call the next tool or, once the task is complete, reply with your final answer in prose (no further tool call).',
+            'STOPPING: ask for help only when you are blocked, lack a capability, or need a clarification you cannot resolve from the workdir listing.'
+          ].join('\n');
+        },
 
     /**
      * Build the system-message prefix for a model request.
