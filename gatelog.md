@@ -281,3 +281,46 @@ Gate: **Satisfied — `npm test` ALL GREEN (frontend phases 0,1,2,3,5,6,7,8) +
   change is one character-class and precisely test-gated; the `claude` CLI for subagent handoff
   is not authenticated in this environment.
 - Fresh commit made for this phase: `phase8: fix chat.end aggregate content duplication + e2e`.
+
+---
+
+## Post-gate pass — baseline re-verification + read-only code review (2026-09-22, cron)
+Status: **NO OPEN PHASE — review pass complete; `codereview.md` updated (pass 3, items 14-26).**
+Plan ref: none (all PLAN.md phases 0-8 are DONE)
+
+- [x] Baseline re-run before touching anything: `npm test` → `FRONTEND SUITE: ALL GREEN`
+      (phases 0,1,2,3,5,6,7,8) + `python3 test_e2e.py` → `0 FAILURES`. Head `b3158c9`.
+- [x] No half-finished phase, no stale gate entry, no leftover failing suite from a prior agent.
+- [x] All phases 0-8 verified DONE → per the standing directive, the action is a **read-only** code
+      review; product code was NOT modified this run.
+- [x] Review written to `codereview.md`: status table for items 1-13 + new findings 14-26, each with
+      file/line and, where applicable, output of an executed probe.
+
+### info to know (post-gate review pass)
+- **Nothing is gated green that isn't green** — the suites are honest; the review found defects the
+  suites simply do not cover (see item 26), which is the useful pattern here: a green phase gate
+  proves what its cases assert, nothing more. Two live bugs (#16, #17) and one live security hole
+  (#14) had zero coverage.
+- **#14 is the top item.** `bridge_daemon.py` (port 8930) has **no** `_origin_allowed()` at all,
+  unlike `bridge.py`. Reproduced: from a foreign `Origin`, `POST /set_workdir` returned `ok:true` and
+  planted `bridge.py` into an attacker-chosen directory, and `POST /install_autostart` really did
+  register `~/.config/autostart/CogitatorBridgeDaemon.desktop` (the probe removed it again; no repo
+  file was touched, and the probe copies live under `/tmp`). **If you re-run such a probe, check for
+  that autostart file and remove it.**
+- **#16 is the sneakiest.** `appcore.js` has an array-aware `CogCore.tok`, but `index.html:430`
+  shadows it with a local `tok` that treats a multimodal `content` array as `array.length/4`. Probed
+  in the real app: a 20 000-char inline attachment prices at **1 token** and the gauge reads
+  `1/131.1k` (correct value 5000). No test references `tok`/`CogCore.tok`/`ctxTokens` at all, so
+  Phase 3's gatelog claim that the gauge/budget "stay sane" is true of a function the app never
+  calls. Trust the shipped call path, not the helper next to it.
+- **#13's original claim was stale** (recorded for accuracy): `settleApproval` has cleared
+  `approvalResolve` since the initial commit. What remains true is only that a second concurrent
+  `approveToolCall` would clobber the first.
+- Probe technique that worked for the services (no in-repo side effects): copy `bridge.py` +
+  `bridge_daemon.py` into a temp dir, run them on spare ports (`--port 8994/8995`) with a temp jail,
+  and `curl -H 'Origin: …'`. The daemon writes its pid/log next to itself, so never probe the daemon
+  in-place in the repo.
+- **Next action for the following agent:** no phase is open. If the operator wants the findings
+  actioned, open **Phase 9** in `PLAN.md` in the order given in `codereview.md`'s Summary (#14+#15
+  security, then #16+#17, then #18+#19, then #10) — each with its own e2e suite and a red-first run,
+  as the phase discipline requires.
