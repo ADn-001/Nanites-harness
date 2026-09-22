@@ -709,7 +709,7 @@ function processStreamObject(j,acc){
   if(j.type==='chat.end'&&j.result){
     for(const o of (j.result.output||[])){
       if(o.type==='reasoning')acc.thinking+=o.content||'';
-      if(o.type==='message')acc.content+=o.content||acc.content;
+      if(o.type==='message')acc.content+=o.content||'';
       for(const t of (o.tool_calls||[]))mergeToolDelta(acc,t);
     }
     return;

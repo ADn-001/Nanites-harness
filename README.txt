@@ -35,10 +35,20 @@ It is built as a small static web app plus two Python helper programs:
 ### Provider endpoint profiles
 
 In **RITES/CONFIG** → **PROVIDER PROFILES**, you can name and save a
-`{name, backend, endpoint, model}` combination, list saved profiles, load one to apply it
-live, or delete it. Profiles persist in `localStorage`. This replaces the old workflow of
-re-typing the backend + endpoint + model every time you switch providers — e.g. save a
-"DeepSeek" profile and an "LM Studio" profile and flip between them from the dropdown.
+`{name, backend, endpoint, model, apiKey}` combination, list saved profiles, load one to
+apply it live, or delete it. Profiles persist in `localStorage`. This replaces the old
+workflow of re-typing the backend + endpoint + model every time you switch providers — e.g.
+save a "DeepSeek" profile and an "LM Studio" profile and flip between them from the dropdown.
+
+### Per-endpoint API key (bearer auth)
+
+The endpoint block also has an **API KEY (BEARER)** field (masked, with a show/hide eye
+toggle). When it is non-empty every model request — `/v1/chat/completions` and the model-list
+probes (`/v1/models`, `/api/v1/models`, `/api/v0/models`, `/api/tags`) — carries
+`Authorization: Bearer <key>`. Leave it empty for local backends (Ollama/LM Studio) and no
+header is sent. The key is saved per profile and per settings blob; it is never written into
+the system prompt, the `[WORKDIR CONTEXT]` block, or an attachment payload, and the tool
+bridge (`/tools/execute`) is never given it.
 
 ### Agentic system prompt + workdir context
 
@@ -252,7 +262,8 @@ cogitator/
   manifest.webmanifest
   icon.svg
   test_e2e.py
-  tests/frontend/      (jsdom e2e suites: phase0-3)
+  tests/frontend/      (jsdom e2e suites: phase0-8, incl. shared appcore helpers)
+  PLAN.md / REPORT.md / gatelog.md / codereview.md   (dev tracking docs)
   README.txt
 ```
 
@@ -272,6 +283,12 @@ Optional assets:
 - The service worker caches the app shell for offline use after first load.
 - If you serve the app from a subpath, keep `sw.js` and `manifest.webmanifest` beside `index.html`.
 - If the model backend hangs, the frontend now applies stream timeouts instead of waiting forever.
+- **Aggregate stream shapes are supported.** Besides the per-chunk OpenAI SSE form
+  (`choices[].delta`) and Ollama's NDJSON, the parser also accepts a single buffered
+  `{"type":"chat.end","result":{"output":[…]}}` frame as emitted by llama.cpp-class servers and
+  some LM Studio modes. `reasoning` objects accumulate into the cogitation record, `message`
+  objects append their content, and `tool_calls` are merged — a `message` object with empty
+  content is a no-op and must never re-append the buffer.
 - Tool execution depends on the bridge being reachable on the configured local port.
 
 ## Troubleshooting
@@ -335,7 +352,8 @@ Run it with:
 python test_e2e.py
 ```
 
-The frontend improvements (profiles, agent prompt, attachments) are covered by the Node/jsdom
+The frontend improvements (profiles, per-endpoint API key, agent prompt + structured
+output validator, attachments, aggregate-stream parser) are covered by the Node/jsdom
 e2e suites in `tests/frontend/` (run with `node tests/frontend/run.js`). To run **everything**
 — the full frontend suite then the full Python bridge/daemon suite — in one command:
 

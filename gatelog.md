@@ -233,21 +233,51 @@ Gate: **Satisfied — phase 7 suite green (0 failures); phases 0-6 + `python3 te
   phase still open.** Note the line number has shifted; grep for the expression, not the line.
 
 ## Phase 8 — Codereview #1 fix + close-out
-Status: **RECON DONE — NOT STARTED**
+Status: **DONE**
 Plan ref: `PLAN.md` Phase 8
 
-- [ ] 8.1 Fix `index.html:707` `acc.content+=o.content||acc.content` → `o.content||''`.
-- [ ] 8.2 E2E case: content-less `message` in `chat.end` output does NOT duplicate prior content.
-- [ ] 8.3 Strike codereview #1 in `codereview.md` (mark FIXED, keep the rest).
-- [ ] 8.4 Full `npm test` green; README/PLAN/gatelog/REPORT updated; re-review pass.
+- [x] 8.1 Fix `index.html:707` `acc.content+=o.content||acc.content` → `o.content||''`.
+- [x] 8.2 E2E case: content-less `message` in `chat.end` output does NOT duplicate prior content.
+- [x] 8.3 Strike codereview #1 in `codereview.md` (mark FIXED, keep the rest).
+- [x] 8.4 Full `npm test` green; README/PLAN/gatelog/REPORT updated; re-review pass.
 
-Gate: full `npm test` green and codereview #1 struck off.
+Gate: **Satisfied — `npm test` ALL GREEN (frontend phases 0,1,2,3,5,6,7,8) +
+`python3 test_e2e.py` 0 FAILURES; codereview #1 marked FIXED.**
 
-### info to know (Phase 8 — recon)
-- The most severe recorded defect (codereview.md #1, index.html:707) is the `chat.end` aggregate
-  stream shape: `o.content||acc.content` self-appends the buffer when a message has empty content.
-  One-character-class fix to `o.content||''`. It does not fire on the default OpenAI SSE path
-  (which streams `choices[].delta`), so it is latent — but it is the top item to strike off.
-- Other codereview items (2 UX silent-drop, 3 folder-opt ignored, 4 workdir picker files-only,
-  5 port duplication, 6 magic numbers, 8 redundant looksBinary cond, 9 remove-by-name) are
-  NOT in scope for Phase 8 unless re-triaged; #1 is the operator-requested fix.
+### info to know (Phase 8)
+- **Gate was GREEN on pickup (baseline re-verified first).** Per the standing directive, every
+  suite in `tests/frontend/` + `python3 test_e2e.py` was run *before* touching anything: all
+  phases 0-7 green, `0 FAILURES`. So Phase 8 was the only open work and no prior agent had left
+  a half-finished phase or a stale gatelog entry.
+- **The defect was real and the RED run proved it.** New suite
+  `tests/frontend/phase8_streamagg.test.js` drives the REAL path end-to-end
+  (`send()` → `stream()` → `callModel()` → `callOpenAI()` → `pumpSSE()` →
+  `processStreamObject()`) with a scripted SSE `body` carrying
+  `{type:'chat.end', result:{output:[…]}}`. At RED it printed
+  `stored content is exactly "Hello world" (got "Hello worldHello world")` — the bug is exactly
+  the self-append codereview #1 described. **Note the compounding:** with N content-less
+  `message` objects the buggy line *doubles* the buffer each time (`"Alpha"` →
+  `'Alpha'×8` for 3 empty messages; case C in the suite pins this), because each append
+  re-appends the whole accumulated string.
+- **Fix is one character-class:** `o.content||acc.content` → `o.content||''` (index.html:712;
+  the line number has shifted from the 707 recorded in codereview — **grep the expression, not
+  the line**). No other production code changed in this phase.
+- **Case B/D in the suite pass at RED too — deliberately.** When the *first* `message` object is
+  empty, `acc.content += acc.content` on an empty buffer is a no-op, so a leading-empty or
+  reasoning/tool-call-only turn never showed the symptom. They are guards; do not read a green
+  case B as "the bug is gone". The load-bearing assertions are case A and case C.
+- **Harness notes reused from Phase 7** (still true): jsdom ships no `TextDecoder` — stub
+  `app.window.TextDecoder` *before* clicking send; a function-valued fetch route is used
+  verbatim by `helpers.js` (only object routes get wrapped into a `Response`), so a streaming
+  route must return its own `{ok,status,json,text,body:{getReader(){…}}}` Response-like object.
+  `active()` is a top-level function declaration so it is reachable as `app.window.active()`
+  — the suite asserts both the **rendered** `#body-N` text and the **stored** message content.
+- **The live OpenAI SSE path is unaffected** (case E asserts `choices[].delta` still
+  concatenates in order) — this bug only ever fired on the buffered aggregate shape.
+- **All phases 0-8 are now DONE.** Per the standing directive, the follow-up for the next agent
+  call is `codereview.md` — it now carries the Phase 8 re-review pass (items 10-13, all read-only
+  findings, none blocking). No new phase is open.
+- Process: implemented directly (tight TDD red→green), same rationale as Phases 1/5/6/7 — the
+  change is one character-class and precisely test-gated; the `claude` CLI for subagent handoff
+  is not authenticated in this environment.
+- Fresh commit made for this phase: `phase8: fix chat.end aggregate content duplication + e2e`.

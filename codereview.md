@@ -5,12 +5,22 @@ Scope: whole repo on `main` @ 8b30be1. All suites green at review time:
 `phase0/1/2/3` frontend jsdom suites + `python3 test_e2e.py` (0 FAILURES).
 Files reviewed: `appcore.js`, `index.html` (inline script), `bridge.py`, test rig.
 
+Re-review run: 2026-09-22 (Phase 8 close-out, read-only). Scope: `main` @ post-Phase-7.
+All suites green (`npm test` → frontend ALL GREEN incl. `phase8_streamagg`; `python3
+test_e2e.py` → 0 FAILURES). Item **#1 is now FIXED** (Phase 8); a fresh pass over the
+streaming/budget/agent-loop seams produced items **10-13** below. None are blocking.
+
 Severity key: **[BUG]** broken behavior, **[LATENT]** only on a rarely-hit path,
 **[UX]** awkward but works, **[SMELL]** maintainability / consistency.
 
 ---
 
 ## 1. [LATENT BUG] Duplicated response content on the `chat.end` stream shape
+**STATUS: FIXED (Phase 8, 2026-09-22).** `index.html` now reads `acc.content+=o.content||''`
+in the aggregate branch (was `o.content||acc.content`). Covered by
+`tests/frontend/phase8_streamagg.test.js` (5 cases; at RED it printed
+`stored content is exactly "Hello world" (got "Hello worldHello world")`). The parity test
+asserts the per-delta SSE path still concatenates normally. Kept below as the original finding.
 
 `index.html:707` (in `processStreamObject`, the aggregated `j.type==='chat.end'`
 branch):
@@ -140,12 +150,75 @@ only a unit-test convenience).
 
 ---
 
+## 10. [LATENT] Context-budget walk can split an assistant `tool_calls` message from its `tool` result
+
+`index.html:601-620` (`buildMessages`) walks the transcript newest→oldest and `break`s as soon
+as the next message would exceed the budget:
+
+```js
+for(let i=end-1;i>=0;i--){const m=c.messages[i];
+  const cost=…;
+  if(used+cost>budget&&msgs.length)break;   // <-- cuts anywhere, including mid tool-pair
+```
+
+A `role:'tool'` message and the `assistant` message carrying its `tool_calls` are serialized as
+**separate** entries (lines 606-615). If the budget boundary lands between them, the request can
+carry an assistant message whose `tool_calls` have no matching `tool` reply, or (the other way
+round) a `tool` reply whose assistant message was dropped. Strict OpenAI-compatible servers
+reject that with a 400 (`tool_calls` must be followed by a tool message for every id) — the turn
+then dies with `[ RITE FAILED: HTTP 400 …]`. Reachable only on a long agent transcript near the
+context limit, i.e. exactly when an agent is mid-task.
+
+**Suggestion:** when a cut would orphan a call/result pair, drop the whole pair — extend the walk
+so a `tool` message is skipped together with its preceding assistant-with-`tool_calls`, and never
+let a request end on a dangling pair.
+
+---
+
+## 11. [SMELL] A reasoning turn is emitted as two consecutive `assistant` messages
+
+`index.html:608-615`: when a stored assistant message has `thinking`, the loop pushes
+`{role:'assistant', content:'[COGITATION]: '+m.thinking}` **and then** the real
+`{role:'assistant', content:m.content, tool_calls?}`. Two consecutive assistant messages violate
+the strict alternation some OpenAI-compatible proxies (and Anthropic-shaped backends) enforce.
+OpenAI itself tolerates it, so this is a smell, not a live bug.
+
+**Suggestion:** fold the cogitation text into the same message (prefixed) rather than emitting a
+sibling, or merge into one assistant message per stored turn.
+
+---
+
+## 12. [SMELL] The validator's "missing id" rejection is dead code on the live path
+
+`appcore.js:287` rejects a call with no `id`, and the Phase 7 unit tests exercise that branch —
+but the only live producer is `finalizeToolCalls` (`index.html:954-958`), which **always** mints
+one: `id:t.id||('call_'+msgIndex+'_'+ix+'_'+Date.now().toString(36))`. So on the real agent path
+the gate can never observe an id-less call; the check only guards direct/other callers. Useful as
+defence-in-depth, worth knowing so a future reader doesn't assume the live path exercises it.
+
+---
+
+## 13. [SMELL] A single shared `approvalResolve` is never cleared
+
+`index.html:930-942` (`approveToolCall`) stores the pending resolver in one module-level
+`approvalResolve` and never nulls it on settle. Tool dispatch is sequential (`for(const tc of
+gate.sanitized){ … await executeTool(tc) }`), so today only one approval can be pending at a time
+and the pattern is safe — but any future parallel dispatch (or a second modal source) would
+silently clobber the first promise, leaving that `executeTool` awaiting forever. Clearing
+`approvalResolve=null` on settle, and rejecting when one is already pending, would make the
+invariant explicit.
+
+---
+
 ## Summary
 
 No new **live** bugs found — the shipped e2e suites (which cover the security
-jaw of `bridge.py` thoroughly and the three new frontend features end-to-end)
-are genuinely green and the implementation is solid for its scale. The one real
-latent defect is **#1** (content duplication on the `chat.end` aggregate stream
-shape); it will not fire on the default OpenAI SSE path but should be fixed (one
-line) the next time the streaming parser is touched, with a companion test case.
-Items 2-4 are UX/SMELL candidates worth a follow-up pass but need no urgent fix.
+jaw of `bridge.py` thoroughly and the frontend features end-to-end)
+are genuinely green and the implementation is solid for its scale.
+
+The one real latent defect (**#1**, content duplication on the `chat.end` aggregate stream
+shape) was **FIXED in Phase 8** with a dedicated jsdom suite driving the real send path, now at
+0 failures. The Phase 8 re-review produced items **#10-13**: #10 is the one worth scheduling next
+(it can break a long agent turn against a strict OpenAI-compatible endpoint); #11-13 are
+consistency/robustness smells with no urgent fix needed. Items #2-4 (attachment UX), #5-6
+(duplication / magic numbers) and #8-9 (nits) remain open from the first pass as opt-in cleanups.

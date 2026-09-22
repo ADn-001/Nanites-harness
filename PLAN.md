@@ -139,14 +139,15 @@ structured output reaches the system the harness runs on.
 Status: **DONE (all suites green — `npm test` ALL GREEN).**
 Gate: phase 7 suite green + phases 5-6 + regression green. — **Satisfied.**
 
-## Phase 8 — Codereview #1 fix + close-out [RECON DONE, NOT STARTED]
+## Phase 8 — Codereview #1 fix + close-out [COMPLETE]
 **Why:** The most severe recorded issue is `index.html:707`
 `acc.content+=o.content||acc.content` — on the `chat.end` aggregate stream shape a
 content-less assistant message self-appends the accumulated buffer, duplicating the response.
-- [ ] 8.1 Fix to `acc.content+=o.content||''` (one-character-class change).
-- [ ] 8.2 Add an e2e case (phase8 or fold into existing suite): a content-less `message`
+- [x] 8.1 Fix to `acc.content+=o.content||''` (one-character-class change).
+- [x] 8.2 Add an e2e case (phase8 or fold into existing suite): a content-less `message`
       object in `chat.end` output does **not** duplicate prior content.
-- [ ] 8.3 Strike codereview issue **#1** from `codereview.md` (mark FIXED, keep the rest).
-- [ ] 8.4 Full `npm test` green (frontend phases 0-7 + python regression); README/PLAN/
+- [x] 8.3 Strike codereview issue **#1** from `codereview.md` (mark FIXED, keep the rest).
+- [x] 8.4 Full `npm test` green (frontend phases 0-7 + python regression); README/PLAN/
       gatelog/REPORT updated; read-only re-review pass for new smells → `codereview.md`.
-Gate: full `npm test` green and codereview #1 struck off.
+Gate: full `npm test` green and codereview #1 struck off. **Satisfied — `npm test` ALL GREEN
+(frontend phases 0,1,2,3,5,6,7,8) + `python3 test_e2e.py` 0 FAILURES.**

@@ -94,6 +94,18 @@ All plan phases are **COMPLETE** and every suite is green.
   derived from the live `TOOL_SCHEMAS` (read_file, write_file, list_dir, grep, git,
   run_command) — removed the phantom `shell_exec`/`clipboard` names, added the JSON
   function-call contract, kept the workdir-jail / relative-path rules.
+- **Phase 7** deterministic structured-output validator (`CogCore.validateStructuredOutput`)
+  gating every model-authored tool call before it can reach the bridge; rejected calls are fed
+  back to the model as `role:'tool'` corrections instead of being dispatched.
+- **Phase 8** codereview #1 fix: a content-less `message` object in the buffered
+  `chat.end` aggregate stream shape no longer self-appends the accumulator (which duplicated
+  the whole response); covered by a new jsdom e2e suite driving the real send path.
+
+## All phases complete (2026-09-22)
+
+`PLAN.md` Phases 0-8 are **COMPLETE**; `gatelog.md` records each phase's gate and the
+"info to know" quirks. Follow-up work now lives in `codereview.md` (read-only review of the
+finished codebase, including the Phase 8 re-review pass).
 
 Full verification: `npm test` → frontend suite `ALL GREEN`, `python3 test_e2e.py` → `0 FAILURES`.
 See `gatelog.md` for per-phase notes, root causes, and "info to know".

@@ -257,3 +257,35 @@
 [2026-09-22 07:15:23] foreign bridge.py in /tmp/cogwd2-f76j9bn9 backed up to /tmp/cogwd2-f76j9bn9/bridge.py.cogitator-bak (never destroyed)
 [2026-09-22 07:15:23] wrote bridge.py -> /tmp/cogwd2-f76j9bn9/bridge.py
 [2026-09-22 07:15:23] daemon shut down
+[2026-09-22 07:18:07] daemon listening on http://127.0.0.1:18930
+[2026-09-22 07:18:08] wrote bridge.py -> /tmp/cogwd1-enoszuie/bridge.py
+[2026-09-22 07:18:08] bridge worker spawned (pid 221994) in /tmp/cogwd1-enoszuie
+[2026-09-22 07:18:08] bridge worker stopped
+[2026-09-22 07:18:08] removed managed bridge.py from old workdir: /tmp/cogwd1-enoszuie
+[2026-09-22 07:18:08] foreign bridge.py in /tmp/cogwd2-f7djjdtj backed up to /tmp/cogwd2-f7djjdtj/bridge.py.cogitator-bak (never destroyed)
+[2026-09-22 07:18:08] wrote bridge.py -> /tmp/cogwd2-f7djjdtj/bridge.py
+[2026-09-22 07:18:08] daemon shut down
+[2026-09-22 09:20:18] daemon listening on http://127.0.0.1:18930
+[2026-09-22 09:20:19] wrote bridge.py -> /tmp/cogwd1-g58jv3ld/bridge.py
+[2026-09-22 09:20:19] bridge worker spawned (pid 242050) in /tmp/cogwd1-g58jv3ld
+[2026-09-22 09:20:20] bridge worker stopped
+[2026-09-22 09:20:20] removed managed bridge.py from old workdir: /tmp/cogwd1-g58jv3ld
+[2026-09-22 09:20:20] foreign bridge.py in /tmp/cogwd2-e75fjotw backed up to /tmp/cogwd2-e75fjotw/bridge.py.cogitator-bak (never destroyed)
+[2026-09-22 09:20:20] wrote bridge.py -> /tmp/cogwd2-e75fjotw/bridge.py
+[2026-09-22 09:20:20] daemon shut down
+[2026-09-22 09:25:20] daemon listening on http://127.0.0.1:18930
+[2026-09-22 09:25:21] wrote bridge.py -> /tmp/cogwd1-gjq70oii/bridge.py
+[2026-09-22 09:25:21] bridge worker spawned (pid 243332) in /tmp/cogwd1-gjq70oii
+[2026-09-22 09:25:21] bridge worker stopped
+[2026-09-22 09:25:21] removed managed bridge.py from old workdir: /tmp/cogwd1-gjq70oii
+[2026-09-22 09:25:21] foreign bridge.py in /tmp/cogwd2-7c7hl5wn backed up to /tmp/cogwd2-7c7hl5wn/bridge.py.cogitator-bak (never destroyed)
+[2026-09-22 09:25:21] wrote bridge.py -> /tmp/cogwd2-7c7hl5wn/bridge.py
+[2026-09-22 09:25:21] daemon shut down
+[2026-09-22 09:37:42] daemon listening on http://127.0.0.1:18930
+[2026-09-22 09:37:43] wrote bridge.py -> /tmp/cogwd1-d3db2kvq/bridge.py
+[2026-09-22 09:37:43] bridge worker spawned (pid 246144) in /tmp/cogwd1-d3db2kvq
+[2026-09-22 09:37:44] bridge worker stopped
+[2026-09-22 09:37:44] removed managed bridge.py from old workdir: /tmp/cogwd1-d3db2kvq
+[2026-09-22 09:37:44] foreign bridge.py in /tmp/cogwd2-082h09zr backed up to /tmp/cogwd2-082h09zr/bridge.py.cogitator-bak (never destroyed)
+[2026-09-22 09:37:44] wrote bridge.py -> /tmp/cogwd2-082h09zr/bridge.py
+[2026-09-22 09:37:44] daemon shut down
