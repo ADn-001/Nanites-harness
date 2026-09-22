@@ -7,7 +7,7 @@
 #                         write fresh bridge.py, optionally respawn
 #   POST /start | /stop   spawn | kill the worker
 #   GET  /status | /health
-import json, os, signal, socket, subprocess, sys, threading, time
+import argparse, json, os, signal, socket, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -15,6 +15,20 @@ DEFAULT_PORT   = 8930
 BRIDGE_PORT    = 8931
 BRIDGE_MARKER  = '# ==== COGITATOR BRIDGE — managed by bridge_daemon.py ===='
 MAX_JSON_BYTES = 1 * 1024 * 1024
+
+# Every daemon route is privileged, so the Origin allow-list is enforced on
+# every GET and POST. Missing Origin = curl/native caller (allowed); null is
+# what a sandboxed iframe / data: / file:// page sends, so it is refused
+# unless explicitly opted in.
+ALLOW_ANY_ORIGIN  = False
+ALLOW_FILE_ORIGIN = False
+
+def origins_desc():
+    if ALLOW_ANY_ORIGIN:
+        return 'ANY'
+    if ALLOW_FILE_ORIGIN:
+        return 'localhost / null (file:// trusted)'
+    return 'localhost only (null refused)'
 
 _here = os.path.dirname(os.path.abspath(__file__))
 STATE = {'workdir': None, 'proc': None, 'bridge_port': BRIDGE_PORT, 'started_at': None}
@@ -242,6 +256,21 @@ def bridge_healthy():
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
+    def _origin_allowed(self):
+        if ALLOW_ANY_ORIGIN:
+            return True
+        origin = self.headers.get('Origin')
+        if not origin:
+            # curl / native callers send no Origin at all.
+            return True
+        if origin == 'null':
+            # Sandboxed iframe, data:/blob: document, or file:// page — any
+            # hostile page can obtain an opaque origin. Opt-in only.
+            return ALLOW_FILE_ORIGIN
+        low = origin.lower()
+        return (low.startswith('http://localhost:') or low.startswith('http://127.0.0.1:')
+                or low in ('http://localhost', 'http://127.0.0.1'))
+
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -264,9 +293,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204); self._cors(); self.end_headers()
 
     def do_GET(self):
+        if not self._origin_allowed():
+            self._json({'ok': False, 'error': 'origin not permitted'}, 403); return
         u = urlparse(self.path).path
         if u == '/health':
-            self._json({'ok': True, 'daemon': True, 'workdir': STATE['workdir']})
+            self._json({'ok': True, 'daemon': True, 'workdir': STATE['workdir'],
+                        'allow_any_origin': ALLOW_ANY_ORIGIN,
+                        'allow_file_origin': ALLOW_FILE_ORIGIN,
+                        'origins': origins_desc()})
         elif u == '/status':
             running = bool(STATE['proc'] and STATE['proc'].poll() is None)
             self._json({'ok': True, 'workdir': STATE['workdir'],
@@ -274,11 +308,16 @@ class Handler(BaseHTTPRequestHandler):
                         'bridge_pid': STATE['proc'].pid if running else None,
                         'bridge_port': STATE['bridge_port'] if running else None,
                         'started_at': STATE['started_at'],
+                        'allow_any_origin': ALLOW_ANY_ORIGIN,
+                        'allow_file_origin': ALLOW_FILE_ORIGIN,
+                        'origins': origins_desc(),
                         'bridge_healthy': bridge_healthy() if running else False})
         else:
             self._json({'ok': False, 'error': 'unknown route'}, 404)
 
     def do_POST(self):
+        if not self._origin_allowed():
+            self._json({'ok': False, 'error': 'origin not permitted'}, 403); return
         u = urlparse(self.path).path
         b = self._body()
         if u == '/pick_directory':
@@ -310,17 +349,27 @@ def _cleanup():
 
 def main():
     import atexit
+    global ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN
     atexit.register(_cleanup)
     if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
-    args = sys.argv[1:]; port = DEFAULT_PORT
-    if '--port' in args: port = int(args[args.index('--port') + 1])
-    if '--install-autostart' in args:
+    ap = argparse.ArgumentParser(description='Cogitator bridge supervisor daemon')
+    ap.add_argument('--port', type=int, default=DEFAULT_PORT, help='supervisor port (default: %d)' % DEFAULT_PORT)
+    ap.add_argument('--allow-any-origin', action='store_true', help='allow non-local web origins (not recommended)')
+    ap.add_argument('--allow-file-origin', action='store_true', help='trust a null Origin (file:// page) — not recommended')
+    ap.add_argument('--install-autostart', action='store_true', help='install the login autostart entry and exit')
+    ap.add_argument('--remove-autostart', action='store_true', help='remove the login autostart entry and exit')
+    a = ap.parse_args()
+    ALLOW_ANY_ORIGIN = a.allow_any_origin
+    ALLOW_FILE_ORIGIN = a.allow_file_origin
+    port = a.port
+    if a.install_autostart:
         print('autostart:', install_autostart()); return
-    if '--remove-autostart' in args:
+    if a.remove_autostart:
         print('autostart:', remove_autostart()); return
     single_instance()
     log('daemon listening on http://127.0.0.1:%d' % port)
+    log('  origins : %s' % origins_desc())
     srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     try:
         srv.serve_forever()

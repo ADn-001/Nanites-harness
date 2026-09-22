@@ -324,3 +324,89 @@ Plan ref: none (all PLAN.md phases 0-8 are DONE)
   actioned, open **Phase 9** in `PLAN.md` in the order given in `codereview.md`'s Summary (#14+#15
   security, then #16+#17, then #18+#19, then #10) — each with its own e2e suite and a red-first run,
   as the phase discipline requires.
+
+---
+
+## Phase 9 — Security hardening (codereview #14/#15) + live correctness (#16/#17)
+Status: **DONE**
+Plan ref: `PLAN.md` Phase 9
+
+- [x] 9.1 [SEC #14] `bridge_daemon.py`: `Handler._origin_allowed()` mirroring `bridge.py`, enforced
+      as the FIRST statement of `do_GET` and `do_POST` → 403 `{"ok":false,"error":"origin not permitted"}`
+      before any route logic; `--allow-any-origin` + new `--allow-file-origin`; `/health` `/status`
+      report the policy; startup banner logs `origins : <desc>`.
+- [x] 9.2 [SEC #15] `bridge.py`: `Origin: null` is no longer trusted by default (missing Origin —
+      curl/native — still allowed); new `--allow-file-origin` opt-in; banner/docstring/`/health`
+      updated (`origins_desc()`).
+- [x] 9.3 [BUG #16] `index.html:430` `const tok=s=>CogCore.tok(s);` — the array-aware estimator is
+      now the live one, so the gauge, `buildMessages()` budget walk, `maybeAutoCompact` and
+      `compactChat` retention all price attachments correctly and object tool-args no longer yield NaN.
+- [x] 9.4 [BUG #17] `index.html:556` COPY uses `CogCore.contentText(...)`.
+- [x] 9.5 RED-first suites: 15 new origin/bridge cases in `test_e2e.py`; new
+      `tests/frontend/phase9_tok_copy.test.js` (37 cases).
+- [x] 9.6 `codereview.md`: #14-#17 marked FIXED, pass-4 row added, new findings #28/#29 recorded;
+      `README.txt` flags/verification list updated.
+
+Gate: **Satisfied — `npm test` exit 0: `python3 test_e2e.py` → 0 FAILURES (now 66 cases, incl. the
+whole daemon hostile-origin matrix) and `node tests/frontend/run.js` → FRONTEND SUITE: ALL GREEN
+(phases 0,1,2,3,5,6,7,8 + new phase9: 0 FAILURES).**
+
+### info to know (Phase 9)
+- **Gate was GREEN on pickup for phases 0-8** (re-verified first, per the standing directive), so the
+  only open work was codereview pass 3's priority list → Phase 9 opened in `PLAN.md`. Baseline before
+  touching anything: `npm test` exit 0, python `0 FAILURES`, head `ddeefcf`.
+- **Team-of-subagents model was used this phase** (operator directive): two `delegate_task` children ran
+  in parallel on non-overlapping files — child A = security (#14/#15: `bridge.py`, `bridge_daemon.py`,
+  `test_e2e.py`, `README.txt`), child B = frontend correctness (#16/#17: `index.html`, new phase-9
+  suite). Neither was allowed to run the other's suite (`python3 test_e2e.py` and the frontend run
+  would fight over ports) and neither was allowed to `git commit`; the integrator (this session)
+  reviewed both diffs and re-ran the **full** `npm test` itself. Child summaries are self-reports —
+  the diffs and the suites were re-read/re-run rather than trusted.
+- **Both RED runs proved the real bug, not a missing test.** Python: 15 FAIL, including
+  `FAIL- refused set_workdir wrote no bridge.py` (a foreign origin really did plant `bridge.py` into an
+  attacker-chosen directory) and `FAIL- refused install_autostart created no autostart entry (it did;
+  cleaned up)` (it really created `~/.config/autostart/CogitatorBridgeDaemon.desktop`). Frontend: 16
+  FAIL, incl. `tok(20000-char attachment) >= 4000 (got 1)`, gauge `"1/131.1k"`, `tok(object) → NaN`,
+  and COPY `"[object Object],[object Object]"`.
+- **BEHAVIOUR CHANGE an operator must know:** `Origin: null` is now refused by **both** the bridge and
+  the daemon. A page opened as `file://`, a `data:`/`blob:` document, or a sandboxed iframe loses bridge
+  access unless the service is started with the new `--allow-file-origin`. The documented setup
+  (`python -m http.server 8080` → `http://localhost:8080`) is unaffected and pinned by the suite.
+  Also note the allow-list matches only the **http** scheme on loopback: serving the app as
+  `https://localhost:8080`, or from a LAN address (`http://192.168.x.x:8080`), is refused — the bridge
+  already behaved that way, the daemon now matches it. Use `--allow-any-origin` on **both** if the
+  operator really serves the app off-loopback (and remember the tool bridge is then exposed too).
+- **The guard is an Origin check, not authentication.** A request with **no** `Origin` header is still
+  allowed (required for curl/native callers), so any local non-browser process can still drive the
+  privileged daemon routes. If that matters, the next step is a per-start random token required as a
+  header (codereview #14's preferred fix) — deliberately not done here to keep the phase minimal and
+  fully testable.
+- **`bridge_daemon.main()` now uses `argparse`** instead of hand-scanning `sys.argv` (`--port`,
+  `--install-autostart`, `--remove-autostart` semantics unchanged, no new required args). Consequence:
+  an *unknown* daemon flag now exits with a usage error instead of being silently ignored. The
+  generated autostart entry's `Exec=` line passes no flags, so login autostart is unaffected — verified
+  by inspection of `install_autostart()`.
+- **Trap for whoever tests this next:** the hostile-origin probe is only safe because the guard runs
+  *before* the route body. Any future route added to `do_GET`/`do_POST` must keep the guard as the first
+  statement; the suite asserts the negative side effects (no `bridge.py` written, workdir unchanged, no
+  autostart entry) for `/set_workdir` and `/install_autostart`, and it deletes a stray autostart entry
+  if one appears before failing. Never probe the daemon in-place in the repo — it writes its pid/log
+  next to itself.
+- **`bridge_daemon.log` is tracked and re-dirtied by every suite run** (codereview #27). This phase's
+  commit reverted the log churn before committing; expect `git status` to show it dirty again after any
+  test run until #27 is fixed.
+- Phase 9 commit: the single commit directly on top of `ddeefcf` (`git log --oneline -1`), carrying
+  product code + tests + docs. `codereview.md` pass 4 records the same head, so the committed
+  source/test bytes are exactly what `npm test` ran green.
+- **New findings from the children's review of the shipped path, recorded as codereview #28/#29**
+  (deliberately NOT fixed here — out of the phase's two-fix mandate): the `compactChat` compression
+  prompt still stringifies an array `content`, so attachment text is lost from the summary
+  (`index.html` ~631-642), and `refreshLast` renders last-message content without the array guard
+  `msgHTML` has.
+- **Next action for the following agent:** phases 0-9 are all DONE. Remaining open review items are
+  the priority list in `codereview.md`: #18 (agent-loop-wide 180 s timeout misclassified as a rite
+  failure), #19 (`compactChat` discards transcript when the summary came back empty), #28, #29, then
+  #10 (oldest latent defect), then the UX/hygiene set (#20 SAVE AS PROFILE can only overwrite, #21
+  `sw.js` cache never bumped, #23 dual profile source of truth, #24 duplicated bridge URL plumbing,
+  #27 tracked log). Open **Phase 10** in `PLAN.md` for whichever the operator wants next — each with
+  its own red-first e2e suite.

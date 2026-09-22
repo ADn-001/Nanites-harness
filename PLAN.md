@@ -151,3 +151,35 @@ content-less assistant message self-appends the accumulated buffer, duplicating 
       gatelog/REPORT updated; read-only re-review pass for new smells → `codereview.md`.
 Gate: full `npm test` green and codereview #1 struck off. **Satisfied — `npm test` ALL GREEN
 (frontend phases 0,1,2,3,5,6,7,8) + `python3 test_e2e.py` 0 FAILURES.**
+
+---
+
+## Phase 9 — Security hardening + live correctness bugs from codereview pass 3 [DONE]
+**Why:** All feature phases 0-8 are DONE and green, so the open work is the read-only review's
+priority list (`codereview.md`, pass 3). Item #14 is a live security hole (the daemon has **no**
+Origin guard, so any web page can re-point the workdir, plant `bridge.py`, spawn a worker and
+register login autostart), #15 lets an opaque `Origin: null` caller be treated as local, and #16/#17
+are operator-visible correctness bugs in the shipped path (attachment token pricing ~1 token; COPY
+on an attachment message yields `[object Object]`).
+- [x] 9.1 [SEC #14] `bridge_daemon.py`: add the same `_origin_allowed()` allow-list `bridge.py`
+      has (missing Origin = native/curl OK; `localhost`/`127.0.0.1` OK; everything else 403),
+      enforced on every `do_GET`/`do_POST` route; `--allow-any-origin` / `--allow-file-origin`
+      flags mirroring the bridge; startup banner + README updated.
+- [x] 9.2 [SEC #15] `bridge.py`: stop trusting `Origin: null` by default (a sandboxed iframe /
+      `data:` / `blob:` document on any site gets an opaque origin); gate it behind a new
+      `--allow-file-origin` flag; banner + README updated. Documented serving path
+      (`python -m http.server`) uses a `localhost` origin and is unaffected.
+- [x] 9.3 [BUG #16] `index.html`: the live `tok` must be the array-aware `CogCore.tok`
+      (multimodal attachment content is an array; `array.length` is parts, not chars), so the
+      `#ctx-pct` gauge, the `buildMessages()` budget walk and `compactChat` retention all price
+      attachments correctly and never yield `NaN`.
+- [x] 9.4 [BUG #17] `index.html` `msgAction('copy')`: use `CogCore.contentText(...)` so an
+      attachment message copies its text, not `[object Object],[object Object]`.
+- [x] 9.5 RED-first suites: daemon/bridge origin matrix cases in `test_e2e.py`; new
+      `tests/frontend/phase9_tok_copy.test.js` for the gauge/COPY fixes.
+- [x] 9.6 `codereview.md` items #14-#17 struck as FIXED; full `npm test` green.
+Gate: `python3 test_e2e.py` 0 FAILURES **and** `node tests/frontend/run.js` ALL GREEN
+(new phase 9 suite + phases 0,1,2,3,5,6,7,8).
+Status: **DONE — `npm test` exit 0 (python 0 FAILURES, FRONTEND SUITE: ALL GREEN); red-first
+evidence and the operator-visible behaviour change (`Origin: null` refused unless
+`--allow-file-origin`) are recorded in `gatelog.md` Phase 9.**

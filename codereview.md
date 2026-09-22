@@ -9,6 +9,16 @@ Severity key: **[SEC]** security, **[BUG]** broken behavior, **[LATENT]** only o
 | 1 | 2026-09-20 | whole repo, read-only | `8b30be1` (items 1-9) |
 | 2 | 2026-09-22 | Phase 8 close-out, read-only | post-Phase-7 (item 1 FIXED, items 10-13 added) |
 | 3 | 2026-09-22 | post-Phase-8 gate, read-only | `b3158c9` (**items 14-26**, statuses of 1-13) |
+| 4 | 2026-09-22 | Phase 9 close-out verification, read-only re-check | `phase9` commit on top of `ddeefcf` (**items 14-17 FIXED**, items 28-29 added) |
+
+**Pass 4 baseline (re-verified before reviewing, per the standing directive):**
+`npm test` → `FRONTEND SUITE: ALL GREEN` (phases 0,1,2,3,5,6,7,8 + new `phase9_tok_copy`) and
+`python3 test_e2e.py` → `0 FAILURES` (66 cases). Phases 0-9 are DONE in `gatelog.md`. Pass 4
+verified the Phase 9 fixes against the reproduction steps recorded in pass 3 (each was re-run: the
+daemon now answers 403 to a foreign Origin on `/status`, `/health`, `/pick_directory`,
+`/set_workdir`, `/start`, `/stop`, `/install_autostart`, `/remove_autostart` with no side effect;
+a 20 000-char attachment prices at 5 000 tokens; COPY yields text) and recorded two new findings the
+Phase 9 work surfaced in adjacent code.
 
 **Pass 3 baseline (re-verified before reviewing, per the standing directive):**
 `npm test` → `FRONTEND SUITE: ALL GREEN` (phases 0,1,2,3,5,6,7,8) and
@@ -21,6 +31,16 @@ claim below is either quoted from the source with its line, or reproduced by an 
 # Pass 3 — new findings (post-Phase-8)
 
 ## 14. [SEC] `bridge_daemon.py` has **no Origin guard at all** — any web page can drive it
+
+> **FIXED in Phase 9.** `bridge_daemon.py` now has `Handler._origin_allowed()` mirroring
+> `bridge.py` (missing Origin = curl/native allowed; `localhost`/`127.0.0.1` allowed; everything
+> else refused with `403 {"ok":false,"error":"origin not permitted"}`) enforced as the **first**
+> statement of `do_GET` and `do_POST`, before any route body runs. It accepts the same
+> `--allow-any-origin` / `--allow-file-origin` opt-ins. `test_e2e.py` pins the whole matrix,
+> including the negative side effects: a refused `/set_workdir` writes no `bridge.py` and leaves
+> the workdir unchanged, and a refused `/install_autostart` creates no autostart entry. The
+> token-based hardening suggested below is still **not** implemented — see the residual note at the
+> end of this item.
 
 `bridge.py` restricts callers via `_origin_allowed()` (`bridge.py:214-221`) and the suite pins that
 ("foreign Origin refused"). The **daemon does not**: `bridge_daemon.py:242-304` implements
@@ -52,6 +72,14 @@ add the origin check — the asymmetry with `bridge.py` is not defensible.
 
 ## 15. [SEC] `Origin: null` is accepted by the bridge — a sandboxed iframe on any site is "local"
 
+> **FIXED in Phase 9.** `bridge.py::_origin_allowed()` no longer returns `True` for `Origin: null`;
+> a missing Origin is still allowed (curl/native callers) and `null` is now behind the explicit
+> `--allow-file-origin` flag, which the other code paths of this repo do not pass. The startup
+> banner, the module docstring and `/health` (`origins_desc()`, `allow_file_origin`) report the
+> policy. `test_e2e.py` flips the old "null Origin (file:// page) allowed" case to
+> `403 null Origin refused by default` and adds a second bridge instance started with
+> `--allow-file-origin` asserting `null` → 200 while a foreign origin still gets 403.
+
 `bridge.py:218-219` returns `True` for a **missing or `"null"`** Origin. Missing is required for
 `curl`/native callers, but `"null"` is also what a browser sends for a `sandbox`ed iframe, a `data:`
 or `blob:` document, and `file://` pages — i.e. content from *any* site can obtain an opaque origin
@@ -74,6 +102,15 @@ operator to serve it over http (`python -m http.server`) rather than opening it 
 require a token) and extend `test_e2e.py`'s origin matrix accordingly.
 
 ## 16. [BUG] The live `tok()` is array-blind, so **attachments cost ~1 token** in the gauge and in the budget
+
+> **FIXED in Phase 9.** `index.html:430` is now `const tok=s=>CogCore.tok(s);` — the live helper
+> delegates to the array-aware implementation in `appcore.js`, so every call site (`ctxTokens`,
+> `ctxUsage`, the `buildMessages()` budget walk, `maybeAutoCompact`, `compactChat`) prices
+> multimodal content by characters and image parts. Side effect of the same change: `tok()` on an
+> already-parsed object (a `toolCalls[].args` object) used to return `NaN` and now returns a finite
+> number. New suite `tests/frontend/phase9_tok_copy.test.js` pins the unit values, the rendered
+> `#ctx-pct`/`#ctx-bar`/`#ctx-fill` for a 20 000-char attachment (5000 tokens, `5.0k/131.1k`), the
+> non-NaN property, and a plain-string regression (`100/131.1k`).
 
 `appcore.js` ships an array-aware `CogCore.tok` (`appcore.js:37-48`, sums text parts + 85/img), and
 gatelog Phase 3 claims the gauge/budget "stay sane" because of it. But `index.html:430` defines its
@@ -103,6 +140,12 @@ defect is specific to array content — exactly the case Phase 3 added.
 tested), or make the local one delegate: `const tok=s=>CogCore.tok(s);`.
 
 ## 17. [BUG] COPY on an attachment message copies `[object Object],[object Object]`
+
+> **FIXED in Phase 9.** `index.html` `msgAction('copy')` now writes
+> `CogCore.contentText(c.messages[i].content)`. Pinned by the COPY case in
+> `tests/frontend/phase9_tok_copy.test.js`, which stubs `navigator.clipboard` and clicks the real
+> rendered COPY control (and also calls `msgAction('copy', 0)` directly), asserting the written
+> string is the joined attachment text and contains no `[object Object]`.
 
 `index.html:556` (`msgAction`) does `navigator.clipboard?.writeText(c.messages[i].content)`. For a
 user message with attachments `content` is a multimodal **array**, and Clipboard `writeText` coerces
@@ -227,6 +270,30 @@ signal for the next agent. **Fix:** `git rm --cached bridge_daemon.log`, add it 
 
 ---
 
+## 28. [BUG] The compaction prompt stringifies array content — attachment text is lost from the summary
+
+`index.html` `compactChat` builds its compression prompt by joining
+`'['+m.role.toUpperCase()+'] '+m.content` (~line 642) after pushing `{role, content: m.content}`
+verbatim (~line 638). For an attachment message `content` is a multimodal **array**, so the prompt the
+model receives contains `[USER] [object Object],[object Object]` instead of the attachment text —
+the summary is written without the very content compaction is supposed to preserve, and then the
+retained window is sliced against that summary (§19 shows the discard path). The two nearby
+concatenations (assistant/tool content) are always strings, so this is array-specific.
+**Fix:** `CogCore.contentText(m.content)` at the push sites or at the join. Found by the Phase 9
+frontend workstream; deliberately left unfixed (out of that phase's two-fix mandate).
+
+## 29. [LATENT] `refreshLast` renders last-message content without the array guard `msgHTML` has
+
+`index.html` `refreshLast` (~line 562) does `el.innerHTML=renderMd(c.messages[i].content)`, while
+`msgHTML` (~line 504) correctly branches: `isUser||isTool ? esc(CogCore.contentText(m.content)) :
+renderMd(m.content)`. Only the last message reaches `refreshLast`, and in the streaming path that is
+the assistant's, so no live array path was reproduced — but a regenerated/short-circuited turn whose
+last message is a user attachment would render `[object Object]` into the transcript.
+**Fix:** use the same `contentText` branch as `msgHTML`. Same provenance as #28.
+
+
+---
+
 # Status of the earlier findings (1-13)
 
 | # | Sev | Status at `b3158c9` |
@@ -326,3 +393,23 @@ Suggested next phase (Phase 9) ordering:
    long-running agent session.
 4. **#10** (still the oldest open latent defect), then #20/#21 as UX/release hygiene, and the
    remaining smells (#3,#5,#6,#11,#23,#24) as an opt-in cleanup pass.
+
+**Phase 9 result: groups 1 and 2 are FIXED and gated green** (`npm test` exit 0; python 66 cases,
+frontend 9 suites). Group 3 (#18/#19) and group 4 were not in Phase 9's scope and remain open, plus
+the two new findings #28/#29 that the Phase 9 work surfaced. Suggested Phase 10 ordering:
+
+1. **#18 + #19** — one session-long signal is shared by every agent iteration, so a slow endpoint
+   kills a legitimate multi-step turn and reports it as `[ RITE FAILED ]` instead of a halt, and an
+   empty/failed compaction response silently deletes transcript. Both are agent-path correctness;
+   both are cheap to pin red-first (fault-inject the SSE route + a `compactChat` stub route).
+2. **#28 + #29** — array-content `contentText` gaps in `compactChat`/`refreshLast`; same class of
+   defect as #17, same style of test.
+3. **#10** — the oldest open latent defect (context-budget walk splitting a tool call from its
+   result); needs a request-shape assertion, not a UI assertion.
+4. **Hygiene** — #27 (`git rm --cached bridge_daemon.log` + `.gitignore`), #21 (`sw.js` cache bump /
+   stale-while-revalidate), #20 (SAVE AS NEW), #23 (single profile source of truth), #24
+   (`bridgeUrl()` helper), #11/#12.
+5. **Optional hardening** — the daemon/bridge still trust any *missing* Origin (curl/native), so the
+   Origin guard is not authentication: a per-start random token required on every non-`/health`
+   route would close that (codereview #14's preferred fix), with the frontend obtaining it
+   out-of-band.

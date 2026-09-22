@@ -427,7 +427,7 @@ const $=id=>document.getElementById(id);
 const api=path=>{let e=(settings.endpoint||'').trim().replace(/\/+$/,'');return e+path;};
 const authHeaders=()=>{const k=(settings.apiKey||'').trim();return k?{'Authorization':'Bearer '+k}:{};};
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const tok=s=>Math.max(1,Math.ceil((s||'').length/4));
+const tok=s=>CogCore.tok(s);
 const fmtK=n=>n<1000?String(Math.round(n)):(n/1000).toFixed(1)+'k';
 function save(){try{localStorage.setItem(LS_CHATS,JSON.stringify(chats));}catch(e){console.warn('archive full',e);}}
 function saveSet(){try{localStorage.setItem(LS_SET,JSON.stringify(settings));}catch(e){console.warn('settings archive inaccessible',e);}}
@@ -553,7 +553,7 @@ ${code}</span>`;
 }
 function msgAction(a,i){
   const c=active();if(!c)return;
-  if(a==='copy'){navigator.clipboard?.writeText(c.messages[i].content);}
+  if(a==='copy'){navigator.clipboard?.writeText(CogCore.contentText(c.messages[i].content));}
   else if(a==='del'){c.messages.splice(i,1);save();renderMessages();renderList();}
   else if(a==='regen'){regenerate();}
 }

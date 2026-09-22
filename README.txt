@@ -184,6 +184,13 @@ cd C:\cogitator
 python bridge_daemon.py
 ```
 
+The daemon enforces the same Origin allow-list as the bridge on every route
+(`/status`, `/health`, `/pick_directory`, `/set_workdir`, `/start`, `/stop`,
+`/install_autostart`, `/remove_autostart`). A page served from anywhere other
+than `localhost` / `127.0.0.1` is refused with `403` and the rite does not run —
+no workdir change, no worker spawn, no autostart entry. The app itself is served
+from `http://localhost:8080`, so normal polling and binding keep working.
+
 Then in the app:
 
 - open **RITES/CONFIG**
@@ -212,7 +219,24 @@ Useful flags:
 --port PORT              listen on a different port
 --allow-git-write        enable mutating git rites
 --allow-exec             enable run_command
---allow-any-origin       disable localhost/null Origin guard
+--allow-any-origin       allow non-local web origins (not recommended)
+--allow-file-origin      trust a null Origin (file:// page) — not recommended
+```
+
+The bridge refuses any request whose `Origin` is not `http://localhost[:port]`
+or `http://127.0.0.1[:port]`. A request with **no** `Origin` header at all is
+still allowed, so `curl` and native callers keep working. A `null` Origin is
+**refused by default**: browsers send it for a `file://` page, a `data:`/`blob:`
+document, and a sandboxed iframe, so any hostile page can present it. Use
+`--allow-file-origin` only if you deliberately open the app from disk.
+
+The supervisor daemon (`bridge_daemon.py`) accepts the same two flags and
+enforces the same allow-list on every route:
+
+```text
+--port PORT              supervisor port (default: 8930)
+--allow-any-origin       allow non-local web origins (not recommended)
+--allow-file-origin      trust a null Origin (file:// page) — not recommended
 ```
 
 ## Using agent mode
@@ -334,7 +358,7 @@ This package includes an E2E suite covering:
 - git global-option bypass refusal
 - safe read-only git acceptance
 - foreign Origin refusal
-- null Origin allowance
+- null Origin refusal (file:// pages are not trusted)
 - localhost Origin allowance
 - oversized POST refusal
 - daemon status
@@ -345,6 +369,8 @@ This package includes an E2E suite covering:
 - managed bridge scrub
 - invalid workdir refusal
 - daemon stop behavior
+- daemon foreign Origin refusal on every GET/POST route
+- daemon no-Origin / localhost Origin allowance
 
 Run it with:
 
