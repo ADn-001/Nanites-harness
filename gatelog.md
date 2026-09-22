@@ -181,26 +181,56 @@ Gate: **Satisfied — phase 6 suite green; `npm test` full run ALL GREEN (fronte
 - Process: implemented directly (tight TDD red→green), same rationale as Phases 1/5 — the change is small, precisely test-gated, and `claude` CLI is unauthenticated in this env.
 
 ## Phase 7 — Structured output validator (deterministic protection layer)
-Status: **RECON DONE — NOT STARTED**
+Status: **DONE**
 Plan ref: `PLAN.md` Phase 7
 
-- [ ] 7.1 `validateStructuredOutput(result, allowedTools)` — pure parse/schema/allow-list check → `{ok, errors, sanitized}`.
-- [ ] 7.2 `sanitizeToolCalls / rejectBeforeDispatch` — reject before `executeTool`; feed `role:'tool'` error back to the model loop.
-- [ ] 7.3 Wire into `runAgentLoop`/`callOpenAI` dispatch path.
-- [ ] 7.4 E2E `tests/frontend/phase7_validator.test.js`.
+- [x] 7.1 `validateStructuredOutput(result, allowedTools)` — pure parse/schema/allow-list check → `{ok, errors, sanitized}`.
+- [x] 7.2 `sanitizeToolCalls / rejectBeforeDispatch` — reject before `executeTool`; feed `role:'tool'` error back to the model loop.
+- [x] 7.3 Wire into `runAgentLoop`/`callOpenAI` dispatch path.
+- [x] 7.4 E2E `tests/frontend/phase7_validator.test.js`.
 
-Gate: phase 7 suite green + phases 5-6 + regression green.
+Gate: **Satisfied — phase 7 suite green (0 failures); phases 0-6 + `python3 test_e2e.py` 0 FAILURES (`npm test` ALL GREEN).**
 
-### info to know (Phase 7 — recon)
-- Today the agent loop (`runAgentLoop`, index.html ~955) trusts the model: any `tool_calls` in
-  the assistant delta are melted by `mergeToolDelta` (index.html ~695) and dispatched to
-  `executeTool` (index.html:943 → `POST /tools/execute`) with **no schema/allow-list gate**.
-  Malformed `arguments`, unknown tool names, or non-JSON args currently flow straight to the bridge.
-- A pure (network/fs-free) validator is the right seam — testable in jsdom via `appcore.js`.
-- **Design note:** rejection must be *recoverable* — feed a `{role:'tool', name:…, content:'ERROR …'}`
-  message back so the model corrects and retries, rather than hard-failing the whole loop.
-- Keep the allowed set derived from `TOOL_SCHEMAS` names (single source), same as Phase 6, so the
-  validator and the prompt can never disagree about what tools exist.
+### info to know (Phase 7)
+- **Gate was RED on pickup (real vulnerability, not a missing test):** the RED run proved the
+  live hole — a `read_file` call with the malformed arguments `{oops` was **dispatched to the
+  bridge** (auto-approved as a read rite), so unvalidated LLM output reached the machine. The
+  other two "never dispatched" assertions passed at RED *for the wrong reason*: an unknown/mutating
+  tool name is a MUTATION, so `approveToolCall()` parked it on the rite-authorization modal before
+  ever POSTing. Be aware of that trap — **"no bridge event" alone is not proof of a gate**; assert
+  the approval modal never opened (`#agent-modal` lacks `.open`) as well.
+- **Where the gate lives:** `appcore.js` gained `validateStructuredOutput` + three pure helpers
+  (`_toolSpec`, `_normalizeToolCalls`, `_argTypeOk`); `index.html` `runAgentLoop` (~line 966) runs
+  `CogCore.validateStructuredOutput(m.toolCalls, TOOL_SCHEMAS)` and dispatches **only**
+  `gate.sanitized`. `TOOL_SCHEMAS` is the single source for both the allow-list and the per-tool
+  required/typed-parameter checks, so prompt, `body.tools` and the validator can never disagree.
+- **Rejection is recoverable, not fatal:** each rejected call pushes
+  `{role:'tool', name, toolCallId, content:'[RITE REJECTED BY VALIDATOR — NOT dispatched: <reason>…]'}`
+  so the model corrects on the next iteration. `finalizeToolCalls` always mints an id, so every
+  assistant `tool_call` gets exactly one correlated tool result — rejected **or** executed — which
+  keeps strict OpenAI-compatible endpoints happy.
+- **`sanitized[].args` is a parsed object, not a string.** `safeToolArgs()`/`approveToolCall()`/
+  `executeTool()` already accepted objects (`typeof tc.args==='string'?JSON.parse:tc.args`), so
+  parsed args flow through unchanged and reach the bridge as real JSON objects.
+- **Accepted input shapes (deliberate leniency):** array of calls, `{toolCalls:[{name,args}]}`
+  (this app's finalized shape) or `{tool_calls:[{id,type,function:{name,arguments}}]}` (raw OpenAI
+  assistant message). Garbage in (`null`, `0`, `'nope'`, `{}`, `{tool_calls:'x'}`) returns
+  `{ok:false, errors:[…], sanitized:[]}` — it never throws, because a throw inside the agent loop
+  would abort the whole turn.
+- **`allowedTools` accepts schema objects OR plain name strings.** An empty/absent list means "no
+  name filtering" (still parses arguments), which keeps the helper usable standalone; passing the
+  real `TOOL_SCHEMAS` is what enables the allow-list + required/type checks.
+- **Harness notes for the next agent:** the inline script declares `const TOOL_SCHEMAS`, so it is
+  **not** a `window` property — grab it with `app.window.eval('JSON.stringify(TOOL_SCHEMAS)')` and
+  `JSON.parse` in the test realm. To drive the SSE agent loop in jsdom you must (a) supply a
+  function-valued route returning a Response-**like** object with a fake `body.getReader()` that
+  yields `data: {…}\n\n` chunks then `{done:true}`, and (b) stub `app.window.TextDecoder`
+  (`decode(v){return String(v)}`) *before* clicking send — jsdom ships neither. Route functions are
+  used verbatim by `helpers.js` (only object routes get wrapped into a `Response`).
+- Process: implemented directly (tight TDD red→green), same rationale as Phases 1/5/6 — the change
+  is small and precisely test-gated, and the `claude` CLI is unauthenticated in this env.
+- **Phase 8 (codereview #1, `index.html:707` `acc.content+=o.content||acc.content`) is the only
+  phase still open.** Note the line number has shifted; grep for the expression, not the line.
 
 ## Phase 8 — Codereview #1 fix + close-out
 Status: **RECON DONE — NOT STARTED**

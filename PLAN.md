@@ -117,26 +117,27 @@ robust agentic priming that works for small or large contexts.
 Status: **DONE (all suites green; commit `phase6: ...`).**
 Gate: phase 6 suite green + phase 5 + regression green.
 
-## Phase 7 — Structured output validator (deterministic protection layer) [RECON DONE, NOT STARTED]
+## Phase 7 — Structured output validator (deterministic protection layer) [DONE]
 **Why:** The harness currently trusts whatever the LLM returns and dispatches any
 `tool_calls` to the bridge. There is no deterministic schema/allow-list check between the
 endpoint and the executor. This phase adds a pure validator so only safe, well-formed
 structured output reaches the system the harness runs on.
-- [ ] 7.1 `appcore.js`: `validateStructuredOutput(result, allowedTools)` — pure, deterministic,
+- [x] 7.1 `appcore.js`: `validateStructuredOutput(result, allowedTools)` — pure, deterministic,
       seeded: parse `tool_calls`; fail on non-JSON `arguments`; each call has `id`/`name`/
       `arguments`; `name` must be in `allowedTools` (the real `TOOL_SCHEMAS` names); arguments
       parse to a plain object; per-tool schema arg check (minimal required-field/type checks).
       Returns `{ok, errors:[…], sanitized}`. Never reaches for the network/fs.
-- [ ] 7.2 `sanitizeToolCalls / rejectBeforeDispatch`: in the agent loop, run every
+- [x] 7.2 `sanitizeToolCalls / rejectBeforeDispatch`: in the agent loop, run every
       `tool_calls` array through the validator **before** `executeTool`; a failed call is
       never dispatched — feed a `{role:'tool', …}` error back into the model loop instead
       (so the model can correct), keeping the bridge safe.
-- [ ] 7.3 Wire into `runAgentLoop`/`callOpenAI` dispatch path so the bridge only ever
+- [x] 7.3 Wire into `runAgentLoop`/`callOpenAI` dispatch path so the bridge only ever
       receives validated tool names/args.
-- [ ] 7.4 E2E `tests/frontend/phase7_validator.test.js`: valid call passes; malformed
+- [x] 7.4 E2E `tests/frontend/phase7_validator.test.js`: valid call passes; malformed
       `arguments` (non-JSON, non-object) rejected; unknown tool name rejected; bridge
       dispatch is provably skipped for a rejected call (assert `events` never receive it).
-Gate: phase 7 suite green + phases 5-6 + regression green.
+Status: **DONE (all suites green — `npm test` ALL GREEN).**
+Gate: phase 7 suite green + phases 5-6 + regression green. — **Satisfied.**
 
 ## Phase 8 — Codereview #1 fix + close-out [RECON DONE, NOT STARTED]
 **Why:** The most severe recorded issue is `index.html:707`

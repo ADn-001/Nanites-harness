@@ -195,7 +195,142 @@
       return msgs;
     },
 
-    /*
+    /* ================= PHASE 7 — STRUCTURED OUTPUT VALIDATOR =================
+     * A pure, deterministic gate between the model endpoint and the tool bridge.
+     * Nothing here may touch the network, the filesystem, the DOM or localStorage:
+     * it is the last checkpoint before an LLM-authored call is handed to the machine.
+     *
+     *   validateStructuredOutput(result, allowedTools) -> {ok, errors, sanitized}
+     *
+     *  - `result` may be: an array of calls, {toolCalls:[…]} (this app's finalized shape),
+     *    or an OpenAI assistant message {tool_calls:[{id,type,function:{name,arguments}}]}.
+     *  - `allowedTools` may be TOOL_SCHEMAS-shaped entries ({type:'function',function:{…}})
+     *    or a plain list of names. Names AND per-tool required/typed parameters are taken
+     *    from it, so the validator can never disagree with the prompt/tool payload.
+     *  - Every call is rejected if it lacks an id or a name, names a tool outside the
+     *    allow-list, or carries `arguments` that are not a JSON object; a call is also
+     *    rejected when a schema-declared required field is absent or a declared type
+     *    does not match. Rejections are collected in `errors`; `sanitized` carries ONLY
+     *    the calls that may be dispatched, with `args` already parsed to a plain object.
+     *  - `ok` is true only when nothing was rejected.
+     */
+    _toolSpec: function (allowedTools) {
+      var spec = { names: [], required: {}, properties: {} };
+      if (!Array.isArray(allowedTools)) return spec;
+      for (var i = 0; i < allowedTools.length; i++) {
+        var t = allowedTools[i];
+        if (typeof t === 'string') {
+          if (t && spec.names.indexOf(t) === -1) spec.names.push(t);
+          continue;
+        }
+        var inner = (t || {}).function || t || {};
+        var n = inner && typeof inner.name === 'string' ? inner.name : '';
+        if (!n) continue;
+        if (spec.names.indexOf(n) === -1) spec.names.push(n);
+        var p = (inner && inner.parameters) || {};
+        spec.required[n] = Array.isArray(p.required) ? p.required.slice() : [];
+        spec.properties[n] = (p && p.properties) || {};
+      }
+      return spec;
+    },
+
+    /** Normalise the many tool-call shapes into [{id,name,args}] or null. */
+    _normalizeToolCalls: function (result) {
+      if (!result || typeof result !== 'object') return null;
+      var raw = Array.isArray(result) ? result
+        : (Array.isArray(result.toolCalls) ? result.toolCalls
+          : (Array.isArray(result.tool_calls) ? result.tool_calls : null));
+      if (!raw) return null;
+      return raw.map(function (c) {
+        c = c || {};
+        var fn = c.function || c || {};
+        var args = c.args !== undefined ? c.args
+          : (c.arguments !== undefined ? c.arguments
+            : (fn.arguments !== undefined ? fn.arguments : fn.args));
+        return {
+          id: c.id == null ? '' : String(c.id),
+          name: (c.name || fn.name) == null ? '' : String(c.name || fn.name),
+          args: args
+        };
+      });
+    },
+
+    /** Declared-type conformance for one already-parsed argument value. */
+    _argTypeOk: function (v, type) {
+      if (!type) return true;
+      switch (type) {
+        case 'string': return typeof v === 'string';
+        case 'number': return typeof v === 'number' && isFinite(v);
+        case 'integer': return typeof v === 'number' && v % 1 === 0;
+        case 'boolean': return typeof v === 'boolean';
+        case 'object': return v !== null && typeof v === 'object' && !Array.isArray(v);
+        case 'array': return Array.isArray(v);
+        default: return true;
+      }
+    },
+
+    validateStructuredOutput: function (result, allowedTools) {
+      var spec = CogCore._toolSpec(allowedTools);
+      var calls = CogCore._normalizeToolCalls(result);
+      var errors = [], sanitized = [];
+
+      if (calls === null) {
+        errors.push({ index: -1, id: '', name: '', error: 'tool_calls is not an array — nothing is dispatchable' });
+        return { ok: false, errors: errors, sanitized: [] };
+      }
+
+      for (var i = 0; i < calls.length; i++) {
+        var c = calls[i];
+        var name = c.name, id = c.id;
+        var bad = [];
+
+        if (!id) bad.push('missing "id" (this app assigns one; an empty id cannot be correlated to a tool result)');
+        if (!name) bad.push('missing tool "name"');
+        else if (spec.names.length && spec.names.indexOf(name) === -1) {
+          bad.push('unknown tool "' + name + '" — not in the allowed set (' + spec.names.join(', ') + ')');
+        }
+
+        var args = null, argsOk = true;
+        if (typeof c.args === 'string') {
+          var txt = c.args.trim();
+          if (!txt) txt = '{}';
+          try { args = JSON.parse(txt); }
+          catch (e) { argsOk = false; bad.push('arguments is not valid JSON'); }
+        } else if (c.args === undefined || c.args === null) {
+          argsOk = false; bad.push('arguments is not valid JSON (missing)');
+        } else {
+          args = c.args;
+        }
+
+        if (argsOk) {
+          if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+            argsOk = false; bad.push('arguments must be a JSON object, got ' + (Array.isArray(args) ? 'array' : typeof args));
+          }
+        }
+
+        if (argsOk && args && spec.names.indexOf(name) !== -1) {
+          var req = spec.required[name] || [];
+          for (var r = 0; r < req.length; r++) {
+            if (!(req[r] in args)) bad.push('missing required argument "' + req[r] + '"');
+          }
+          var props = spec.properties[name] || {};
+          for (var k in props) {
+            if (!Object.prototype.hasOwnProperty.call(props, k)) continue;
+            if (!(k in args)) continue;
+            if (!CogCore._argTypeOk(args[k], (props[k] || {}).type)) {
+              bad.push('argument "' + k + '" must be of type ' + (props[k] || {}).type);
+            }
+          }
+        }
+
+        if (bad.length) errors.push({ index: i, id: id, name: name, error: bad.join('; ') });
+        else sanitized.push({ id: id, name: name, args: args });
+      }
+
+      return { ok: errors.length === 0, errors: errors, sanitized: sanitized };
+    },
+
+    /**
      * providerProfileStore — persisted list of provider endpoint profiles.
      * DOM-free. Operates over an injected storage adapter that satisfies
      * {getItem,setItem,removeItem} (localStorage in the browser, fake in tests).

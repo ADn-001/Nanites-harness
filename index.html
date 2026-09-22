@@ -963,7 +963,15 @@ async function runAgentLoop(c,m,sig){
     m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=finalizeToolCalls(acc,m.ts||Date.now());
     m.ts=m.ts||Date.now();refreshLast();
     if(!m.toolCalls.length)return;
-    for(const tc of m.toolCalls){
+    /* DETERMINISTIC GATE: no model-authored call reaches the bridge unvalidated.
+       Rejected calls are reported back as tool results so the spirit can correct. */
+    const gate=CogCore.validateStructuredOutput(m.toolCalls,TOOL_SCHEMAS);
+    for(const e of gate.errors){
+      c.messages.push({role:'tool',name:e.name||'unknown_rite',toolCallId:e.id||('call_rejected_'+iter+'_'+e.index),
+        content:'[RITE REJECTED BY VALIDATOR — NOT dispatched: '+e.error+'. Re-issue a corrected call, or answer in prose.]',ts:Date.now()});
+    }
+    if(gate.errors.length){save();renderMessages();}
+    for(const tc of gate.sanitized){
       if(sig.aborted)throw new DOMException('Aborted','AbortError');
       const result=await executeTool(tc);
       c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
