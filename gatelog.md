@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 10 — Local Cortex plumbing (flags, sidecar skeleton, ledger, health)**
+Next phase to work on: **Phase 11 — Deterministic salvage pass + golden corpus**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -443,7 +443,7 @@ Regression gate is always `npm test` (frontend ALL GREEN **and** `python3 test_e
 plus every earlier phase's suite.
 
 ## Phase 10 — Local Cortex plumbing: flags, sidecar skeleton, ledger, health
-Status: not started
+Status: **DONE**
 Test suite: `tests/frontend/phase10_localmodels_config.test.js` + localmodels cases in `test_e2e.py`
 
 Deliverable: `localmodels/local_models_daemon.py` (Origin-guarded `ThreadingHTTPServer` on
@@ -455,8 +455,82 @@ Gate: frontend suite ALL GREEN (phase10 + 0,1,2,3,5,6,7,8,9) AND python 0 FAILUR
 `localModels.enabled=false` **no** request is ever made to :8932; sidecar down ⇒ every client call
 resolves degraded without throwing.
 
+Gate evidence: **Satisfied.** `npm test` exit 0 on the committed tree — `node tests/frontend/run.js`
+→ `FRONTEND SUITE: ALL GREEN` (phase10: `PHASE 10 LOCAL CORTEX CONFIG: 0 FAILURES`, 118 checks;
+phase0/1/2/3/5/6/7/8/9 all 0 FAILURES) and `python3 test_e2e.py` → `0 FAILURES` (72 checks, 14 of
+them new localmodels cases). Plus an independent integration probe the two suites cannot give
+(below): the REAL `CogCore.localModels.client` driven from Node against the REAL daemon —
+`health` → `{ok:true, needle:{enabled:true,loaded:false}, laya:{child_pid:null}, ledger:{writable:true}}`,
+`POST /repair` → `{ok:false,degraded:true,error:"http 404"}`, sidecar down → `{ok:false,degraded:true,
+error:"network: fetch failed"}`, and the daemon's cwd held **only** the ledger (no pid/log).
+
 ### Findings
-(empty — fill in during this phase's Test/Debug Sprint)
+- **Nothing here loads a model, on purpose.** `needle.loaded=false`, `laya.loaded=false`,
+  `laya.child_pid=null` are hard-coded in `health_obj()`; Phases 12/13 replace them. Phase 10 is
+  plumbing only — do not "finish" it by wiring an engine in.
+- **`needle.weights` is a cheap `NEEDLE_WEIGHTS` env check, not a real probe** (`needle_weights_present()`
+  does `os.path.isfile(os.environ['NEEDLE_WEIGHTS'])`). Deliberate: importing `needle` in Phase 10
+  would contradict "nothing loads a model". **Phase 12 must replace it** with the package's real
+  `_base_weights_path(3)` check.
+- **`degraded` semantics (decided here, later phases depend on it):** one reason per **enabled**
+  feature that cannot serve *right now*; a feature deliberately turned off with `--no-needle`/
+  `--no-laya` is **not** degraded. So `--no-needle --no-laya` ⇒ `degraded == []`, while a
+  needle-enabled daemon without weights reports `["needle weights missing"]` and an enabled Laya
+  reports `["laya child not started"]` (Phase 13 replaces that with a real child check).
+- **The Origin guard runs before *everything*, but the POST size cap runs before routing.**
+  A deliberate deviation from `bridge.py`'s order: Phase 10 has **no** POST route, so with
+  route-first ordering the oversized-body case could never return 413 (it would always be 404).
+  **Whoever adds the first POST route in Phase 12 must keep 413-before-404 and re-assert
+  "foreign Origin → 403, not 404".**
+- **The daemon must never write a pid/log file** (unlike `bridge_daemon.py`). The suite asserts the
+  daemon's cwd contains the ledger only. Consequence: there is no daemon log to inspect at runtime —
+  use `stderr` (`[LOCALMODELS] ...`) and `/health`.
+- **`__pycache__` is now git-ignored — this was a real near-miss.** `sys.dont_write_bytecode = True`
+  *inside* `ledger.py` cannot stop the interpreter from writing `ledger.pyc` while importing it
+  (the flag takes effect only after the module body runs). Only the `PYTHONDONTWRITEBYTECODE=1` env
+  var (which the test subprocess sets) actually prevents it. Verified with `git check-ignore` that
+  the old `.gitignore` did **not** cover `localmodels/__pycache__`, so bytecode would have been
+  committable into a share-ready public repo. Added `__pycache__/` + `*.py[cod]`.
+- **The UMD wrapper now passes `root` into the factory** (`factory(root)` / `function (root)`).
+  The shipped factory took no parameter, so the injected-fetch default (`root.fetch`) and the
+  `AbortSignal.timeout` guard were literally unreachable (`ReferenceError: root is not defined`).
+  Under Node the root is `module.exports` (no `fetch`), so "no `fetchImpl` ⇒ degraded" still holds.
+  **This is the one change in `appcore.js` outside `localModels`; treat it as load-bearing.**
+- **jsdom in THIS environment DOES have `AbortSignal.timeout`** (Node 24 supplies it) — the plan and
+  earlier gatelog notes assume it does not. The guard is still required for older browsers; the test
+  deletes the static in-realm and asserts the call still resolves rather than assuming its absence.
+  **Correct the "jsdom has no AbortSignal.timeout" claim wherever you rely on it.**
+- **`refreshCortexStatus()` short-circuits on `enabled === false` and renders `LOCAL CORTEX: DISABLED`
+  without touching `fetch`.** That short-circuit *is* the phase's hard gate (`enabled=false` ⇒ zero
+  requests to :8932). **Do not "improve" it into an unconditional probe** — the gate would silently
+  become untestable, and a disabled feature would start talking to a port on every boot.
+- **`normLocalModels()` is load-bearing for every later phase.** A stored blob from an older
+  revision (or a corrupt one) is merged field-by-field over `DEF_SETTINGS.localModels`, so
+  `settings.localModels.needle.minConfidence` etc. can never be `undefined`. Phases 11-15 index into
+  these sub-objects on hot paths (stream deltas, agent turn) — keep the normaliser and keep it
+  called at boot and in `writeCortexFields()`.
+- **Ledger redaction is verified, not merely written:** an independent probe confirmed the configured
+  key → `[REDACTED-KEY]` anywhere in a string, `Authorization: …`/`Bearer …` → `[REDACTED-AUTH]`,
+  `sk-…` → `[REDACTED-KEY]`, a dict key named `api_key`/`authorization`/`apikey`/`x-api-key` always
+  redacts its value, home dir → `~`, and a 2500-char field → `…[truncated 500]` (field ends up 2016
+  chars, so assert *marker present*, never `endswith`). `append_record` returns `False` and logs to
+  stderr on an unwritable path instead of raising — the request path is never broken by a bad ledger.
+- **Harness notes:** the phase-10 suite reaches `settings` via `app.window.eval(...)` (`const
+  DEF_SETTINGS` / `let settings` are not window properties) and spies on `app.events` for `:8932`
+  URLs. `appcore.js` is UMD, so the same file is `require()`d directly for the client unit cases.
+- **Process:** the phase was split across two `delegate_task` children on non-overlapping files
+  (A: `localmodels/**` + `test_e2e.py`; B: `appcore.js` + `index.html` + the phase-10 suite), each
+  required to do a red-first run and forbidden to commit or run the other's suite — the Phase 9
+  team-of-subagents model. Both children's RED runs are recorded in their summaries; the integrator
+  re-ran the **full** `npm test` on the final tree and separately drove the real client against the
+  real daemon, because a mocked suite plus a urllib suite still leave that seam untested.
+  The two delegation specs lived in `docs/plans/phase10-workstream-{A,B}.md` and were **deleted
+  before committing** — they contained this machine's absolute repo path, which the share-readiness
+  rule forbids in tracked files. Phase 11+ should do the same (spec on disk for the child, deleted
+  at commit time) rather than inventing absolute paths into the repo.
+- **Next agent:** Phase 11 (deterministic salvage + golden corpus) is open. Read its block above and
+  the plan's Phase 11 section. Nothing in Phase 10 blocks it: `CogCore.localModels.client` is ready
+  and inert, and the sidecar is not needed until Phase 12.
 
 ## Phase 11 — Deterministic salvage pass + golden corpus
 Status: not started
@@ -566,3 +640,18 @@ machine-specific changes; PR opened against `main`.
   process-wide (`needle/__init__.py:_active`), so serialize all Needle calls behind a lock; an
   untuned base model reports a calibrated `confidence`, a tuned `.cact` without a confidence head
   reports `None`. Both facts are from the installed 3.0.4 source, not from the spec.
+- 2026-09-23 (Phase 10 session, cron): Phase 10 done and committed. Decisions taken here that a
+  later session must not silently reverse — recorded so they are not re-litigated:
+  1. `degraded` in `/health` means "an ENABLED feature cannot serve right now"; a deliberately
+     disabled engine is not a degradation.
+  2. `refreshCortexStatus()` must keep its `enabled === false` short-circuit (it is the "zero
+     requests to :8932 while off" guarantee) and `normLocalModels()` must keep normalising at boot.
+  3. The localmodels daemon checks the POST size cap **before** routing (413 outranks 404) — a
+     deviation from `bridge.py`, required because Phase 10 has no POST route yet.
+  4. `localmodels/local_models_daemon.py` writes no pid/log file, by design.
+  5. `.gitignore` gained `__pycache__/` + `*.py[cod]` (bytecode from importing `ledger.py` was
+     committable otherwise).
+- Deferred/hand-off: `/repair`, `/decide`, `/select`, `POST /ledger` routes and every model load are
+  **not** implemented (Phases 12-14). `needle.weights` in `/health` is an env-var-only check that
+  Phase 12 must replace with the real weights-path probe. No pull request yet — Phase 15 opens the
+  single PR; until then commits land on `feat/local-cortex-needle-laya`.

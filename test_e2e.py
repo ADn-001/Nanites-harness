@@ -165,5 +165,184 @@ finally:
     try: da.wait(timeout=5)
     except subprocess.TimeoutExpired: da.kill()
 
+# ---------------- localmodels sidecar (Phase 10, workstream A) ----------------
+def lm_probe(msg, fn):
+    """Run one localmodels case; an exception (e.g. ConnectionRefused while the
+    daemon does not exist yet) is a FAIL for that case, not an aborted suite."""
+    try:
+        check(bool(fn()), msg)
+    except Exception as e:
+        check(False, '%s [%s: %s]' % (msg, type(e).__name__, e))
+
+lmdir = tempfile.mkdtemp(prefix='coglm-')
+lmport = 18933
+lmledger = os.path.join(lmdir, 'local-models.jsonl')
+lmd = subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+                        '--port', str(lmport), '--ledger', lmledger, '--no-needle', '--no-laya'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=lmdir)
+time.sleep(1.0)
+try:
+    def lm_health_shape():
+        s, j = req(lmport, '/health')
+        return (s == 200 and j.get('ok') is True and j.get('version') == '0.1.0'
+                and {'needle', 'laya', 'ledger', 'degraded'} <= set(j)
+                and isinstance(j.get('degraded'), list)
+                and j['needle'].get('enabled') is False and j['laya'].get('enabled') is False
+                and j['needle'].get('loaded') is False and j['laya'].get('loaded') is False
+                and j['laya'].get('child_pid') is None
+                and j['needle'].get('weights') in ('missing', 'present')
+                and isinstance(j['needle'].get('generation'), int)
+                and 'lib' in j['needle'] and 'cache' in j['laya']
+                and j['ledger'].get('path') == os.path.abspath(lmledger)
+                and j['ledger'].get('writable') is True)
+    lm_probe('localmodels: boot + GET /health 200 (shape, engines disabled, models unloaded)', lm_health_shape)
+
+    def lm_degraded_empty():
+        s, j = req(lmport, '/health')
+        return s == 200 and j.get('degraded') == []
+    lm_probe('localmodels: --no-needle --no-laya => degraded == [] (disabled is not degraded)', lm_degraded_empty)
+
+    # second instance WITHOUT --no-needle: needle enabled but weights missing => degraded reason
+    lmport2 = 18934
+    lm2ledger = os.path.join(lmdir, 'local-models-2.jsonl')
+    lmd2 = subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+                             '--port', str(lmport2), '--ledger', lm2ledger, '--no-laya'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=lmdir)
+    time.sleep(1.0)
+    try:
+        def lm_needle_enabled():
+            s, j = req(lmport2, '/health')
+            return (s == 200 and j['needle'].get('enabled') is True
+                    and j['needle'].get('loaded') is False
+                    and any('needle' in str(r) for r in j.get('degraded', [])))
+        lm_probe('localmodels: without --no-needle => needle.enabled True + needle degraded reason', lm_needle_enabled)
+    finally:
+        lmd2.terminate()
+        try: lmd2.wait(timeout=5)
+        except subprocess.TimeoutExpired: lmd2.kill()
+
+    def lm_foreign_origin():
+        s, j = req(lmport, '/health', origin='http://evil.example')
+        return s == 403 and j.get('error') == 'origin not permitted'
+    lm_probe('localmodels: foreign Origin GET /health => 403 origin not permitted', lm_foreign_origin)
+
+    def lm_null_origin():
+        s, j = req(lmport, '/health', origin='null')
+        return s == 403 and j.get('error') == 'origin not permitted'
+    lm_probe('localmodels: null Origin => 403 by default (no file:// trust)', lm_null_origin)
+
+    def lm_localhost_origin():
+        s, j = req(lmport, '/health', origin='http://localhost:8080')
+        return s == 200 and j.get('ok') is True
+    lm_probe('localmodels: http://localhost:8080 Origin allowed', lm_localhost_origin)
+
+    def lm_127_origin():
+        s, j = req(lmport, '/health', origin='http://127.0.0.1:8080')
+        return s == 200 and j.get('ok') is True
+    lm_probe('localmodels: http://127.0.0.1:8080 Origin allowed', lm_127_origin)
+
+    def lm_no_origin():
+        s, j = req(lmport, '/health')
+        return s == 200 and j.get('ok') is True
+    lm_probe('localmodels: missing Origin allowed (curl/native callers)', lm_no_origin)
+
+    def lm_get_unknown():
+        s, j = req(lmport, '/nope')
+        return s == 404 and j.get('error') == 'unknown rite' and j.get('ok') is False
+    lm_probe('localmodels: GET /nope => 404 unknown rite (JSON, no traceback)', lm_get_unknown)
+
+    def lm_post_unknown():
+        s, j = req(lmport, '/nope', {})
+        return s == 404 and j.get('error') == 'unknown rite' and j.get('ok') is False
+    lm_probe('localmodels: POST /nope => 404 unknown rite (JSON, no traceback)', lm_post_unknown)
+
+    def lm_oversized():
+        s, j = req(lmport, '/nope', raw=b'{"x":"' + b'a' * (2 * 1024 * 1024) + b'"}')
+        return s == 413 and j.get('ok') is False
+    lm_probe('localmodels: oversized POST body (> 1 MiB) => 413', lm_oversized)
+
+    def lm_foreign_post_before_route():
+        s, j = req(lmport, '/nope', {}, origin='http://evil.example')
+        return s == 403 and j.get('error') == 'origin not permitted'
+    lm_probe('localmodels: foreign-Origin POST refused before route logic (403, not 404)',
+             lm_foreign_post_before_route)
+
+    # the ONLY file the daemon may write is the ledger
+    def lm_no_stray_files():
+        return set(os.listdir(lmdir)) <= {'local-models.jsonl', 'local-models-2.jsonl'}
+    lm_probe('localmodels: daemon wrote no pid/log file next to itself (ledger only)',
+             lm_no_stray_files)
+
+    # ---- ledger.py standalone (run from BASE, ledger in the temp dir) ----
+    lm_ledger_script = (
+        "import sys; sys.path.insert(0, 'localmodels'); import ledger\n"
+        "ok = ledger.append_record({\n"
+        "    'trace_id': ledger.new_trace_id(), 'model': 'needle', 'op': 'repair',\n"
+        "    'input_redacted': 'Authorization: Bearer ***', 'output': 'x' * 2500,\n"
+        "    'confidence': 0.9, 'latency_ms': 12, 'degraded': False, 'action': None,\n"
+        "    'request': {'api_key': 'supersecretvalue123',\n"
+        "                'header': 'Authorization: Bearer abcdef123456'}},\n"
+        "    path=%r, api_key='supersecretvalue123', home=%r)\n"
+        "print('APPENDED' if ok else 'FAILED')" % (lmledger, lmdir)
+    )
+
+    def lm_ledger_record():
+        if os.path.isfile(lmledger):
+            os.remove(lmledger)
+        # PYTHONDONTWRITEBYTECODE: a fresh interpreter writes a __pycache__ next to
+        # localmodels/*.py otherwise, and this repo is share-ready (no stray artifacts).
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+        r = subprocess.run([sys.executable, '-c', lm_ledger_script],
+                           cwd=BASE, capture_output=True, text=True, timeout=60, env=env)
+        if r.returncode != 0 or 'APPENDED' not in (r.stdout or ''):
+            print('   ledger subprocess rc=%s stdout=%r stderr=%r' % (r.returncode, r.stdout, r.stderr))
+            return False
+        if not os.path.isfile(lmledger):
+            print('   ledger file was not created at %s' % lmledger)
+            return False
+        raw = open(lmledger, encoding='utf-8').read()
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        if len(lines) != 1:
+            print('   ledger has %d lines, expected exactly 1' % len(lines))
+            return False
+        rec = json.loads(lines[0])
+        if 'supersecretvalue123' in raw:
+            print('   ledger leaked the configured api key')
+            return False
+        if 'Bearer abcdef123456' in raw:
+            print('   ledger leaked a Bearer token')
+            return False
+        out = rec.get('output', '')
+        if '…[truncated' not in out or len(out) >= 2500:
+            print('   output was not truncated with the marker: %r' % out[-40:])
+            return False
+        if rec.get('request', {}).get('api_key') != '[REDACTED-AUTH]':
+            print('   request.api_key was not redacted: %r' % rec.get('request'))
+            return False
+        if not rec.get('ts'):
+            return False
+        if not str(rec.get('trace_id', '')).startswith('tr'):
+            return False
+        return True
+    lm_probe('localmodels: ledger record written, single line, parsed, key/Bearer redacted, '
+             'output truncated, request.api_key redacted', lm_ledger_record)
+
+    # ---- installers / docs shipped by this workstream ----
+    def lm_support_files():
+        for name in ('README.md', 'setup.sh', 'setup.ps1'):
+            p = os.path.join(BASE, 'localmodels', name)
+            if not os.path.isfile(p) or os.path.getsize(p) == 0:
+                print('   missing or empty: %s' % p)
+                return False
+        readme = open(os.path.join(BASE, 'localmodels', 'README.md'), encoding='utf-8').read()
+        return 'GET /health' in readme and 'var/local-models.jsonl' in readme
+    lm_probe('localmodels: README + setup.sh + setup.ps1 exist and document /health + the ledger path',
+             lm_support_files)
+finally:
+    lmd.terminate()
+    try: lmd.wait(timeout=5)
+    except subprocess.TimeoutExpired: lmd.kill()
+    shutil.rmtree(lmdir, ignore_errors=True)
+
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)

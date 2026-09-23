@@ -364,6 +364,28 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
     <div class="field chk"><input id="set-agent" type="checkbox"><label for="set-agent" style="margin:0">&#9763; AGENT MODE — MACHINE-SPIRIT MAY INVOKE BRIDGE RITES</label></div>
     <div class="field chk"><input id="set-auto-read" type="checkbox" checked><label for="set-auto-read" style="margin:0">AUTO-AUTHORIZE READ-ONLY RITES (FILE READ / LIST / GREP / SAFE GIT INQUIRY)</label></div>
     <div class="field">
+      <label>LOCAL CORTEX — SIDECAR 127.0.0.1 / NEEDLE + LAYA (OPT-IN, LOCAL ONLY)</label>
+      <div style="font-size:9.5px;color:var(--phos-dim);letter-spacing:.12em;line-height:1.8;margin-bottom:6px">
+        NEEDLE AND LAYA ARE OPT-IN MODELS THAT RUN LOCALLY ON THIS MACHINE; THEY ARE OFF BY DEFAULT AND NOTHING BELOW REACHES THE NETWORK. WHILE "ENABLE LOCAL CORTEX" IS UNTICKED THE PAGE NEVER CONTACTS THE SIDECAR PORT AT ALL, AND THE HARNESS WORKS IDENTICALLY WHEN THE MODELS ARE ABSENT. A DEAD OR SILENT SIDECAR READS AS OFFLINE/DEGRADED AND FAILS OPEN — IT NEVER BLOCKS, NEVER THROWS, NEVER ASKS FOR AN API KEY.
+      </div>
+      <div class="field chk"><input id="set-lm-enabled" type="checkbox"><label for="set-lm-enabled" style="margin:0">ENABLE LOCAL CORTEX (OPT-IN — EVERYTHING BELOW IS OFF BY DEFAULT AND RUNS LOCALLY)</label></div>
+      <div class="field chk"><input id="set-lm-needle" type="checkbox"><label for="set-lm-needle" style="margin:0">NEEDLE — REPAIR MALFORMED TOOL CALLS (LOCAL, OPT-IN)</label></div>
+      <div class="field"><label>NEEDLE MIN CONFIDENCE (0—1, STEP .05)</label><input id="set-lm-needle-conf" type="number" min="0" max="1" step=".05" value="0.75"></div>
+      <div class="field"><label>NEEDLE TIMEOUT (MS)</label><input id="set-lm-needle-timeout" type="number" min="50" step="50" value="800"></div>
+      <div class="field chk"><input id="set-lm-laya" type="checkbox"><label for="set-lm-laya" style="margin:0">LAYA — PRE-FLIGHT + ANOMALY GATES (LOCAL, OPT-IN)</label></div>
+      <div class="field"><label>LAYA MIN CONFIDENCE (0—1, STEP .05)</label><input id="set-lm-laya-conf" type="number" min="0" max="1" step=".05" value="0.70"></div>
+      <div class="field"><label>LAYA TIMEOUT (MS)</label><input id="set-lm-laya-timeout" type="number" min="50" step="50" value="500"></div>
+      <div class="field chk"><input id="set-lm-laya-preflight" type="checkbox" checked><label for="set-lm-laya-preflight" style="margin:0">LAYA PRE-FLIGHT ON MUTATING RITES</label></div>
+      <div class="field chk"><input id="set-lm-laya-anomaly" type="checkbox" checked><label for="set-lm-laya-anomaly" style="margin:0">LAYA REPLY-ANOMALY FLAG</label></div>
+      <div class="field chk"><input id="set-lm-sanitizer" type="checkbox" checked><label for="set-lm-sanitizer" style="margin:0">DETERMINISTIC SANITIZER PASS (FREE — NO MODEL, ON BY DEFAULT)</label></div>
+      <div class="field chk"><input id="set-lm-dispatcher" type="checkbox"><label for="set-lm-dispatcher" style="margin:0">LOCAL DISPATCHER (CHEAP PRE-ROUTER — OPT-IN)</label></div>
+      <div class="field chk"><input id="set-lm-dispatcher-autoread" type="checkbox" checked><label for="set-lm-dispatcher-autoread" style="margin:0">AUTO-RUN READ-ONLY DISPATCHER PROPOSALS</label></div>
+      <div class="field"><label>LOCAL CORTEX SIDECAR PORT (127.0.0.1 ONLY)</label><input id="set-lm-port" type="number" min="1" max="65535" value="8932"></div>
+      <div class="field"><label>LOCAL CORTEX LEDGER (APPEND-ONLY JSONL PATH, RELATIVE TO THE REPO)</label><input id="set-lm-ledger" type="text" value="var/local-models.jsonl"></div>
+      <div id="lm-status" style="font-size:10px;margin-top:6px;letter-spacing:.15em;color:var(--phos-dim)">LOCAL CORTEX: DISABLED</div>
+      <button class="tbtn" id="test-cortex" style="margin-top:6px">&#9881; PROBE LOCAL CORTEX</button>
+    </div>
+    <div class="field">
       <label>CANTICLE / SYSTEM PROMPT</label>
       <textarea id="set-sys" placeholder="You are a machine-spirit of the Adeptus Mechanicus..."></textarea>
     </div>
@@ -416,10 +438,37 @@ const LS_CHATS='cogitator.chats', LS_SET='cogitator.settings', LS_ACTIVE='cogita
 const DEF_SETTINGS={endpoint:'',model:'',system:'',backend:'auto',
   temperature:0.7,topP:0.9,presence:0,frequency:0,ctxLimit:131072,compactAt:70,autoCompact:true,
   flashAttention:false,kvOffload:false,workdir:null,autoBridge:true,
-  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:'',apiKey:''};
+  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:'',apiKey:'',
+  localModels:{enabled:false,
+  needle:{enabled:false,minConfidence:0.75,confirmBand:[0.5,0.75],timeoutMs:800},
+  laya:{enabled:false,minConfidence:0.70,timeoutMs:500,preflight:true,anomaly:true},
+  sanitizer:{enabled:true,mode:'auto',deterministicPass:true},
+  dispatcher:{enabled:false,autoReadOnly:true},
+  port:8932, ledger:'var/local-models.jsonl'}};
 let settings={...DEF_SETTINGS};
 try{Object.assign(settings,JSON.parse(localStorage.getItem(LS_SET)||'{}'));}catch(e){}
 try{settings.profiles=(window.CogCore&&CogCore.profileStore)?CogCore.profileStore.list(localStorage):(settings.profiles||[]);}catch(e){}
+/* LOCAL CORTEX normaliser — a partial/legacy/corrupt stored blob must NEVER leave
+   settings.localModels with undefined sub-objects (every later phase indexes into it). */
+function normLocalModels(v){
+  const d=DEF_SETTINGS.localModels;
+  const out=Object.assign({},d);
+  const src=(v&&typeof v==='object'&&!Array.isArray(v))?v:{};
+  for(const name of ['needle','laya','sanitizer','dispatcher']){
+    const base=d[name],got=src[name];
+    const sub=Object.assign({},base);
+    if(got&&typeof got==='object'&&!Array.isArray(got)){
+      for(const k in base){if(Object.prototype.hasOwnProperty.call(base,k)&&Object.prototype.hasOwnProperty.call(got,k))sub[k]=got[k];}
+    }
+    out[name]=sub;
+  }
+  if(typeof src.enabled==='boolean')out.enabled=src.enabled;
+  const p=(typeof src.port==='number')?src.port:parseInt(src.port,10);
+  if(typeof p==='number'&&isFinite(p)&&p>0)out.port=p;
+  if(typeof src.ledger==='string'&&src.ledger)out.ledger=src.ledger;
+  return out;
+}
+try{settings.localModels=normLocalModels(settings.localModels);}catch(e){settings.localModels=normLocalModels(null);saveSet();}
 let chats=[]; try{chats=JSON.parse(localStorage.getItem(LS_CHATS)||'[]');}catch(e){}
 let activeId=localStorage.getItem(LS_ACTIVE)||null;
 let abortCtl=null, generating=false, sidebarOpen=false, backendType='unknown';
@@ -1216,9 +1265,82 @@ $('open-settings').onclick=()=>{
   $('test-result').textContent='';
   refreshWorkdirUI();refreshBridgeChip();
   refreshProfileList();
+  restoreCortexFields();
+  if(settings.localModels&&settings.localModels.enabled)refreshCortexStatus();
   $('settings-modal').classList.add('open');
   testConnection(true);
 };
+/* ================= LOCAL CORTEX OPS (PHASE 10) =================
+   Opt-in, OFF by default. While settings.localModels.enabled is falsy the page makes
+   ZERO requests to the sidecar port — refreshCortexStatus() returns before touching fetch. */
+function restoreCortexFields(){
+  const lm=normLocalModels(settings.localModels);
+  if($('set-lm-enabled'))$('set-lm-enabled').checked=!!lm.enabled;
+  if($('set-lm-needle'))$('set-lm-needle').checked=!!lm.needle.enabled;
+  if($('set-lm-needle-conf'))$('set-lm-needle-conf').value=lm.needle.minConfidence;
+  if($('set-lm-needle-timeout'))$('set-lm-needle-timeout').value=lm.needle.timeoutMs;
+  if($('set-lm-laya'))$('set-lm-laya').checked=!!lm.laya.enabled;
+  if($('set-lm-laya-conf'))$('set-lm-laya-conf').value=lm.laya.minConfidence;
+  if($('set-lm-laya-timeout'))$('set-lm-laya-timeout').value=lm.laya.timeoutMs;
+  if($('set-lm-laya-preflight'))$('set-lm-laya-preflight').checked=!!lm.laya.preflight;
+  if($('set-lm-laya-anomaly'))$('set-lm-laya-anomaly').checked=!!lm.laya.anomaly;
+  if($('set-lm-sanitizer'))$('set-lm-sanitizer').checked=!!lm.sanitizer.enabled;
+  if($('set-lm-dispatcher'))$('set-lm-dispatcher').checked=!!lm.dispatcher.enabled;
+  if($('set-lm-dispatcher-autoread'))$('set-lm-dispatcher-autoread').checked=!!lm.dispatcher.autoReadOnly;
+  if($('set-lm-port'))$('set-lm-port').value=lm.port;
+  if($('set-lm-ledger'))$('set-lm-ledger').value=lm.ledger;
+}
+function writeCortexFields(){
+  const d=DEF_SETTINGS.localModels;
+  const lm=normLocalModels(settings.localModels);   /* never leave undefined sub-objects */
+  const numf=(id,def)=>{const el=$(id);if(!el)return def;const v=parseFloat(el.value);return isFinite(v)?v:def;};
+  const numi=(id,def)=>{const el=$(id);if(!el)return def;const v=parseInt(el.value,10);return isFinite(v)?v:def;};
+  lm.enabled=!!($('set-lm-enabled')&&$('set-lm-enabled').checked);
+  lm.needle.enabled=!!($('set-lm-needle')&&$('set-lm-needle').checked);
+  lm.needle.minConfidence=numf('set-lm-needle-conf',d.needle.minConfidence);
+  lm.needle.timeoutMs=numi('set-lm-needle-timeout',d.needle.timeoutMs);
+  lm.laya.enabled=!!($('set-lm-laya')&&$('set-lm-laya').checked);
+  lm.laya.minConfidence=numf('set-lm-laya-conf',d.laya.minConfidence);
+  lm.laya.timeoutMs=numi('set-lm-laya-timeout',d.laya.timeoutMs);
+  lm.laya.preflight=!!($('set-lm-laya-preflight')&&$('set-lm-laya-preflight').checked);
+  lm.laya.anomaly=!!($('set-lm-laya-anomaly')&&$('set-lm-laya-anomaly').checked);
+  lm.sanitizer.enabled=!!($('set-lm-sanitizer')&&$('set-lm-sanitizer').checked);
+  lm.dispatcher.enabled=!!($('set-lm-dispatcher')&&$('set-lm-dispatcher').checked);
+  lm.dispatcher.autoReadOnly=!!($('set-lm-dispatcher-autoread')&&$('set-lm-dispatcher-autoread').checked);
+  lm.port=numi('set-lm-port',d.port);
+  const led=$('set-lm-ledger');
+  lm.ledger=(led&&led.value.trim())?led.value.trim():d.ledger;
+  settings.localModels=lm;
+}
+async function refreshCortexStatus(){
+  try{
+    const el=$('lm-status');
+    const lm=normLocalModels(settings.localModels);
+    if(!lm.enabled){if(el)el.textContent='LOCAL CORTEX: DISABLED';return;}
+    if(el)el.textContent='LOCAL CORTEX: PROBING…';
+    let r=null;
+    try{
+      if(!(window.CogCore&&CogCore.localModels&&CogCore.localModels.client))throw new Error('client unavailable');
+      r=await CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/').health();
+    }catch(e){r={ok:false,degraded:true,error:String((e&&e.message)||e)};}
+    if(!el)return;
+    if(!r||r.ok===false){
+      el.textContent='LOCAL CORTEX: OFFLINE (degraded)'+(r&&r.error?' — '+r.error:'');
+      return;
+    }
+    const nd=r.needle||{},ly=r.laya||{};
+    const needle=nd.enabled?(nd.loaded?'loaded':'unloaded'):'off';
+    const laya=ly.enabled?(ly.loaded?'loaded':'unloaded'):'off';
+    let txt='LOCAL CORTEX: needle '+needle+(nd.weights?'/'+nd.weights:'')+' · laya '+laya+
+      ' · ledger '+((r.ledger&&r.ledger.path)||lm.ledger||'(unknown)');
+    const deg=Array.isArray(r.degraded)?r.degraded.filter(Boolean):[];
+    if(deg.length)txt+=' · degraded: '+deg.join('; ');
+    el.textContent=txt;
+  }catch(e){
+    const el=$('lm-status');if(el)el.textContent='LOCAL CORTEX: OFFLINE (degraded)';
+  }
+}
+if($('test-cortex'))$('test-cortex').onclick=()=>{refreshCortexStatus();};
 /* ================= PROFILE OPS ================= */
 function refreshProfileList(){
   const sel=$('prof-list');if(!sel)return;
@@ -1290,6 +1412,7 @@ $('save-settings').onclick=()=>{
   settings.topP=parseFloat($('set-topp').value);
   settings.presence=parseFloat($('set-pres').value);
   settings.frequency=parseFloat($('set-freq').value);
+  writeCortexFields();
   saveSet();$('settings-modal').classList.remove('open');
   $('model-name').textContent=settings.model||'—';ctxUsage();testConnection(true);
 };

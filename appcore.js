@@ -7,11 +7,11 @@
  */
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = factory();
+    module.exports = factory(root);
   } else {
-    root.CogCore = factory();
+    root.CogCore = factory(root);
   }
-})(typeof self !== 'undefined' ? self : this, function () {
+})(typeof self !== 'undefined' ? self : this, function (root) {
   'use strict';
 
   var CogCore = {
@@ -328,6 +328,125 @@
       }
 
       return { ok: errors.length === 0, errors: errors, sanitized: sanitized };
+    },
+
+    /* ================= PHASE 10 — LOCAL CORTEX CLIENT =================
+     * The ONLY door between the harness and the local-models sidecar (127.0.0.1:8932).
+     * Pure and DOM-free: the transport is INJECTED so jsdom/Node tests need no server,
+     * and the whole object may never throw or reject — the sidecar is opt-in, so a
+     * dead/missing/lying sidecar must degrade, never break the conversation.
+     *
+     *   CogCore.localModels.client(base, fetchImpl, clock) ->
+     *     { health(), repair(payload,opts), decide(payload,opts),
+     *       selectTool(payload,opts), outcome(payload,opts) }
+     *
+     *  - `base` is e.g. 'http://127.0.0.1:8932' (trailing slashes are tolerated).
+     *  - `fetchImpl` defaults to `root.fetch`; when neither exists every call resolves
+     *    {ok:false, degraded:true}.
+     *  - `clock` is an injected time source: an object with now() OR a function returning
+     *    ms. It is used ONLY for the elapsed-ms field; default Date.now.
+     *  - Every failure (network reject, abort/timeout, non-2xx, unparseable JSON, no fetch)
+     *    resolves {ok:false, degraded:true, error:'<short reason>'} — never a throw.
+     *  - No `Authorization` header is ever sent: the sidecar is local and must never
+     *    receive an API key.
+     */
+    localModels: {
+      /* The settings block (plan §4). Kept byte-comparable with DEF_SETTINGS.localModels. */
+      DEFAULTS: {
+        enabled: false,
+        needle: { enabled: false, minConfidence: 0.75, confirmBand: [0.5, 0.75], timeoutMs: 800 },
+        laya: { enabled: false, minConfidence: 0.70, timeoutMs: 500, preflight: true, anomaly: true },
+        sanitizer: { enabled: true, mode: 'auto', deterministicPass: true },
+        dispatcher: { enabled: false, autoReadOnly: true },
+        port: 8932,
+        ledger: 'var/local-models.jsonl'
+      },
+
+      /* Per-call bounded timeouts (ms). Overridable with opts.timeoutMs. */
+      TIMEOUTS: { health: 1500, repair: 800, decide: 500, select: 800, outcome: 1500 },
+
+      client: function (base, fetchImpl, clock) {
+        var b = '';
+        try { b = String(base == null ? '' : base).replace(/\/+$/, ''); } catch (e) { b = ''; }
+
+        var doFetch = (typeof fetchImpl === 'function') ? fetchImpl
+          : ((root && typeof root.fetch === 'function') ? function () { return root.fetch.apply(root, arguments); } : null);
+
+        var nowMs = function () {
+          try {
+            if (typeof clock === 'function') return clock();
+            if (clock && typeof clock.now === 'function') return clock.now();
+          } catch (e) { /* fall through to the wall clock */ }
+          try { return Date.now(); } catch (e) { return 0; }
+        };
+
+        var degraded = function (reason) {
+          return { ok: false, degraded: true, error: String(reason == null ? 'unavailable' : reason) };
+        };
+
+        var timeoutFor = function (opts, dflt) {
+          var v = opts && opts.timeoutMs;
+          return (typeof v === 'number' && isFinite(v) && v > 0) ? v : dflt;
+        };
+
+        /* One bounded request. ALWAYS resolves an object; never throws, never rejects. */
+        var request = function (method, path, payload, timeoutMs) {
+          if (!doFetch) return Promise.resolve(degraded('no fetch implementation available'));
+          var url = b + path;
+          var init = { method: method, headers: { 'Content-Type': 'application/json' } };
+          if (method !== 'GET') {
+            var bodyText = '{}';
+            try { bodyText = JSON.stringify(payload || {}); } catch (e) { bodyText = '{}'; }
+            init.body = bodyText;
+          }
+          try {
+            /* jsdom has no AbortSignal.timeout — build the signal DEFENSIVELY. */
+            init.signal = (root && root.AbortSignal && root.AbortSignal.timeout)
+              ? root.AbortSignal.timeout(timeoutMs) : undefined;
+          } catch (e) { init.signal = undefined; }
+
+          var started = nowMs();
+          return new Promise(function (resolve) {
+            var settled = false;
+            var done = function (v) { if (settled) return; settled = true; try { resolve(v); } catch (e) { /* nothing left to do */ } };
+
+            var p;
+            try { p = doFetch(url, init); }
+            catch (e) { return done(degraded('fetch threw: ' + ((e && e.message) || e))); }
+            if (!p || typeof p.then !== 'function') return done(degraded('fetch returned no promise'));
+
+            p.then(function (res) {
+              try {
+                if (!res) return done(degraded('empty response'));
+                if (res.ok === false) return done(degraded('http ' + (res.status || 'error')));
+                if (typeof res.json !== 'function') return done(degraded('response has no json()'));
+                return Promise.resolve(res.json()).then(function (json) {
+                  var out = Object.assign({}, (json && typeof json === 'object') ? json : {}, {
+                    /* keep the server's own ok:false; otherwise the body parsed => ok */
+                    ok: (json && json.ok === false) ? false : true
+                  });
+                  var elapsed = nowMs() - started;
+                  out.latency_ms = (typeof elapsed === 'number' && isFinite(elapsed) && elapsed >= 0) ? Math.round(elapsed) : 0;
+                  done(out);
+                }, function (e) { done(degraded('unparseable json: ' + ((e && e.message) || e))); });
+              } catch (e) { done(degraded('bad response: ' + ((e && e.message) || e))); }
+            }, function (e) { done(degraded('network: ' + ((e && e.message) || e))); });
+          });
+        };
+
+        return {
+          /* GET /health — is the sidecar alive, are the models loaded, is the ledger writable? */
+          health: function (opts) { return request('GET', '/health', null, timeoutFor(opts, 1500)); },
+          /* POST /repair — Needle: salvage a malformed tool call. */
+          repair: function (payload, opts) { return request('POST', '/repair', payload, timeoutFor(opts, 800)); },
+          /* POST /decide — Laya: gate a mutating rite / flag a reply anomaly. */
+          decide: function (payload, opts) { return request('POST', '/decide', payload, timeoutFor(opts, 500)); },
+          /* POST /select — cheap local pre-router candidate selection. */
+          selectTool: function (payload, opts) { return request('POST', '/select', payload, timeoutFor(opts, 800)); },
+          /* POST /ledger — record the operator/outcome verdict for a trace (payload as-is). */
+          outcome: function (payload, opts) { return request('POST', '/ledger', payload, timeoutFor(opts, 1500)); }
+        };
+      }
     },
 
     /**
