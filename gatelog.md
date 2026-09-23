@@ -1,7 +1,16 @@
 # GATELOG — COGITATOR feature work tracker
 
+Next phase to work on: **Phase 10 — Local Cortex plumbing (flags, sidecar skeleton, ledger, health)**
+
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
+
+Phase numbering is continuous across the whole project. Phases 0-9 (chat frontend, profiles,
+attachments, agent prompt, validator, security hardening) are DONE and their suite files are in
+`tests/frontend/`. Phases 10-15 are the **Local Cortex** work (Needle + Laya tool-call middleware)
+and are planned in `docs/plans/needle-laya-middleware-plan.md` — read that document before
+touching a phase; it is self-contained and defines the contracts (sidecar routes, ledger shape,
+settings block, frontend seam) so no session needs conversational context.
 
 ---
 
@@ -410,3 +419,142 @@ whole daemon hostile-origin matrix) and `node tests/frontend/run.js` → FRONTEN
   `sw.js` cache never bumped, #23 dual profile source of truth, #24 duplicated bridge URL plumbing,
   #27 tracked log). Open **Phase 10** in `PLAN.md` for whichever the operator wants next — each with
   its own red-first e2e suite.
+
+---
+
+# ===== LOCAL CORTEX (Needle + Laya tool-call middleware) — planned 2026-09-23 =====
+
+Plan: `docs/plans/needle-laya-middleware-plan.md` (self-contained; requirements source is
+`Laya_needle_expansion/needle-laya-harness-integration-spec.md`, reconciled against the codebase).
+Owner decisions taken before planning: one Python sidecar supervisor on 127.0.0.1:8932 (Needle
+in-process, Laya as a spawned Node ESM child); scope = F1 + F2 + F3 (F4/F5 deferred); install BOTH
+models on this machine for real live evidence; long-lived branch `feat/local-cortex-needle-laya`
+with one commit per phase and a single PR at the end; Laya's npm deps isolated in
+`localmodels/package.json`; ledger + caches git-ignored.
+
+Dev-sprint rule for every phase below: implement → write the phase's e2e suite → debug until green
+→ only then mark the phase done and fill in its findings. **One phase per session/cron call.**
+Regression gate is always `npm test` (frontend ALL GREEN **and** `python3 test_e2e.py` 0 FAILURES)
+plus every earlier phase's suite.
+
+## Phase 10 — Local Cortex plumbing: flags, sidecar skeleton, ledger, health
+Status: not started
+Test suite: `tests/frontend/phase10_localmodels_config.test.js` + localmodels cases in `test_e2e.py`
+
+Deliverable: `localmodels/local_models_daemon.py` (Origin-guarded `ThreadingHTTPServer` on
+127.0.0.1:8932, `GET /health` only, bridge.py-style flags and banner), `localmodels/ledger.py`
+(append-only redacted JSONL), `CogCore.localModels.client()` (bounded, never-throwing),
+`settings.localModels` block + LOCAL CORTEX section in RITES/CONFIG, `.gitignore` entries, and
+setup/README. Nothing loads a model in this phase.
+Gate: frontend suite ALL GREEN (phase10 + 0,1,2,3,5,6,7,8,9) AND python 0 FAILURES; with
+`localModels.enabled=false` **no** request is ever made to :8932; sidecar down ⇒ every client call
+resolves degraded without throwing.
+
+### Findings
+(empty — fill in during this phase's Test/Debug Sprint)
+
+## Phase 11 — Deterministic salvage pass + golden corpus
+Status: not started
+Test suite: `tests/frontend/phase11_salvage.test.js` + `tests/fixtures/toolcall-corpus/`
+
+Deliverable: `CogCore.salvageToolCalls()` (fences, trailing commas, string/double-encoded args,
+truncated-JSON close-balance, ambiguous-vs-unique near-miss tool names, narration recovery) wired
+into the agent turn ahead of the existing Phase 7 validator; ~60-case corpus across the three real
+wire shapes (OpenAI `tool_calls` incl. chunk-split, Ollama NDJSON, buffered `chat.end`) with a
+false-repair guard set of legitimate prose.
+Gate: deterministic fix rate ≥ 80% of repairable cases, **false-repair rate exactly 0**, ambiguous
+names never guessed; a driven agent turn with fenced+near-miss calls reaches the bridge with the
+canonical name/object args; full regression green.
+
+### Findings
+(empty — fill in during this phase's Test/Debug Sprint)
+
+## Phase 12 — Needle repair pass (F1 ML stage)
+Status: not started
+Test suite: `tests/frontend/phase12_needle_repair.test.js` + `/repair` cases in `test_e2e.py` +
+opt-in `tests/live/test_needle_live.py`
+
+Deliverable: probe first (record the REAL `Needle.complete()` envelope in this file's findings),
+then `localmodels/needle_backend.py` (lazy load, process-global lock, weights from `NEEDLE_WEIGHTS`
+or base weights, `confidence:null` = below threshold), daemon `POST /repair` (800 ms default
+timeout enforced around the model call), `CogCore.sanitizeReply()` (salvage → Needle → validator →
+confidence accept) in `runAgentLoop`, operator-visible repair note, `/ledger` outcome call, and
+`localmodels/setup.sh|ps1` that really installs the venv + base weights.
+Gate: above-threshold repair accepted and dispatched canonically; below-threshold/timeout/`calls:[]`
+/ sidecar-down all pass the original reply through untouched; empty result never manufactures a
+call; no API key ever reaches the sidecar; exactly one `/repair` per suspect turn. Live Needle
+suite green on this machine with measured latency recorded here.
+
+### Findings
+(empty — fill in during this phase's Test/Debug Sprint)
+
+## Phase 13 — Laya gates (F2) via the Node child
+Status: not started
+Test suite: `tests/frontend/phase13_laya_gates.test.js` + `/decide` cases in `test_e2e.py` +
+opt-in `tests/live/test_laya_live.py`
+
+Deliverable: `localmodels/laya_child.mjs` (ESM, newline-delimited JSON on stdio, lazy
+`Laya.load`, nothing non-JSON on stdout), daemon lazy spawn + `POST /decide` (500 ms default,
+idle reap), frontend F2a pre-flight on mutating rites (refusal goes into the existing
+`role:'tool'` self-correction channel, never blocks the turn) and F2b reply-anomaly catch (flag
+only — never rewrites content). Do NOT invent a `precision`/float16 load option; the package's
+real options are listed in the plan §1.
+Gate: batching pinned (N questions ⇒ exactly one `/decide`), fail-open on timeout/down identical
+to Phase 12, read-only rites not pre-flighted; **kill-the-model test** green (full suites + a
+driven turn with `--no-needle --no-laya` behave identically to `localModels.enabled=false`); live
+Laya suite green on this machine with latency recorded here.
+
+### Findings
+(empty — fill in during this phase's Test/Debug Sprint)
+
+## Phase 14 — F3 cheap local dispatcher (Needle as pre-router)
+Status: not started
+Test suite: `tests/frontend/phase14_dispatcher.test.js`
+
+Deliverable: `dispatcher.enabled` toggle, `/select` call on send, proposal card (tool, args,
+confidence) with ACCEPT/IGNORE; ACCEPT goes through the unchanged Phase 7 validator + approval
+modal + `executeTool`; IGNORE/low-confidence/empty ⇒ the normal model call. Ledger-driven
+proposal counters in the LOCAL CORTEX section.
+Gate: no local-model output can execute anything without an explicit operator ACCEPT
+(prompt-injection case pinned), low-confidence path issues exactly one big-model request and no
+dispatch, `disabled` ⇒ no `/select` at all; full regression green.
+
+### Findings
+(empty — fill in during this phase's Test/Debug Sprint)
+
+## Phase 15 — Streaming-incremental detection, ledger-driven tuning, close-out
+Status: not started
+Test suite: `tests/frontend/phase15_incremental.test.js` + `tools/tune_thresholds.py` report
+
+Deliverable: incremental cheap detection on accumulated deltas (at most one fire-and-forget repair
+probe per turn, never awaited inside `pumpSSE`, never buffering the stream); threshold tuning from
+`var/local-models.jsonl` (fix rate, acceptance rate, false-repair rate, latency p50/p95) with the
+resulting defaults written back into `DEF_SETTINGS`; README.txt LOCAL CORTEX section + privacy
+statement; share-readiness pass (no hostnames/IPs/keys/absolute personal paths tracked; revert
+`bridge_daemon.log` churn); single PR from `feat/local-cortex-needle-laya`.
+Gate: `npm test` ALL GREEN + both live suites green + one manual UI pass with a real backend and
+both models loaded; thresholds recorded with their ledger evidence; `git status` free of
+machine-specific changes; PR opened against `main`.
+
+### Findings
+(empty — fill in during this phase's Test/Debug Sprint)
+
+## Notes
+
+- 2026-09-23 (planning session): Phases 10-15 planned and entered here; **no code written yet**.
+  This session's scope was recon + brainstorming + the plan document + this gatelog update.
+- The two documents in `Laya_needle_expansion/` came from a session without codebase context: they
+  are the *intent/design* source, the repo is the *code* source of truth. The reconciliation
+  (spec-vs-repo deltas D1-D8, plus resolved answers to the spec's §8 open questions) is §2/§3 of
+  the plan — notably: both models must run in a localhost sidecar (the UI is a browser), Laya's
+  real API is `systemOne(state, {key:{...}})` not `decide(state, LayaQuestion[])`, Needle's real
+  API is `Needle(tools=…).complete(text)`, the tool registry is 6 tools so no candidate-subset
+  stage is needed, and Anthropic `tool_use` is not spoken by this harness.
+- **Not part of this run (do not let a cron session pick these up as "the next phase"):** the open
+  `codereview.md` items (#18 agent-loop timeout misclassification, #19 `compactChat` empty-summary
+  data loss, #28/#29 array-content paths, #10, and the UX/hygiene set #20/#21/#23/#24/#27) and
+  `PLAN.md` phases 0-9. They remain available work; they are simply not phases 10-15.
+- Leads for whoever runs Phase 12: `needle`'s package keeps ONE active instance per generation
+  process-wide (`needle/__init__.py:_active`), so serialize all Needle calls behind a lock; an
+  untuned base model reports a calibrated `confidence`, a tuned `.cact` without a confidence head
+  reports `None`. Both facts are from the installed 3.0.4 source, not from the spec.
