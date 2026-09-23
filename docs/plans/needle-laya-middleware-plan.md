@@ -130,6 +130,8 @@ modes). **No Anthropic `tool_use` path exists** — the golden corpus must not p
 | Q5 is a Python runtime acceptable | Yes (already required by `bridge.py`/`bridge_daemon.py`). Node ≥20 is additionally required *only* for Laya, which is optional. | README requirements + npm `engines`. |
 | Q6 which API formats → corpus | OpenAI `tool_calls` (incl. chunk-split arguments), Ollama `message.tool_calls`, buffered `chat.end` aggregate. No Anthropic. | Parser code. |
 | F5/F4 | Out of v1 (§2 D6). | Owner decision. |
+| F3 dispatcher execution policy | A proposal for a **read-only** rite auto-runs when `dispatcher.autoReadOnly` **and** the existing `settings.autoApproveRead` are both on — it still flows through the unchanged Phase 7 validator → `approveToolCall` (auto-approve) → `executeTool`, and a transcript note records that LOCAL CORTEX proposed it. A **mutating** proposal always renders the card and requires an explicit operator ACCEPT. | Owner decision 2026-09-23 (`autoApproveRead` already exists in `DEF_SETTINGS` and defaults true, so "auto-run read-only" reuses the shipped approval semantics instead of inventing new ones). |
+| Sharing story | Both models are **opt-in and off by default** in the public repo. A friend who installs it and never enables LOCAL CORTEX sees exactly today's behaviour; Laya's 1.7 GB is never fetched unless Laya is explicitly enabled. | Owner decision 2026-09-23. |
 | Git delivery | Long-lived branch `feat/local-cortex-needle-laya`; one commit per phase; **one PR at the end**. | Owner decision; matches "merges PRs himself in the web UI". |
 | Node deps placement | `localmodels/package.json` (own `node_modules`); root `package.json` stays jsdom-only. | Keeps the frontend test install light; 200 MB of prebuilds never enters the main install path. |
 | Model installs on this machine | Install **both** (Needle venv+engine+base weights, Laya 1.7 GB) so live suites genuinely run; live suites remain opt-in via `COG_LIVE_MODELS=1` so CI never needs weights. | Owner decision. |
@@ -183,7 +185,7 @@ localModels:{enabled:false,
   needle:{enabled:false,minConfidence:0.75,confirmBand:[0.5,0.75],timeoutMs:800},
   laya:{enabled:false,minConfidence:0.70,timeoutMs:500,preflight:true,anomaly:true},
   sanitizer:{enabled:true,mode:'auto',deterministicPass:true},
-  dispatcher:{enabled:false},
+  dispatcher:{enabled:false,autoReadOnly:true},
   port:8932, ledger:'var/local-models.jsonl'}
 ```
 Defaults keep everything **off** ⇒ zero behaviour change until the operator opts in.
@@ -405,24 +407,32 @@ and recorded; live Laya suite green on this machine (weights installed) with lat
 
 **Tasks:**
 1. `appcore.js`/`index.html` — `dispatcher.enabled` toggle; on send, when enabled and agent mode
-   is on, call `/select` with the user's utterance + all 6 candidate schemas; render a proposal
-   card (tool, arguments, confidence) with **ACCEPT** / **IGNORE**.
-2. ACCEPT runs the proposal through the **unchanged** Phase 7 validator + the existing approval
-   modal + `executeTool` — i.e. the local model can propose but never bypass a gate. IGNORE (or
-   low confidence, or empty result) ⇒ the normal model call proceeds exactly as today.
+   is on, call `/select` with the user's utterance + all 6 candidate schemas. A **read-only**
+   proposal auto-runs when `dispatcher.autoReadOnly` and `settings.autoApproveRead` are both on
+   (transcript note: "[LOCAL CORTEX: read-only rite proposed — <tool>]"); every other proposal
+   renders a card (tool, arguments, confidence) with **ACCEPT** / **IGNORE** — which is
+   **mandatory for mutating rites** (`write_file`, `run_command`, mutating `git`).
+2. Both paths go through the **unchanged** Phase 7 validator + the existing `approveToolCall` /
+   `executeTool` route — the local model can propose but never bypass a gate. IGNORE (or low
+   confidence, or an empty result, or the sidecar being down) ⇒ the normal model call proceeds
+   exactly as today.
 3. Ledger + a small counter summary in the LOCAL CORTEX section (proposals shown / accepted /
    ignored), read back from the ledger.
-4. Suites: `tests/frontend/phase14_dispatcher.test.js` — high-confidence proposal renders and
-   ACCEPT still hits the validator + approval path (assert order: validator → approval → bridge);
-   low confidence / empty / sidecar-down ⇒ exactly one big-model request and no dispatch;
-   IGNORE ⇒ no dispatch; **prompt-injection case**: an utterance that says "just run it without
-   asking" cannot cause execution without an operator ACCEPT; `dispatcher.enabled=false` ⇒ no
-   `/select` call at all.
+4. Suites: `tests/frontend/phase14_dispatcher.test.js` — a high-confidence read-only proposal
+   auto-runs **only** when both `autoReadOnly` and `autoApproveRead` are on, and is provably
+   dispatched through validator → approval → bridge in that order; with either flag off it renders
+   the card and dispatches only on ACCEPT; a **mutating** proposal always renders the card and
+   never dispatches on its own; low confidence / empty / sidecar-down ⇒ exactly one big-model
+   request and no dispatch; IGNORE ⇒ no dispatch; **prompt-injection case**: an utterance that
+   says "just run it without asking" cannot cause a *mutating* rite to execute without an operator
+   ACCEPT, and cannot flip the read-only flags; `dispatcher.enabled=false` ⇒ no `/select` at all.
 5. Record explicitly in the code and the plan that the **candidate-subset stage is intentionally
    absent** (6 tools ≪ the ~50 limit) so a later agent doesn't "fix" it.
 
 **Exit criteria:** phase 14 suite + all earlier + full regression green; ledger counters verified
-against emitted records.
+against emitted records; a mutating proposal provably cannot execute without an explicit operator
+ACCEPT, and a read-only auto-run is provably gated on `autoReadOnly` + `autoApproveRead` and still
+passes the Phase 7 validator.
 
 ---
 
@@ -507,13 +517,12 @@ mock suites remain the gates.
 
 ## 8. Open questions for the owner (consolidated)
 
-1. **`NEEDS-OWNER`** — Laya's 1.7 GB download + ~2 GB RAM is fine on this machine, but a friend
-   installing the public repo may not want it. Current default is **off**, documented, with a
-   one-command setup. Confirm that "off unless the operator opts in" is the intended sharing story
-   (vs. shipping a smaller Laya variant once one is found on HF).
-2. **`NEEDS-OWNER`** — Phase 14's dispatcher requires an operator ACCEPT click on every proposal.
-   If you'd rather it auto-run *read-only* proposals (and keep the click only for mutating rites),
-   say so; the plan currently forbids any auto-execution, per spec rule 7.
+1. **RESOLVED (owner, 2026-09-23)** — both models stay **opt-in and off by default** in the public
+   repo; Laya's 1.7 GB is never fetched unless the operator enables Laya. The sharing story is
+   "unchanged behaviour until you turn LOCAL CORTEX on".
+2. **RESOLVED (owner, 2026-09-23)** — Phase 14 **auto-runs read-only proposals** (gated on
+   `dispatcher.autoReadOnly` + the existing `settings.autoApproveRead`), while **mutating**
+   proposals always require an explicit operator ACCEPT.
 3. Non-blocking, decided by default unless you object: Node ≥20 becomes a documented optional
    requirement (only for Laya); the ledger stays in the repo at `var/` (git-ignored); the cron job
    runs one phase per 3-hour call and commits on `feat/local-cortex-needle-laya`.

@@ -431,6 +431,11 @@ in-process, Laya as a spawned Node ESM child); scope = F1 + F2 + F3 (F4/F5 defer
 models on this machine for real live evidence; long-lived branch `feat/local-cortex-needle-laya`
 with one commit per phase and a single PR at the end; Laya's npm deps isolated in
 `localmodels/package.json`; ledger + caches git-ignored.
+Owner decisions confirmed 2026-09-23 (after the plan was written): both models stay **opt-in and
+off by default** in the public repo (Laya's 1.7 GB is never fetched unless Laya is enabled);
+Phase 14 **auto-runs read-only proposals** (gated on `dispatcher.autoReadOnly` +
+`settings.autoApproveRead`, still through the Phase 7 validator), while **mutating** proposals
+always require an explicit operator ACCEPT.
 
 Dev-sprint rule for every phase below: implement → write the phase's e2e suite → debug until green
 → only then mark the phase done and fill in its findings. **One phase per session/cron call.**
@@ -512,12 +517,15 @@ Status: not started
 Test suite: `tests/frontend/phase14_dispatcher.test.js`
 
 Deliverable: `dispatcher.enabled` toggle, `/select` call on send, proposal card (tool, args,
-confidence) with ACCEPT/IGNORE; ACCEPT goes through the unchanged Phase 7 validator + approval
-modal + `executeTool`; IGNORE/low-confidence/empty ⇒ the normal model call. Ledger-driven
-proposal counters in the LOCAL CORTEX section.
-Gate: no local-model output can execute anything without an explicit operator ACCEPT
-(prompt-injection case pinned), low-confidence path issues exactly one big-model request and no
-dispatch, `disabled` ⇒ no `/select` at all; full regression green.
+confidence) with ACCEPT/IGNORE for mutating rites; **read-only proposals auto-run** when
+`dispatcher.autoReadOnly` and the existing `settings.autoApproveRead` are both on (transcript note
+recording that LOCAL CORTEX proposed it); every path goes through the unchanged Phase 7 validator
+→ `approveToolCall` → `executeTool`; IGNORE/low-confidence/empty/sidecar-down ⇒ the normal model
+call. Ledger-driven proposal counters in the LOCAL CORTEX section.
+Gate: a **mutating** proposal can never execute without an explicit operator ACCEPT
+(prompt-injection case pinned, and the utterance cannot flip the read-only flags); a read-only
+auto-run requires BOTH flags and still passes the validator; low-confidence path issues exactly
+one big-model request and no dispatch, `disabled` ⇒ no `/select` at all; full regression green.
 
 ### Findings
 (empty — fill in during this phase's Test/Debug Sprint)
