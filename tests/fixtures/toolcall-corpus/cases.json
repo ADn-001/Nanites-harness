@@ -1,0 +1,1573 @@
+{
+  "version": 1,
+  "note": "Golden corpus for the Phase 11 deterministic salvage pass. Every `reply` is a realistic model output in one of the three wire formats this harness actually speaks, or a legitimate prose answer. See README.md for the schema and for the two rules a new case must follow (fold guard replies must not contain an allowed-tool name({...}) span; `unchanged: true` means salvage must change nothing at all).",
+  "tools": [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "grep",
+    "git",
+    "run_command"
+  ],
+  "cases": [
+    {
+      "id": "clean-openai-array",
+      "category": "legitimate-call",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\": \"src/main.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "src/main.py"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-finalized-shape",
+      "category": "legitimate-call",
+      "format": "openai",
+      "reply": {
+        "toolCalls": [
+          {
+            "id": "call_a",
+            "name": "list_dir",
+            "args": "{\"path\": \".\"}"
+          }
+        ]
+      },
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-openai-message",
+      "category": "legitimate-call",
+      "format": "openai",
+      "reply": {
+        "tool_calls": [
+          {
+            "id": "call_a",
+            "type": "function",
+            "function": {
+              "name": "grep",
+              "arguments": "{\"path\": \".\", \"pattern\": \"TODO\"}"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "name": "grep",
+        "args": {
+          "path": ".",
+          "pattern": "TODO"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-ollama",
+      "category": "legitimate-call",
+      "format": "ollama",
+      "reply": {
+        "message": {
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "function": {
+                "name": "git",
+                "arguments": "{\"args\": \"status --short\"}"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "name": "git",
+        "args": {
+          "args": "status --short"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-chatend",
+      "category": "legitimate-call",
+      "format": "chat.end",
+      "reply": {
+        "type": "chat.end",
+        "result": {
+          "output": [
+            {
+              "type": "message",
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "id": "call_a",
+                  "function": {
+                    "name": "read_file",
+                    "arguments": "{\"path\": \"README.txt\"}"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "README.txt"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-args-already-object",
+      "category": "legitimate-call",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "write_file",
+          "args": {
+            "path": "a.txt",
+            "content": "hi"
+          }
+        }
+      ],
+      "expect": {
+        "name": "write_file",
+        "args": {
+          "path": "a.txt",
+          "content": "hi"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-single-bare-call-object",
+      "category": "legitimate-call",
+      "format": "openai",
+      "reply": {
+        "id": "call_a",
+        "name": "read_file",
+        "arguments": "{\"path\": \"x.py\"}"
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "x.py"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-two-calls",
+      "category": "legitimate-call",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "list_dir",
+          "args": "{\"path\": \".\"}"
+        },
+        {
+          "id": "call_b",
+          "name": "read_file",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        },
+        "unchanged": true,
+        "callCount": 2
+      }
+    },
+    {
+      "id": "clean-args-with-newlines",
+      "category": "legitimate-call",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "write_file",
+          "args": "{\n  \"path\": \"a.txt\",\n  \"content\": \"line1\\nline2\"\n}"
+        }
+      ],
+      "expect": {
+        "name": "write_file",
+        "args": {
+          "path": "a.txt",
+          "content": "line1\nline2"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "clean-run-command",
+      "category": "legitimate-call",
+      "format": "ollama",
+      "reply": {
+        "message": {
+          "tool_calls": [
+            {
+              "function": {
+                "name": "run_command",
+                "arguments": "{\"command\": \"ls -la\"}"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "name": "run_command",
+        "args": {
+          "command": "ls -la"
+        },
+        "unchanged": true
+      }
+    },
+    {
+      "id": "string-args-fenced",
+      "category": "string-args",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "```json\n{\"path\": \"a.py\"}\n```"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "string-args-fence-no-lang",
+      "category": "string-args",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "```\n{\"path\": \"a.py\"}\n```"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "string-args-trailing-comma",
+      "category": "string-args",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\",}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "string-args-trailing-comma-nested",
+      "category": "string-args",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "grep",
+          "args": "{\"path\":\".\",\"pattern\":\"x\",}"
+        }
+      ],
+      "expect": {
+        "name": "grep",
+        "args": {
+          "path": ".",
+          "pattern": "x"
+        }
+      }
+    },
+    {
+      "id": "string-args-prose-prefix",
+      "category": "string-args",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "Here are the arguments: {\"path\":\"a.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "string-args-trailing-garbage-brace",
+      "category": "trailing-garbage",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\"}}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "string-args-trailing-garbage-comment",
+      "category": "trailing-garbage",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\"} // done"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "string-args-trailing-semicolon",
+      "category": "trailing-garbage",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\"};"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "string-args-trailing-comma-after-close",
+      "category": "trailing-garbage",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\"},"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "truncated-args-unclosed-object",
+      "category": "truncated-json",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\""
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "truncated-args-unclosed-string",
+      "category": "truncated-json",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "truncated-args-two-fields",
+      "category": "truncated-json",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "grep",
+          "args": "{\"path\":\".\",\"pattern\":\"x\""
+        }
+      ],
+      "expect": {
+        "name": "grep",
+        "args": {
+          "path": ".",
+          "pattern": "x"
+        }
+      }
+    },
+    {
+      "id": "truncated-args-dangling-comma",
+      "category": "truncated-json",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\","
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "truncated-content-fenced",
+      "category": "truncated-json",
+      "format": "content",
+      "reply": {
+        "content": "```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.py\"}}\n```"
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "truncated-content-narration",
+      "category": "truncated-json",
+      "format": "content",
+      "reply": {
+        "content": "Invoking read_file({\"path\": \"a.py\""
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "truncated-args-mid-value-unrepairable",
+      "category": "truncated-json",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":\"a.py\",\"line\":"
+        }
+      ],
+      "expect": {
+        "unrepairable": true
+      }
+    },
+    {
+      "id": "truncated-args-no-value-unrepairable",
+      "category": "truncated-json",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\":"
+        }
+      ],
+      "expect": {
+        "unrepairable": true
+      }
+    },
+    {
+      "id": "double-encoded-args",
+      "category": "double-encoded",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "\"{\\\"path\\\": \\\"a.py\\\"}\""
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "double-encoded-args-fenced",
+      "category": "double-encoded",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "```json\n\"{\\\"path\\\": \\\"b.py\\\"}\"\n```"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "b.py"
+        }
+      }
+    },
+    {
+      "id": "double-encoded-args-ollama",
+      "category": "double-encoded",
+      "format": "ollama",
+      "reply": {
+        "message": {
+          "tool_calls": [
+            {
+              "function": {
+                "name": "list_dir",
+                "arguments": "\"{\\\"path\\\": \\\".\\\"}\""
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "double-encoded-args-spaced",
+      "category": "double-encoded",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "\"{ \\\"path\\\": \\\"c.py\\\" }\""
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "c.py"
+        }
+      }
+    },
+    {
+      "id": "near-case-upper",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "READ_FILE",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "near-case-mixed",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "List_Dir",
+          "args": "{\"path\": \".\"}"
+        }
+      ],
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "near-separator-dash",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read-file",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "near-separator-space",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read file",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "near-separator-camel",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "ReadFile",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "near-separator-dot",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "list.dir",
+          "args": "{\"path\": \".\"}"
+        }
+      ],
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "near-typo-missing-char",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_fil",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "near-typo-extra-char",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "list_dirr",
+          "args": "{\"path\": \".\"}"
+        }
+      ],
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "near-typo-substitution",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "writ_file",
+          "args": "{\"path\": \"a.txt\", \"content\": \"x\"}"
+        }
+      ],
+      "expect": {
+        "name": "write_file",
+        "args": {
+          "path": "a.txt",
+          "content": "x"
+        }
+      }
+    },
+    {
+      "id": "near-miss-in-ollama",
+      "category": "near-miss-name",
+      "format": "ollama",
+      "reply": {
+        "message": {
+          "tool_calls": [
+            {
+              "function": {
+                "name": "read-file",
+                "arguments": "{\"path\": \"a.py\"}"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "near-miss-in-chatend",
+      "category": "near-miss-name",
+      "format": "chat.end",
+      "reply": {
+        "type": "chat.end",
+        "result": {
+          "output": [
+            {
+              "type": "message",
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "function": {
+                    "name": "List-Dir",
+                    "arguments": "{\"path\": \".\"}"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "near-miss-with-broken-args",
+      "category": "near-miss-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read-file",
+          "args": "```json\n{\"path\": \"a.py\"}\n```"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "ambiguous-equidistant",
+      "category": "ambiguous-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_fil",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "unrepairable": true,
+        "ambiguous": true,
+        "never": [
+          "read_file",
+          "read_filx"
+        ]
+      },
+      "tools": [
+        "read_file",
+        "read_filx"
+      ]
+    },
+    {
+      "id": "ambiguous-case-duplicates",
+      "category": "ambiguous-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "READ_FILE",
+          "args": "{\"path\": \"a.py\"}"
+        }
+      ],
+      "expect": {
+        "unrepairable": true,
+        "ambiguous": true,
+        "never": [
+          "Read_File",
+          "read_file"
+        ]
+      },
+      "tools": [
+        "Read_File",
+        "read_file"
+      ]
+    },
+    {
+      "id": "ambiguous-two-narrated-calls",
+      "category": "ambiguous-name",
+      "format": "content",
+      "reply": {
+        "content": "I will read_file({\"path\": \"a.py\"}) and then list_dir({\"path\": \".\"})."
+      },
+      "expect": {
+        "unrepairable": true,
+        "ambiguous": true,
+        "never": [
+          "read_file",
+          "list_dir"
+        ]
+      }
+    },
+    {
+      "id": "below-threshold-unknown",
+      "category": "unknown-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "gitz",
+          "args": "{\"args\": \"status\"}"
+        }
+      ],
+      "expect": {
+        "unrepairable": true,
+        "never": [
+          "git",
+          "gits"
+        ]
+      },
+      "tools": [
+        "git",
+        "gits"
+      ]
+    },
+    {
+      "id": "unknown-tool",
+      "category": "unknown-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "definitely_not_a_tool",
+          "args": "{}"
+        }
+      ],
+      "expect": {
+        "unrepairable": true,
+        "never": [
+          "read_file",
+          "list_dir",
+          "grep",
+          "git"
+        ]
+      }
+    },
+    {
+      "id": "unknown-phantom-shell-exec",
+      "category": "unknown-name",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "shell_exec",
+          "args": "{\"command\": \"ls\"}"
+        }
+      ],
+      "expect": {
+        "unrepairable": true,
+        "never": [
+          "run_command"
+        ]
+      }
+    },
+    {
+      "id": "unknown-python-call-in-prose",
+      "category": "unknown-name",
+      "format": "content",
+      "reply": {
+        "content": "I would call python({\"code\": \"print(1)\"}) if such a rite existed."
+      },
+      "expect": {
+        "callCount": 0
+      }
+    },
+    {
+      "id": "schema-missing-required",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"line\": 3}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "line": 3
+        },
+        "validatorOk": false
+      }
+    },
+    {
+      "id": "schema-wrong-type",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\": 42}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": 42
+        },
+        "validatorOk": false
+      }
+    },
+    {
+      "id": "schema-write-file-no-content",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "write_file",
+          "args": "{\"path\": \"a.txt\"}"
+        }
+      ],
+      "expect": {
+        "name": "write_file",
+        "args": {
+          "path": "a.txt"
+        },
+        "validatorOk": false
+      }
+    },
+    {
+      "id": "schema-grep-no-pattern",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "grep",
+          "args": "{\"path\": \".\"}"
+        }
+      ],
+      "expect": {
+        "name": "grep",
+        "args": {
+          "path": "."
+        },
+        "validatorOk": false
+      }
+    },
+    {
+      "id": "schema-extra-member-passes",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "list_dir",
+          "args": "{\"path\": \".\", \"depth\": 2}"
+        }
+      ],
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": ".",
+          "depth": 2
+        },
+        "validatorOk": true
+      }
+    },
+    {
+      "id": "schema-empty-object",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {},
+        "validatorOk": false
+      }
+    },
+    {
+      "id": "args-missing-entirely",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file"
+        }
+      ],
+      "expect": {
+        "unrepairable": true
+      }
+    },
+    {
+      "id": "args-non-object-string",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "\"just a string\""
+        }
+      ],
+      "expect": {
+        "unrepairable": true
+      }
+    },
+    {
+      "id": "args-array",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": [
+            {
+              "path": "a.py"
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "unrepairable": true
+      }
+    },
+    {
+      "id": "args-non-json-garbage",
+      "category": "schema-violation",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{oops"
+        }
+      ],
+      "expect": {
+        "unrepairable": true
+      }
+    },
+    {
+      "id": "prose-plain-answer",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "I have read the file and updated the plan. No further rites are required, operator."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-mentions-tool-names",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "The read_file and write_file rites are available to me, but prose is enough here."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-json-schema-blob",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "Here is the shape the harness expects: {\"path\": \"string\", \"pattern\": \"string\"}."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-code-block-helper",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "Use a helper:\n```js\nfunction readFile(path) { return fs.read(path); }\n```\nThat is all."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-hypothetical-call",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "If I were to call read_file, I would pass {\"path\": \"a.py\"} to it."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-unknown-tool-call-span",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "I would invoke shell_exec({\"command\":\"ls\"}) but that rite does not exist."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-empty-content",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": ""
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-array-blob",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "The candidate list is [\"read_file\", \"grep\"] and nothing else matters."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-markdown-table",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "| rite | purpose |\n|---|---|\n| read_file | inspect |\n| grep | search |\nNo call is needed."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-fenced-config-not-a-call",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "The config block looks like:\n```json\n{\"temperature\": 0.2, \"top_p\": 0.9}\n```\nNothing to invoke."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "prose-json-with-name-no-args",
+      "category": "false-repair-guard",
+      "format": "content",
+      "reply": {
+        "content": "The call object has the form {\"name\": \"<tool>\", \"arguments\": {...}}."
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "narration-call-span",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "Let me inspect it: read_file({\"path\": \"src/main.py\"})"
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "src/main.py"
+        }
+      }
+    },
+    {
+      "id": "narration-call-span-near-miss",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "Invoking list-dir({\"path\": \".\"}) now."
+      },
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "narration-call-span-trailing-prose",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "Done: grep({\"path\":\".\",\"pattern\":\"TODO\"}) — that is all for now."
+      },
+      "expect": {
+        "name": "grep",
+        "args": {
+          "path": ".",
+          "pattern": "TODO"
+        }
+      }
+    },
+    {
+      "id": "narration-fenced-json-object",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "Sure, invoking:\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.py\"}}\n```"
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        }
+      }
+    },
+    {
+      "id": "narration-fenced-json-no-lang",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "```\n{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}\n```"
+      },
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "narration-bare-json-object",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}"
+      },
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        }
+      }
+    },
+    {
+      "id": "narration-fenced-json-args-as-string",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "```json\n{\"name\": \"grep\", \"arguments\": \"{\\\"path\\\": \\\".\\\", \\\"pattern\\\": \\\"TODO\\\"}\"}\n```"
+      },
+      "expect": {
+        "name": "grep",
+        "args": {
+          "path": ".",
+          "pattern": "TODO"
+        }
+      }
+    },
+    {
+      "id": "narration-fenced-with-empty-tool-calls",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "```json\n{\"name\": \"git\", \"arguments\": {\"args\": \"log --oneline\"}}\n```",
+        "tool_calls": []
+      },
+      "expect": {
+        "name": "git",
+        "args": {
+          "args": "log --oneline"
+        }
+      }
+    },
+    {
+      "id": "narration-openai-style-function",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "```json\n{\"type\": \"function\", \"function\": {\"name\": \"list_dir\", \"arguments\": {\"path\": \"src\"}}}\n```"
+      },
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "src"
+        }
+      }
+    },
+    {
+      "id": "narration-tool-and-args-keys",
+      "category": "narration-recovery",
+      "format": "content",
+      "reply": {
+        "content": "```json\n{\"tool\": \"read_file\", \"args\": {\"path\": \"b.py\"}}\n```"
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "b.py"
+        }
+      }
+    },
+    {
+      "id": "mixed-good-and-unknown",
+      "category": "mixed-turn",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{\"path\": \"a.py\"}"
+        },
+        {
+          "id": "call_b",
+          "name": "evil_tool",
+          "args": "{}"
+        }
+      ],
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        },
+        "unrepairable": true,
+        "callCount": 1
+      }
+    },
+    {
+      "id": "mixed-good-and-broken-args",
+      "category": "mixed-turn",
+      "format": "openai",
+      "reply": [
+        {
+          "id": "call_a",
+          "name": "read_file",
+          "args": "{oops"
+        },
+        {
+          "id": "call_b",
+          "name": "list_dir",
+          "args": "{\"path\": \".\"}"
+        }
+      ],
+      "expect": {
+        "name": "list_dir",
+        "args": {
+          "path": "."
+        },
+        "unrepairable": true,
+        "callCount": 1
+      }
+    },
+    {
+      "id": "mixed-repaired-name-and-broken-args",
+      "category": "mixed-turn",
+      "format": "ollama",
+      "reply": {
+        "message": {
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "function": {
+                "name": "read-file",
+                "arguments": "{\"path\":\"a.py\",}"
+              }
+            },
+            {
+              "id": "call_b",
+              "function": {
+                "name": "grep",
+                "arguments": "{nope"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "name": "read_file",
+        "args": {
+          "path": "a.py"
+        },
+        "unrepairable": true,
+        "callCount": 1
+      }
+    },
+    {
+      "id": "garbage-null",
+      "category": "garbage",
+      "format": "content",
+      "reply": null,
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "garbage-number",
+      "category": "garbage",
+      "format": "content",
+      "reply": 42,
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "garbage-plain-string",
+      "category": "garbage",
+      "format": "content",
+      "reply": "not a call at all",
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "garbage-tool-calls-not-array",
+      "category": "garbage",
+      "format": "content",
+      "reply": {
+        "tool_calls": "nope"
+      },
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    },
+    {
+      "id": "garbage-empty-array",
+      "category": "garbage",
+      "format": "openai",
+      "reply": [],
+      "expect": {
+        "unchanged": true,
+        "callCount": 0
+      }
+    }
+  ]
+}

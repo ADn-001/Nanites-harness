@@ -1009,7 +1009,18 @@ async function runAgentLoop(c,m,sig){
   for(let iter=0;iter<12;iter++){
     if(sig.aborted)throw new DOMException('Aborted','AbortError');
     const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
-    m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=finalizeToolCalls(acc,m.ts||Date.now());
+    m.content=acc.content;m.thinking=acc.thinking;
+    const finalized=finalizeToolCalls(acc,m.ts||Date.now());
+    /* PHASE 11 — deterministic salvage runs BEFORE the Phase 7 gate. It repairs FORMAT
+       only (fences, trailing commas, string / double-encoded / truncated arguments,
+       near-miss tool names, narrated calls) and NEVER invents an argument value. What it
+       cannot resolve stays in the turn so the validator still rejects it explicitly, and
+       is recorded on the message as a `cortexSuspects` lead for the ML repair stage. */
+    const salv=CogCore.salvageToolCalls({toolCalls:finalized,content:acc.content},TOOL_SCHEMAS);
+    m.toolCalls=salv.calls.concat(salv.unrepairable.map(u=>({id:u.id,name:u.name,args:u.args})))
+      .map((t,ix)=>({id:t.id||('call_salv_'+iter+'_'+ix+'_'+Date.now().toString(36)),name:t.name,args:t.args}));
+    if(!m.toolCalls.length)m.toolCalls=finalized;
+    if(salv.unrepairable.length)m.cortexSuspects=salv.unrepairable;
     m.ts=m.ts||Date.now();refreshLast();
     if(!m.toolCalls.length)return;
     /* DETERMINISTIC GATE: no model-authored call reaches the bridge unvalidated.

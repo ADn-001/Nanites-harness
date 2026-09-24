@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 11 — Deterministic salvage pass + golden corpus**
+Next phase to work on: **Phase 12 — Needle repair pass (F1 ML stage)**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -533,7 +533,7 @@ error:"network: fetch failed"}`, and the daemon's cwd held **only** the ledger (
   and inert, and the sidecar is not needed until Phase 12.
 
 ## Phase 11 — Deterministic salvage pass + golden corpus
-Status: not started
+Status: **DONE**
 Test suite: `tests/frontend/phase11_salvage.test.js` + `tests/fixtures/toolcall-corpus/`
 
 Deliverable: `CogCore.salvageToolCalls()` (fences, trailing commas, string/double-encoded args,
@@ -541,12 +541,103 @@ truncated-JSON close-balance, ambiguous-vs-unique near-miss tool names, narratio
 into the agent turn ahead of the existing Phase 7 validator; ~60-case corpus across the three real
 wire shapes (OpenAI `tool_calls` incl. chunk-split, Ollama NDJSON, buffered `chat.end`) with a
 false-repair guard set of legitimate prose.
+
 Gate: deterministic fix rate ≥ 80% of repairable cases, **false-repair rate exactly 0**, ambiguous
 names never guessed; a driven agent turn with fenced+near-miss calls reaches the bridge with the
 canonical name/object args; full regression green.
 
+Gate evidence: **Satisfied.** `npm test` exit 0 on the committed tree — `node tests/frontend/run.js`
+→ `FRONTEND SUITE: ALL GREEN` (phase11: `PHASE 11 DETERMINISTIC SALVAGE + GOLDEN CORPUS: 0 FAILURES`;
+phases 0,1,2,3,5,6,7,8,9,10 all 0 FAILURES) and `python3 test_e2e.py` → `0 FAILURES` (594 ok lines
+total). Measured on the corpus: **89 cases, 60 declared-repairable, 60 fixed (fix rate 100.0%),
+15 declared-unrepairable, 11 false-repair guards, FALSE-REPAIR RATE 0, ambiguous names guessed 0.**
+Plus two seams the corpus alone cannot cover: (a) the SHIPPED inline `window.CogCore` (the copy
+`index.html` actually calls) reproduces the module byte-for-byte on all 89 cases, and (b) four
+driven jsdom agent turns through the real `send → stream → runAgentLoop → bridge` path — fenced +
+near-miss dispatch, narrated-call dispatch, clean call dispatched exactly once, and an
+unrepairable turn reaching the bridge zero times with both rejections fed back.
+
 ### Findings
-(empty — fill in during this phase's Test/Debug Sprint)
+- **Gate was not started (baseline green).** Re-verified first: `npm test` exit 0, python
+  `0 FAILURES`, head `0785a61`, only `bridge_daemon.log` dirty. No stale suite, no partial
+  implementation. **RED was captured honestly** by stashing `appcore.js` + `index.html` and running
+  the new suite against the pre-phase tree → 6 FAILURES (`CogCore.salvageToolCalls exists`,
+  the dispatch assertions, and the `cortexSuspects` assertions). Restore, then GREEN.
+- **LANDMINE (cost me the first GREEN attempt): every `/tools/execute` POST is polluted by the
+  workdir listing.** `getWorkdirListing()` (index.html:621) POSTs
+  `{name:'list_dir',arguments:{path:'.'}}` to the *same* bridge route on **every** agent iteration
+  (each `buildMessages()`). A 2-iteration turn therefore logs **3** bridge bodies (2 listings +
+  1 model call) — my first `e2e B` "passed" by matching a workdir listing, i.e. for the wrong
+  reason, and `e2e A` counted 3. Diagnosed with a throwaway two-app probe (proof: A's own event log
+  held a `list_dir` body *before* its own `read_file`). **Any future suite must count
+  `modelDispatches` (bridge bodies minus that exact signature), never raw bridge POSTs** — the
+  helper is at the top of `phase11_salvage.test.js`. Phase 12+ suites that assert dispatch counts
+  must copy it.
+- **DECISION (deliberate deviation from plan §4's naming): salvage emits `{id, name, args}`, not
+  `{id, name, arguments}`.** Every shipped consumer of a finalized call speaks `args`
+  (`finalizeToolCalls`, `safeToolArgs`, `isReadRite`, `tok(t.args)`, and
+  `validateStructuredOutput`'s `args`-first normaliser). Emitting `arguments` would have silently
+  dropped every repaired argument at dispatch, because `safeToolArgs()` reads `tc.args` only and
+  falls back to `{}`. Input parsing is liberal (`args` | `arguments` | `function.arguments` |
+  Ollama `function.arguments` | `chat.end` `function.arguments`); **output is `args`.** If a later
+  phase wants `arguments`, it must change `safeToolArgs` too.
+- **DECISION: `calls` = dispatchable repairs only; `unrepairable` = everything salvage could not
+  fix, and `index.html` re-attaches those to the turn** so the Phase 7 validator still rejects them
+  *explicitly* (a `role:'tool'` correction the model can react to, and one correlated tool result
+  per assistant `tool_call` for strict OpenAI endpoints). Silently dropping them would have removed
+  the self-correction signal that Phase 7 deliberately built. Ids are minted by `index.html`
+  (`call_salv_<iter>_<ix>_<ts>`) for calls that lack one — exactly what `finalizeToolCalls` already
+  did — so a narratively recovered call is dispatchable without weakening the gate.
+- **DECISION: `m.cortexSuspects` on the assistant message is the ready-made suspect list for
+  Phase 12** (it carries `{id,name,args,reason}` per unrepairable call). Narration-with-zero-calls is
+  deliberately **not** marked suspect here: the plan gives `sanitizeReply`'s `mode:'auto'` the job of
+  deciding whether a prose-only turn is worth a Needle probe, and salvage cannot know the mode.
+- **Name reconciliation ladder and its honest limits:** exact → case-insensitive → separator/
+  punctuation-normalised (`_cortexNormName` strips everything non-alphanumeric, so
+  `read-file`/`read file`/`ReadFile`/`list.dir` all fold to the canonical name) → nearest by
+  Levenshtein similarity with a **unique** winner at **≥ 0.86**. Consequences to respect:
+  `read_fil` (0.875), `list_dirr` (0.875) and `writ_file` (0.889) are repaired, but a transposition
+  like `raed_file` is **not** (0.78) and neither is `gitz` against `git`/`gits` (0.75, tie).
+  **Do not lower the 0.86 bar without corpus evidence** — it is what keeps a typo from silently
+  becoming a *different* tool call. Two equally-close candidates (or a case-fold collision such as
+  an allow-list holding both `Read_File` and `read_file`) return an `ambiguous` reason and are never
+  guessed.
+- **Close-balance only ever ADDS syntax.** `_cortexCloseBalance` appends the missing quote/closers
+  (dropping a dangling separator first) and the result is used **only if it parses**, so
+  `{"path":"a.py","line":` stays unrepairable — the no-invented-values rule is enforced by the
+  parser, not by convention. Same for fences: an *unclosed* fence left by a truncated reply is
+  stripped, which is what makes the truncated-narration cases repairable.
+- **Narration recovery runs ONLY when the reply carried no call objects, and only one distinct
+  candidate is accepted.** Two distinct candidates ⇒ `ambiguous` ⇒ unrepairable. A candidate whose
+  name does not reconcile to an allowed tool is treated as prose, not as an unrepairable call (this
+  is why `I would invoke shell_exec({…})` is a **guard** case, not a repair case). Guard replies
+  must therefore not contain an allowed-tool `name({…})` span — that span *is* the recovery
+  contract. Documented in `tests/fixtures/toolcall-corpus/README.md`; note this in any new case.
+- **The corpus is GENERATED, not hand-edited:** `python3 tools/gen_toolcall_corpus.py` →
+  `tests/fixtures/toolcall-corpus/cases.json` (89 cases). My first hand-written `cases.json` was
+  **invalid JSON** (nested `arguments` escaping) — `write_file`'s syntax check caught it, the
+  generator (which builds every nested string with `json.dumps`) cannot make that mistake.
+  `tools/` and `tests/fixtures/` are tracked and share-ready (no machine paths, no hostnames).
+  Case schema + the two rules a new case must follow (guard replies; `unchanged:true` semantics)
+  are in the corpus README.
+- **Harness notes (in addition to the Phase 7/9/10 ones, all still true):** grab the live schemas
+  with `app.window.eval('JSON.stringify(TOOL_SCHEMAS)')` (a `const`, not a window property);
+  `chatRoute` repeats the LAST scripted event forever, so a narration turn will keep re-dispatching
+  every iteration until the loop's own guard stops it — that is why `e2e B` asserts *exactly one*
+  `read_file` dispatch after switching its narrated call off `list_dir` (which collided with the
+  workdir listing); `fedToolResults(app, 1)` reads the `role:'tool'` messages of the *second* model
+  POST, which is the cheapest proof a dispatch came from the agent loop rather than from
+  `buildMessages()`.
+- **Process:** implemented directly (tight red→green) rather than delegated. The phase is one pure
+  function plus one seam in the same inline script a child would have had to edit; splitting
+  `appcore.js` across two children was more likely to produce conflicting edits than parallelism.
+  RED evidence was captured by stashing the two touched files (the Phase 9/10 team-of-subagents
+  model was not a good fit here — recorded so a later session does not read this as a shortcut).
+- **Next agent:** Phase 12 (Needle repair pass) is open. Everything it needs exists:
+  `salvageToolCalls` is stage 1 of `sanitizeReply`, `m.cortexSuspects` is the suspect list, and
+  `CogCore.localModels.client(...).repair` is wired and inert. Remember the plan's phase-12 task 0:
+  probe the REAL `Needle.complete()` envelope first and write it into that phase's findings, and
+  replace Phase 10's env-var-only `needle.weights` check with the package's real weights-path probe.
 
 ## Phase 12 — Needle repair pass (F1 ML stage)
 Status: not started
@@ -655,3 +746,16 @@ machine-specific changes; PR opened against `main`.
   **not** implemented (Phases 12-14). `needle.weights` in `/health` is an env-var-only check that
   Phase 12 must replace with the real weights-path probe. No pull request yet — Phase 15 opens the
   single PR; until then commits land on `feat/local-cortex-needle-laya`.
+- 2026-09-24 (Phase 11 session, cron): Phase 11 done and committed. Decisions a later session must
+  not silently reverse:
+  1. `salvageToolCalls` emits `{id, name, args}` (the harness's own field), never `arguments` —
+     `safeToolArgs()` reads `tc.args` only, so `arguments` would drop repaired args at dispatch.
+  2. `salvageToolCalls().calls` holds only dispatchable calls; the caller must re-attach
+     `unrepairable` to the turn so the Phase 7 validator rejects them explicitly.
+  3. The near-miss name bar is a unique winner at similarity **≥ 0.86**; ties are ambiguous and are
+     never guessed. Do not lower it without corpus evidence.
+  4. The golden corpus is generated (`tools/gen_toolcall_corpus.py`) and must not be hand-edited.
+  5. Dispatch-count assertions must filter the `{name:'list_dir',arguments:{path:'.'}}` workdir
+     listing that `buildMessages()` posts on every agent iteration (see Phase 11 findings).
+  6. Nothing counts a local-model dispatch as "repaired" yet: `sanitizeReply` (Phase 12) is what will
+     consume `m.cortexSuspects`, and the operator-visible repair note belongs to that phase too.
