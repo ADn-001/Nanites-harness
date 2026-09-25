@@ -33,16 +33,19 @@ python localmodels/local_models_daemon.py                     # 127.0.0.1:8932
 python localmodels/local_models_daemon.py --no-needle         # Needle disabled, Laya optional
 python localmodels/local_models_daemon.py --no-needle --no-laya
 python localmodels/local_models_daemon.py --ledger var/local-models.jsonl
+python localmodels/local_models_daemon.py --preload-needle    # warm the engine at boot
+python localmodels/local_models_daemon.py --needle-timeout-ms 1200
 ```
 
 Flags: `--port` (default 8932), `--no-needle`, `--no-laya`, `--ledger PATH`,
-`--allow-any-origin`, `--allow-file-origin`. Absence of `--no-needle` means the engine is
-*enabled* — but **the model is still not loaded** in Phase 10 (`needle.loaded=false`,
-`laya.loaded=false`, `laya.child_pid=null`, always).
+`--allow-any-origin`, `--allow-file-origin`, `--needle-timeout-ms` (default 800 — the
+BOUNDED TIMEOUT around the model call), `--preload-needle` (eager background load at
+boot). Absence of `--no-needle` means the engine is *enabled*; it is *loaded* lazily on
+the first `/repair` (or at boot with `--preload-needle`).
 
-### Routes shipped in Phase 10
+### Routes
 
-`GET /health` only:
+`GET /health`:
 
 ```json
 {"ok": true, "version": "0.1.0",
@@ -52,10 +55,36 @@ Flags: `--port` (default 8932), `--no-needle`, `--no-laya`, `--ledger PATH`,
  "degraded": ["needle weights missing"]}
 ```
 
+`needle.weights` is a REAL probe (Phase 12): `NEEDLE_WEIGHTS` (a file path) first, else
+the needle package's own cache path (`~/.cache/cactus-needle/v3/<version>/needle3.cact`).
+A daemon run with the SYSTEM python has no needle package, so the probe answers
+`'missing'` — that is the intended degraded-posture proof.
+
 `degraded` lists one reason per **enabled** feature that cannot serve right now. A feature
 you deliberately disabled with `--no-needle`/`--no-laya` is not degraded — it is off.
-Repair/decide/select routes arrive in later phases; any other path answers
-`404 {"ok": false, "error": "unknown rite"}`.
+
+`POST /repair` (Phase 12):
+
+```json
+{"suspect": {"name": "read-file", "arguments": "{\"path\": \"a.py\"}"},
+ "candidates": [{"name": "read_file", "description": "...", "parameters": {...}}, ...],
+ "trace_id": "tr…"}  // optional
+```
+
+→ `{ok, calls: [{name, arguments}], confidence, reasoning, latency_ms, trace_id,
+degraded?, reason?}`. **`calls: []` means "no repair"** — the daemon never manufactures
+a call. `confidence: null` means the weights carry no confidence head; treat it as
+below-threshold. The candidate schemas are the FLAT shape (`{name, description,
+parameters}`); an OpenAI-shaped entry (`{type:'function', function:{…}}`) is unwrapped.
+The model call runs on a single worker inside `--needle-timeout-ms`; an overrun (or the
+package/weights being absent) answers `{ok:false, degraded:true}` — never a 500, never a
+wedged socket. Every call appends one redacted ledger record
+(`{trace_id, model:'needle', op:'repair', input_redacted, request, output, confidence,
+latency_ms, degraded, action:null}`).
+
+`POST /ledger` appends the matching outcome line `{trace_id, action, note?}` → `{ok:true}`.
+
+Any other path answers `404 {"ok": false, "error": "unknown rite"}`.
 
 ### Security conventions
 
@@ -70,27 +99,34 @@ file it ever writes.
 ## Install the models (Phase 12/13 do this deliberately — nothing runs automatically)
 
 ```bash
-bash localmodels/setup.sh     # Linux/macOS
+bash localmodels/setup.sh     # Linux/macOS  — installs the Needle venv + weights + engine
 ```
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File localmodels/setup.ps1   # Windows
 ```
 
-Both scripts create `localmodels/.venv`, upgrade `pip` and `pip install cactus-needle`;
-they then *print* the remaining steps (`needle download needle3`, and `npm install` inside
-`localmodels/` for the optional Laya child). They do not download anything by themselves.
-Weights land in `~/.cache/cactus-needle` (a `.cact` file; `NEEDLE_WEIGHTS` may point at it)
-and `~/.cache/receptron-laya` (`LAYA_CACHE` overrides). Laya additionally needs Node ≥ 20;
-Needle needs a Python runtime, which the bridge already requires.
+Both scripts create `localmodels/.venv`, upgrade `pip`, `pip install cactus-needle` and
+then REALLY download the base weights + engine library into the package's cache dir
+(`localmodels/fetch_engine.py` → `~/.cache/cactus-needle/v3/<version>/`; idempotent —
+a cached file is skipped). If the exact engine version was never published as a wheel,
+the helper lists the repo's `python/` directory and extracts `libneedle3.*` from the
+highest version matching this machine's platform tag, so install does not silently
+break. `NEEDLE_WEIGHTS` may point at a specific `.cact` instead of the cache.
+Laya additionally needs Node ≥ 20; its weights land in `~/.cache/receptron-laya`
+(`LAYA_CACHE` overrides). **Run the daemon with the venv python**
+(`localmodels/.venv/bin/python localmodels/local_models_daemon.py`; it sets
+`NEEDLE_TELEMETRY=0` itself, so nothing about a repair leaves the machine).
 
 ## Layout
 
 | File | Role |
 |---|---|
-| `local_models_daemon.py` | Origin-guarded `ThreadingHTTPServer` on 127.0.0.1:8932 |
+| `local_models_daemon.py` | Origin-guarded `ThreadingHTTPServer` on 127.0.0.1:8932 (`/health`, `/repair`, `/ledger`) |
+| `needle_backend.py` | lazy, lock-serialised Needle wrapper (`repair`, `weights_present`, `lib_present`) |
 | `ledger.py` | append-only redacted JSONL writer (`new_trace_id`, `append_record`, `redact`) |
-| `setup.sh` / `setup.ps1` | documented installers for Needle (and the Laya npm step) |
+| `setup.sh` / `setup.ps1` | installers for Needle (and the Laya npm step) |
+| `fetch_engine.py` | weights + engine download helper (version-fallback wheel scan) |
 | `README.md` | this file |
 
 Tracked files here hold no hostnames, LAN IPs, keys or absolute personal paths — the repo

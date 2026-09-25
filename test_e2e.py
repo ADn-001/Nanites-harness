@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, shutil, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import json, os, shutil, subprocess, sys, tempfile, threading, time, urllib.request, urllib.error
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 fails = []
@@ -214,8 +214,30 @@ try:
             s, j = req(lmport2, '/health')
             return (s == 200 and j['needle'].get('enabled') is True
                     and j['needle'].get('loaded') is False
+                    and j['needle'].get('weights') in ('present', 'missing')
                     and any('needle' in str(r) for r in j.get('degraded', [])))
         lm_probe('localmodels: without --no-needle => needle.enabled True + needle degraded reason', lm_needle_enabled)
+
+        # Phase 12: needle is enabled, but this daemon runs the SYSTEM python, which has
+        # no needle package. Assert /repair degrades; if some machine ever runs a system
+        # python WITH weights loaded, assert only the never-500 contract.
+        def lm_repair_needle_unavailable():
+            h = req(lmport2, '/health')[1]
+            s, j = req(lmport2, '/repair', {'suspect': {'name': 'read-file', 'arguments': '{"path": "a.py"}'},
+                                            'candidates': [{'name': 'read_file', 'description': 'Read a file.',
+                                                            'parameters': {'type': 'object',
+                                                                           'properties': {'path': {'type': 'string'}},
+                                                                           'required': ['path']}}],
+                                            'trace_id': 'tr_e2e_pkg'})
+            if h['needle'].get('weights') == 'present':
+                return (s == 200 and isinstance(j.get('ok'), bool) and 'confidence' in j
+                        and j.get('trace_id') == 'tr_e2e_pkg')
+            return (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                    and j.get('reason') in ('tool_unavailable', 'weights_missing')
+                    and isinstance(j.get('latency_ms'), int)
+                    and j.get('trace_id') == 'tr_e2e_pkg')
+        lm_probe('localmodels: needle enabled + package/weights absent => /repair {ok:false,degraded:true}, never a 500',
+                 lm_repair_needle_unavailable)
     finally:
         lmd2.terminate()
         try: lmd2.wait(timeout=5)
@@ -267,7 +289,136 @@ try:
     lm_probe('localmodels: foreign-Origin POST refused before route logic (403, not 404)',
              lm_foreign_post_before_route)
 
-    # the ONLY file the daemon may write is the ledger
+    # ---- Phase 12: POST /repair on the --no-needle daemon (never a 500, always JSON) ----
+    SUSPECT = {'name': 'read-file', 'arguments': '{"path": "a.py"}'}
+    CANDIDATES = [{'type': 'function',
+                   'function': {'name': 'read_file', 'description': 'Read a file.',
+                                'parameters': {'type': 'object',
+                                               'properties': {'path': {'type': 'string'}},
+                                               'required': ['path']}}}]
+
+    def lm_repair_flag():
+        import subprocess as sp
+        r = sp.run([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'), '--help'],
+                   capture_output=True, text=True, timeout=30)
+        return '--needle-timeout-ms' in r.stdout and '--preload-needle' in r.stdout
+    lm_probe('localmodels (phase12): --needle-timeout-ms and --preload-needle flags exist', lm_repair_flag)
+
+    def lm_repair_foreign_origin():
+        ledger_before = open(lmledger, encoding='utf-8').read() if os.path.isfile(lmledger) else ''
+        s, j = req(lmport, '/repair', {'suspect': SUSPECT, 'candidates': CANDIDATES},
+                   origin='http://evil.example')
+        ledger_after = open(lmledger, encoding='utf-8').read() if os.path.isfile(lmledger) else ''
+        return (s == 403 and j.get('error') == 'origin not permitted'
+                and ledger_before == ledger_after)
+    lm_probe('localmodels (phase12): foreign Origin POST /repair => 403 and NO ledger record',
+             lm_repair_foreign_origin)
+
+    def lm_repair_no_needle():
+        s, j = req(lmport, '/repair', {'suspect': SUSPECT, 'candidates': CANDIDATES,
+                                       'trace_id': 'tr_e2e_none'})
+        return (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                and j.get('reason') == 'disabled'
+                and isinstance(j.get('latency_ms'), int)
+                and j.get('trace_id') == 'tr_e2e_none')
+    lm_probe('localmodels (phase12): --no-needle POST /repair => {ok:false,degraded:true}, never a 500',
+             lm_repair_no_needle)
+
+    def lm_repair_413wins():
+        s, j = req(lmport, '/repair', raw=b'{"suspect":{"name":"' + b'a' * (2 * 1024 * 1024) + b'"}}')
+        return s == 413 and j.get('ok') is False
+    lm_probe('localmodels (phase12): oversized POST /repair => 413 (size cap outranks routing)',
+             lm_repair_413wins)
+
+    def lm_repair_concurrent():
+        # Two concurrent /repair calls: the threading server + backend lock must
+        # answer BOTH (bounded waits, no wedge, no 500).
+        got = {}
+        def call(i):
+            got[i] = req(lmport, '/repair', {'suspect': SUSPECT, 'candidates': CANDIDATES,
+                                             'trace_id': 'tr_e2e_c%d' % i})
+        threads = [threading.Thread(target=call, args=(i,)) for i in range(2)]
+        t0 = time.time()
+        [t.start() for t in threads]
+        [t.join(15) for t in threads]
+        dt = time.time() - t0
+        return (len(got) == 2 and dt < 12
+                and all(got[i][0] == 200 and 'degraded' in got[i][1] for i in (0, 1))
+                and got[0][1].get('trace_id') != got[1][1].get('trace_id'))
+    lm_probe('localmodels (phase12): two concurrent POST /repair => both answered, never wedged',
+             lm_repair_concurrent)
+
+    def lm_repair_ledger():
+        before = [json.loads(ln) for ln in open(lmledger, encoding='utf-8')
+                  if ln.strip()] if os.path.isfile(lmledger) else []
+        tid = 'tr_e2e_repair1'
+        s, j = req(lmport, '/repair', {'suspect': SUSPECT, 'candidates': CANDIDATES,
+                                       'trace_id': tid})
+        if s != 200:
+            return False
+        after = [json.loads(ln) for ln in open(lmledger, encoding='utf-8')
+                 if ln.strip()] if os.path.isfile(lmledger) else []
+        fresh = after[len(before):]
+        recs = [r for r in fresh if r.get('trace_id') == tid and r.get('op') == 'repair']
+        if len(recs) != 1:
+            print('   expected exactly 1 repair record for %s, got %r' % (tid, fresh))
+            return False
+        rec = recs[0]
+        if not (rec.get('model') == 'needle' and rec.get('input_redacted') is True
+                and 'confidence' in rec and rec.get('action') is None
+                and isinstance(rec.get('latency_ms'), int) and rec.get('degraded') is True):
+            print('   repair record malformed: %r' % rec)
+            return False
+        # outcome line: same trace_id, requested action, still redacted
+        s2, j2 = req(lmport, '/ledger', {'trace_id': tid, 'action': 'passed_through',
+                                         'note': 'Authorization: Bearer topsecret999'})
+        if not (s2 == 200 and j2.get('ok') is True):
+            return False
+        final = [json.loads(ln) for ln in open(lmledger, encoding='utf-8')
+                 if ln.strip()]
+        outs = [r for r in final if r.get('trace_id') == tid and r.get('action') == 'passed_through'
+                and 'op' not in r]
+        if len(outs) != 1:
+            print('   expected 1 outcome line for %s' % tid)
+            return False
+        raw = open(lmledger, encoding='utf-8').read()
+        return 'topsecret999' not in raw
+    lm_probe('localmodels (phase12): /repair ledger record (confidence, action:null) + /ledger outcome line (same trace_id, still redacts)',
+             lm_repair_ledger)
+
+    def lm_repair_prompt_shapes():
+        """The prompt builder must render EVERY suspect shape the shipped frontend sends.
+
+        Regression (found by the integrator's real client<->daemon probe, not by the mocked
+        suites): `_cortexRepairPayload` sends a LIST of {name, arguments, reason} when a turn
+        has several unrepairable calls, and the raw reply TEXT for a prose-only probe in
+        mode:'on'. A dict-only renderer silently dropped both, sending the model a
+        context-free "Previous tool call (malformed): null" prompt - a repair attempt with
+        nothing to repair, which produced a confident wrong guess.
+        """
+        sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+        import needle_backend as nb
+        d = nb.build_repair_prompt({'name': 'raed_file', 'arguments': '{"path":"main.py"}'})
+        lst = nb.build_repair_prompt([{'name': 'raed_file', 'arguments': '{"path":"main.py"}',
+                                       'reason': 'unknown tool'}])
+        txt = nb.build_repair_prompt('I will read main.py for you.')
+        oai = nb.build_repair_prompt([{'function': {'name': 'read_fil', 'arguments': {'path': 'a.py'}}}])
+        empty = nb.build_repair_prompt(None)
+        checks = [
+            ('raed_file' in d and 'main.py' in d, 'dict shape'),
+            ('raed_file' in lst and 'main.py' in lst and 'unknown tool' in lst, 'list shape (frontend): %r' % lst),
+            ('main.py' in txt, 'prose string shape (mode:on): %r' % txt),
+            ('read_fil' in oai and 'a.py' in oai, 'OpenAI nested shape'),
+            ('null' not in lst and 'null' not in txt, 'no empty "malformed: null" placeholder: %r' % lst),
+            (empty.count('Emit the corrected call.') == 1, 'None suspect still returns one prompt'),
+        ]
+        bad = [m for ok, m in checks if not ok]
+        if bad:
+            print('   ' + '; '.join(bad))
+        return not bad
+    lm_probe('localmodels (phase12): repair prompt renders dict / list / prose-string / OpenAI suspects',
+             lm_repair_prompt_shapes)
+
     def lm_no_stray_files():
         return set(os.listdir(lmdir)) <= {'local-models.jsonl', 'local-models-2.jsonl'}
     lm_probe('localmodels: daemon wrote no pid/log file next to itself (ledger only)',

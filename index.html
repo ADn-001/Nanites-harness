@@ -176,6 +176,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
 #agent-toggle{letter-spacing:.18em}
 #agent-toggle.on{color:var(--amber);border-color:rgba(255,179,71,.65);box-shadow:0 0 10px rgba(255,179,71,.18)}
 .rite-call{margin:0 12px 8px;padding:7px 9px;border-left:2px solid var(--amber);background:rgba(255,179,71,.06);color:var(--amber);font-size:11.5px;letter-spacing:.08em;white-space:pre-wrap;word-break:break-word}
+.cortex-note{margin:0 12px 8px;padding:6px 9px;border-left:2px solid var(--phos);background:rgba(0,255,157,.05);color:var(--phos);font-size:11px;letter-spacing:.10em;white-space:pre-wrap;word-break:break-word}
+.cortex-note.degraded{border-left-color:var(--danger);background:rgba(255,71,71,.05);color:var(--danger)}
 .msg.rite-result{border-color:rgba(255,179,71,.4);background:rgba(255,179,71,.025)}
 .msg.rite-result .msg-head{color:var(--amber);border-color:rgba(255,179,71,.25)}
 .msg.rite-result .msg-body{color:#ffd99a;font-size:12.5px}
@@ -551,6 +553,9 @@ function msgHTML(m,i){
     return `<div class="rite-call">&#9881; INVOKED RITE: ${esc(t.name||'unknown')} ${esc(args)}</div>`;
   }).join('');
   const body=isUser||isTool?esc(CogCore.contentText(m.content)):renderMd(m.content);
+  /* PHASE 12 — operator-visible LOCAL CORTEX note (a repaired rite, or a degraded probe).
+     Non-blocking: it never mutates the model's own text and never enters the request payload. */
+  const cortexNote=m.cortexNote?`<div class="cortex-note${m.cortexDegraded?' degraded':''}">${esc(m.cortexNote)}</div>`:'';
   const msgs=active()?.messages||[];
   const caret=(generating&&i===msgs.length-1&&m.role==='assistant')?'<span class="caret"></span>':'';
   const acts=`<div class="acts">
@@ -558,7 +563,7 @@ function msgHTML(m,i){
     <span data-a="copy" data-i="${i}">&#10697; COPY</span>
     <span data-a="del" data-i="${i}" class="danger">&#10005; PURGE</span></div>`;
   return `<div class="msg ${m.role}${isTool?' rite-result':''}"><div class="msg-head"><span>${who}${isTool&&m.name?' // '+esc(m.name):''}</span>
-    <span class="spacer"></span><span>${ts}</span></div>${think}${invoked}
+    <span class="spacer"></span><span>${ts}</span></div>${think}${invoked}${cortexNote}
     <div class="msg-body" id="body-${i}">${body}${caret}</div>${acts}</div>`;
 }
 function renderMessages(){
@@ -1011,16 +1016,39 @@ async function runAgentLoop(c,m,sig){
     const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
     m.content=acc.content;m.thinking=acc.thinking;
     const finalized=finalizeToolCalls(acc,m.ts||Date.now());
-    /* PHASE 11 — deterministic salvage runs BEFORE the Phase 7 gate. It repairs FORMAT
-       only (fences, trailing commas, string / double-encoded / truncated arguments,
-       near-miss tool names, narrated calls) and NEVER invents an argument value. What it
-       cannot resolve stays in the turn so the validator still rejects it explicitly, and
-       is recorded on the message as a `cortexSuspects` lead for the ML repair stage. */
-    const salv=CogCore.salvageToolCalls({toolCalls:finalized,content:acc.content},TOOL_SCHEMAS);
-    m.toolCalls=salv.calls.concat(salv.unrepairable.map(u=>({id:u.id,name:u.name,args:u.args})))
-      .map((t,ix)=>({id:t.id||('call_salv_'+iter+'_'+ix+'_'+Date.now().toString(36)),name:t.name,args:t.args}));
+    /* PHASE 12 — LOCAL CORTEX repair pass. Stage 1 is the Phase 11 deterministic salvage
+       (unchanged): fences, trailing commas, string / double-encoded / truncated arguments,
+       near-miss tool names, narrated calls — FORMAT only, never an invented argument value.
+       Stage 2 may offer what plain code cannot resolve to the local Needle sidecar, bounded
+       and confidence-gated. Local inference is NEVER in the critical path: with the sidecar
+       down, disabled, unconfigured or slow this is byte-identical to Phase 11 and the ORIGINAL
+       reply passes through untouched. Whatever cannot be resolved still stays in the turn so
+       the Phase 7 validator rejects it explicitly (re-attached below). */
+    const lm=normLocalModels(settings.localModels);
+    let cortexClient=null;
+    try{
+      /* ONE client per turn, built only when the operator opted in — with enabled:false the page
+         makes ZERO requests to the sidecar port. */
+      if(lm.enabled)cortexClient=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch);
+    }catch(e){cortexClient=null;}
+    let san=null;
+    try{ san=await CogCore.sanitizeReply({toolCalls:finalized,content:acc.content},TOOL_SCHEMAS,{client:cortexClient,settings:lm}); }
+    catch(e){ san=null; }
+    if(!san||!Array.isArray(san.calls))san={calls:finalized,unrepairable:[],source:'deterministic',accepted:true,degraded:false,reason:'',changed:[]};
+    m.cortexNote='';m.cortexDegraded=false;
+    if(san.accepted&&san.source==='needle'){
+      /* A real local repair. Surface it to the operator (never silently) as a non-blocking
+         transcript note, and clear the suspect lead a later phase reads. */
+      m.cortexNote='[LOCAL CORTEX: RITE REPAIRED — '+((san.calls||[]).map(t=>t.name).filter(Boolean).join(', ')||'unknown')+']';
+      delete m.cortexSuspects;
+    }else if(san.degraded&&san.reason==='timeout'){
+      m.cortexDegraded=true;
+      m.cortexNote='[LOCAL CORTEX: NEEDLE TIMED OUT — ORIGINAL RITE PASSED THROUGH]';
+    }
+    m.toolCalls=(san.calls||[]).concat((san.unrepairable||[]).map(u=>({id:u.id,name:u.name,args:u.args})))
+      .map((t,ix)=>({id:t.id||('call_san_'+iter+'_'+ix+'_'+Date.now().toString(36)),name:t.name,args:t.args}));
     if(!m.toolCalls.length)m.toolCalls=finalized;
-    if(salv.unrepairable.length)m.cortexSuspects=salv.unrepairable;
+    if(san.unrepairable&&san.unrepairable.length&&!(san.accepted&&san.source==='needle'))m.cortexSuspects=san.unrepairable;
     m.ts=m.ts||Date.now();refreshLast();
     if(!m.toolCalls.length)return;
     /* DETERMINISTIC GATE: no model-authored call reaches the bridge unvalidated.

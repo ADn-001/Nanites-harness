@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # LOCAL CORTEX — Needle (+ optional Laya) installer.
 #
-# DOCUMENTED BUT NOT RUN automatically by the test suite or CI: installing the models is
-# a deliberate, per-machine opt-in (Phase 12 runs the Needle half; Phase 13 the Laya half).
-# Nothing here happens unless you run this script yourself.
+# Installs the Needle repair engine for real: venv + cactus-needle + the base weights +
+# the engine library. Per-machine opt-in: nothing runs unless you invoke this script,
+# and nothing here is ever enabled by default in the harness.
 #
 #   bash localmodels/setup.sh
 #
@@ -31,19 +31,29 @@ echo "[LOCAL CORTEX] upgrading pip"
 echo "[LOCAL CORTEX] installing cactus-needle (Apache-2.0) — the repair engine"
 "$VPY" -m pip install cactus-needle
 
+# Weights + engine library. `needle download needle3` defaults `--out` to the CURRENT
+# DIRECTORY — running that from here would dump a 35 MB binary into the repo — so the
+# helper script does the downloads itself and places everything in the package's own
+# cache dir (~/.cache/cactus-needle/v3/<version>/). Idempotent: a cached file is skipped.
+# The engine version the package expects is occasionally unpublished as a wheel;
+# fetch_engine.py then picks the HIGHEST wheel in the repo's python/ dir that matches
+# this machine's platform tag and extracts libneedle3.so from it.
+echo "[LOCAL CORTEX] downloading base weights + engine library (the only network use)"
+"$VPY" "$HERE/fetch_engine.py"
+
 cat <<'EOT'
 
 [LOCAL CORTEX] Needle installed. Next steps:
 
-  1. Download the base weights (this is the only network use, ~1 download):
+  1. Run the sidecar with the VENV python (the system python has no needle package):
 
-         .venv/bin/needle download needle3
+         localmodels/.venv/bin/python localmodels/local_models_daemon.py
+         # on Windows: localmodels\.venv\Scripts\python.exe localmodels\local_models_daemon.py
 
-     Weights land in ~/.cache/cactus-needle (a .cact file). To point the daemon at a
-     specific file instead, export NEEDLE_WEIGHTS=/path/to/base.cact
-     Run the sidecar with the venv python:
-         .venv/bin/python local_models_daemon.py
-     (on Windows: .venv\Scripts\python.exe local_models_daemon.py)
+     Add --preload-needle to warm the engine at boot. The daemon sets
+     NEEDLE_TELEMETRY=0 itself, so the package's anonymous usage counters never fire —
+     nothing about a repair leaves the machine. To point at a specific weights file,
+     export NEEDLE_WEIGHTS=/path/to/base.cact (otherwise the cache above is used).
 
   2. Laya is OPTIONAL and separate (Node >= 20, ~1.7 GB of ONNX weights on first use):
 
@@ -52,5 +62,5 @@ cat <<'EOT'
 
 [LOCAL CORTEX] Nothing is enabled by default: the harness works unchanged until you
 turn LOCAL CORTEX on, and nothing in this package ever contacts a remote service
-besides the weight downloads above.
+besides the weight/engine downloads above.
 EOT

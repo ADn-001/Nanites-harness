@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 12 — Needle repair pass (F1 ML stage)**
+Next phase to work on: **Phase 13 — Laya gates (F2) via the Node child**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -640,23 +640,114 @@ unrepairable turn reaching the bridge zero times with both rejections fed back.
   replace Phase 10's env-var-only `needle.weights` check with the package's real weights-path probe.
 
 ## Phase 12 — Needle repair pass (F1 ML stage)
-Status: not started
+Status: **DONE**
 Test suite: `tests/frontend/phase12_needle_repair.test.js` + `/repair` cases in `test_e2e.py` +
 opt-in `tests/live/test_needle_live.py`
 
-Deliverable: probe first (record the REAL `Needle.complete()` envelope in this file's findings),
-then `localmodels/needle_backend.py` (lazy load, process-global lock, weights from `NEEDLE_WEIGHTS`
-or base weights, `confidence:null` = below threshold), daemon `POST /repair` (800 ms default
-timeout enforced around the model call), `CogCore.sanitizeReply()` (salvage → Needle → validator →
-confidence accept) in `runAgentLoop`, operator-visible repair note, `/ledger` outcome call, and
-`localmodels/setup.sh|ps1` that really installs the venv + base weights.
-Gate: above-threshold repair accepted and dispatched canonically; below-threshold/timeout/`calls:[]`
-/ sidecar-down all pass the original reply through untouched; empty result never manufactures a
-call; no API key ever reaches the sidecar; exactly one `/repair` per suspect turn. Live Needle
-suite green on this machine with measured latency recorded here.
+Deliverable as planned: `localmodels/needle_backend.py` (lazy load, module lock, real
+weights-path probe, `confidence:null` = below threshold), daemon `POST /repair` + `POST /ledger`
+(800 ms default timeout around the model call, `--preload-needle`), `CogCore.sanitizeReply()`
+(salvage → Needle → Phase 7 validator → confidence accept) wired into `runAgentLoop`, the
+operator-visible repair note, and real `localmodels/setup.sh|ps1` (+ `localmodels/fetch_engine.py`.
+Weights + engine REALLY installed on this machine (venv at `localmodels/.venv`,
+`cactus-needle 3.0.5`, base weights `~/.cache/cactus-needle/v3/3.0.2/needle3.cact` 35 MB,
+engine lib `libneedle.so` 1.2 MB in the same cache dir).
+
+Gate: **Satisfied.** On the committed tree:
+- `npm test` exit 0 — `node tests/frontend/run.js` → `FRONTEND SUITE: ALL GREEN`
+  (phase12: 72 checks, `0 FAILURES`; phases 0,1,2,3,5,6,7,8,9,10,11 all `0 FAILURES`) and
+  `python3 test_e2e.py` → `0 FAILURES` (80 ok, 8 of them new localmodels phase-12 cases).
+- LIVE suite green on this machine: `COG_LIVE_MODELS=1 python3 -m unittest
+  tests/live/test_needle_live` → `Ran 3 tests in 8.442s OK`; real-model latencies 546–3406 ms
+  (first construction 0.77 s — engine loads fast once the lib is cached), no-match probe
+  `function_calls == []`, every repair kept its canonical name inside the candidate set and
+  object-shaped arguments.
+- Integrator seam probe (mock-vs-mock is NOT enough): the SHIPPED `CogCore.sanitizeReply` +
+  shipped `localModels.client` driven from Node against a REAL daemon running the venv python
+  with the REAL model on port 8939 — suspect above threshold accepted and dispatched
+  (`source:'needle'`, conf 0.89–0.98, `action:'accepted'` ledgered, `cortexSuspects` cleared,
+  operator note surfaced); below-threshold suspect passes through untouched
+  (`reason:'below_threshold'`); 250 ms budget against a warm engine ⇒ pass-through in 264 ms
+  (`reason:'timeout'`, turn completes, `action:'timeout'` ledgered); a clean turn issues ZERO
+  requests to :8932; across 7 real HTTP requests ZERO carried an `Authorization` header or the
+  seeded API key.
 
 ### Findings
-(empty — fill in during this phase's Test/Debug Sprint)
+- **THE LANDMINE BOTH CHILDREN MISSED (integrator problem, exactly as the Phase 10 findings
+  warned): silo drift on the /repair suspect contract.** Plan §4 documents
+  `suspect:{name, arguments}` — a single dict — but the shipped frontend's
+  `_cortexRepairPayload` sends a **LIST** of `{name, arguments, reason}` when a turn has
+  several unrepairable calls, and the raw **reply text** for a prose-only probe in `mode:'on'`.
+  The child's daemon rendered only the dict form, so a real frontend request taught the model
+  `"Previous tool call (malformed): null"` — a context-free prompt that asked a tool-calling
+  model to guess at nothing. Measured behaviour pre-fix: the real model answered confidently
+  WRONG (an off-corpus `grep` call at conf≈0.21) instead of repairing. The mocked frontend
+  suite asserted the *contract shape* the mock returned, the mocked python suite asserted the
+  *dict* path — only the real client↔real-daemon probe caught it. Fixed by rendering ALL
+  suspect shapes in `needle_backend.build_repair_prompt` (regression pinned in
+  `test_e2e.py` as "repair prompt renders dict / list / prose-string / OpenAI suspects").
+  **Phase 13+: the integrator's real-seam probe is load-bearing; add an equivalent one for
+  `/decide` there (batched ask shape vs the daemon's expectation).**
+- **Real `complete()` envelope (settles the plan's §1 "must verify" 1–2, on `needle` 3.0.5):**
+  `{type:'call', success, error, error_code, reason, function_calls:[{name, arguments}],
+  suppressed_calls:[…], reasoning, confidence, prefill_tps, decode_tps, peak_ram_mb,
+  validation:{ungrounded:[paths], negation}}`. NOT the spec's bare
+  `{function_calls, reasoning, confidence}`: it carries `type:'call'`, a `suppressed_calls`
+  list, a `validation` block and per-call perf counters. `arguments` is a plain object here.
+  Base weights (untuned) report a REAL calibrated confidence (0.08–0.99 across probes);
+  `confidence: null` still means "below threshold".
+- **`suppressed_calls` is where a *legit* call often lands**: "read main.py" came back with
+  `function_calls: []` and the call in `suppressed_calls` at conf 0.08. The daemons
+  deliberately read ONLY `function_calls` — `suppressed` is the model's own "not confident
+  enough to act" lane, and the frontend's `minConfidence` gate already covers low-conf output.
+  Do not "rescue" them by harvesting `suppressed_calls`.
+- **The no-match guarantee is stateful.** After a repair-shaped query the same process yields a
+  spurious low-confidence call on an off-topic prompt — the package's `_active` conversation is
+  sticky even under `stateless=True` + `reset()`. Only a FRESH process reliably answers
+  `function_calls == []`. Live suite therefore runs the no-match probe FIRST in its own
+  subprocess. **The daemon's real path (frontend posts actual suspects) is unaffected; never
+  run a QA "no-match" health probe against a warm production daemon.**
+- **Engine version pin:** the HF repo `Cactus-Compute/needle3` does NOT publish a wheel for the
+  engine version `needle 3.0.5` expects (3.0.2) — only 3.0.0/3.0.1. `_load_cdll` had no
+  fallback and `needle download needle3` (bare CLI) writes a 35 MB `.cact` into the **cwd**
+  (the repo!), never the cache. `localmodels/fetch_engine.py` (installer helper) resolves this
+  generically: try the expected wheel, on 404 list `python/` and pick the highest version
+  matching the runtime platform tag, extract `needle/libneedle<gen>.so` into
+  `cache_dir(gen)`. Verified end-to-end: lib moved away → helper fetched 3.0.1
+  `musllinux_1_2_aarch64`, extracted, identical lib restored. A 3.0.1 engine + 3.0.5 package
+  pair runs correctly (no ABI drift observed across the live suite).
+- **`build_repair_prompt` is not a contract detail the frontend should own.** The frontend knows
+  what suspect shape it has; the daemon knows how to phrase a repair. Keep the prompt here,
+  keep `_cortexRepairPayload` (appcore) shape-tolerant (it accepts `arguments`/`args`/
+  `function.arguments`), never reintroduce an assumption that `suspect` is a dict in either.
+- **Telemetry silenced for real:** `NEEDLE_TELEMETRY=0` (`os.environ.setdefault`, so an
+  operator's explicit setting wins) is set in BOTH `local_models_daemon.py` (before `import
+  needle_backend`) and `needle_backend.py` (before the lazy `needle` import) — the package's
+  anonymous usage counters would otherwise fire on every model call. `setup.sh` documents it.
+- **A warm engine at a tight budget is a prompt timeout, not a hang.** `_repair_call` submits to
+  a 1-worker `ThreadPoolExecutor` and `future.result(timeout=…)`. A first-call engine build can
+  exceed 800 ms and is reported as `reason:'needle loading'` (not `'timeout'`); two concurrent
+  `/repair` requests both answer in bounded time, serialized by the module lock (real model:
+  6.9 s + 3.4 s for two 8 s-budget calls). Verified in `test_e2e.py`.
+- **Frontend `sanitizeReply` is sync-or-async by design.** Plain object on non-probing paths,
+  Promise only when it actually probes, so `await` always works and a no-deps caller stays
+  synchronous/I-O-free. `index.html` awaits it, then falls back to `finalized` on a throw.
+- Landmine kept from Phase 11 and re-asserted this phase: **dispatch-count assertions still
+  must filter the `{name:'list_dir',arguments:{path:'.'}}` workdir listing.**
+- Process: TEAM-OF-TWO (same as Phase 9/10). child A owned the Python sidecar
+  (`localmodels/*`, `test_e2e.py`, `tests/live/*`), child B owned the frontend
+  (`appcore.js`, `index.html`, `tests/frontend/phase12_needle_repair.test.js`). Both children
+  did red-first runs and neither committed. The integrator ran the FULL `npm test` on the
+  combined tree and the real client↔real-daemon probe; the seam bug above was found and fixed
+  by the integrator, not a child. Spec files `docs/plans/phase12-workstream-{A,B}.md` were
+  deleted before commit (they carried this machine's absolute paths — share-readiness rule).
+- `bridge_daemon.log` re-dirtied by the suite run per codereview #27 — reverted before commit.
+- **Next agent:** Phase 13 (Laya) is open. `/repair`, the ledger, the client, the operator
+  note, and the real-seam-probe pattern are all established; add `/decide` + the Node child,
+  and mirror this phase's real-seam probe for the batched-questions shape. The `degraded`
+  semantics (an ENABLED-but-unavailable engine is degraded, a `--no-*` engine is not) from
+  Phase 10 still govern. Laya's token limits (~192 tokens/question options, ~512 state) must
+  be MEASURED against the real child, not assumed from the spec.
 
 ## Phase 13 — Laya gates (F2) via the Node child
 Status: not started
@@ -757,5 +848,19 @@ machine-specific changes; PR opened against `main`.
   4. The golden corpus is generated (`tools/gen_toolcall_corpus.py`) and must not be hand-edited.
   5. Dispatch-count assertions must filter the `{name:'list_dir',arguments:{path:'.'}}` workdir
      listing that `buildMessages()` posts on every agent iteration (see Phase 11 findings).
-  6. Nothing counts a local-model dispatch as "repaired" yet: `sanitizeReply` (Phase 12) is what will
-     consume `m.cortexSuspects`, and the operator-visible repair note belongs to that phase too.
+- 2026-09-25 (Phase 12 session, cron): Phase 12 done and committed. Decisions a later session must
+  not silently reverse:
+  1. The `/repair` suspect field is shape-tolerant on BOTH sides (daemon renders dict, list, prose
+     string and OpenAI-nested; `_cortexRepairPayload` accepts arguments/args/function.arguments).
+     The dict-only rendering that used to be there silently dropped the frontend's list and
+     produced confident wrong guesses — the real-seam probe is the property that keeps it honest.
+  2. The daemon reads ONLY `function_calls` from the Needle envelope; `suppressed_calls` is the
+     model's own "not confident enough" lane and must NOT be harvested.
+  3. No-match probes and any QA "is it sane" check must run in a FRESH process — the package's
+     `_active` conversation is sticky and a warm process fakes a match.
+  4. `NEEDLE_TELEMETRY=0` is set in both `local_models_daemon.py` and `needle_backend.py`, always
+     via `setdefault` (an operator's explicit setting wins).
+  5. `localmodels/fetch_engine.py` is the installer: engine version the package expects may not be
+     published, so it falls back to the highest available wheel for the runtime platform tag.
+  6. `sanitizeReply` keeps the Phase 11 deterministic calls in `out.calls` even when the probe
+     is skipped/timeout/rejected — a mixed turn never loses its repairable rite.

@@ -851,6 +851,301 @@
       }
     },
 
+    /* ================= PHASE 12 — NEEDLE REPAIR PASS (F1) =================
+     * `sanitizeReply(reply, allowedTools, deps)` — the single door the agent turn uses to turn a
+     * model reply into dispatchable calls. Stage 1 is the Phase 11 deterministic salvage
+     * (`salvageToolCalls`) and is COMPLETELY unchanged: if plain code can produce dispatchable
+     * calls with nothing left over, this function does NO I/O.
+     *
+     * Stage 2 (opt-in, OFF by default) offers the calls plain code could not resolve — and, in
+     * `mode:'on'`, a prose-only narration — to the local Needle sidecar, bounded by
+     * `needle.timeoutMs`. Local inference is NEVER in the critical path:
+     *   - sidecar down / disabled / unconfigured / slow / empty ⇒ the ORIGINAL reply and its
+     *     Phase 11 unrepairable suspects pass through byte-identically;
+     *   - a repair fixes FORMAT ONLY and is still gated by `validateStructuredOutput` before it
+     *     can be dispatched — the local model never widens the allow-list, and a name it invents
+     *     is rejected by the deterministic gate, not trusted;
+     *   - an empty `calls:[]` never manufactures a call (the turn ends as prose);
+     *   - it NEVER throws; any failure degrades to `source:'original'`.
+     *
+     * Return: {calls, source:'deterministic'|'needle'|'original', confidence, accepted,
+     *          trace_id, degraded, changed, unrepairable, reason}
+     * `calls` is ALWAYS what the caller should dispatch. Phase 11 deterministic calls are never
+     * dropped: a mixed turn (repairable + suspects) keeps its dispatchable call even when the
+     * probe is skipped, times out or is rejected. `unrepairable` holds the still-unresolved calls
+     * so the caller can re-attach them to the Phase 7 gate.
+     *
+     * `deps` is INJECTED so jsdom/Node tests need no server and the function stays pure:
+     *   {client, settings, traceId, timeout, now}
+     * The `/repair` and `/ledger` requests carry NO Authorization header and never the provider
+     * API key: only `{suspect, candidates, schema, trace_id}` / `{trace_id, action}` are sent.
+     *
+     * Returns a plain object on every non-probing path, and a Promise when it actually probes, so
+     * `await sanitizeReply(...)` is always correct and a no-deps caller stays synchronous.
+     */
+    sanitizeReply: function (reply, allowedTools, deps) {
+      var out = {
+        calls: [], source: 'original', confidence: null, accepted: false,
+        trace_id: '', degraded: false, changed: [], unrepairable: [], reason: ''
+      };
+      try {
+        out.trace_id = CogCore._cortexTraceId(deps);
+        return CogCore._cortexSanitize(reply, allowedTools, deps, out);
+      } catch (e) {
+        out.calls = []; out.source = 'original'; out.accepted = false;
+        out.degraded = true; out.reason = 'error';
+        return out;
+      }
+    },
+
+    /* ---- Phase 12 internals (pure except for the injected client) ---- */
+
+    _cortexTraceId: function (deps) {
+      try {
+        if (deps && typeof deps.traceId === 'function') {
+          var t = deps.traceId();
+          if (t !== undefined && t !== null && String(t)) return String(t);
+        }
+        if (deps && deps.traceId !== undefined && deps.traceId !== null && String(deps.traceId)) {
+          return String(deps.traceId);
+        }
+      } catch (e) { /* fall through to a fresh id */ }
+      try { return CogCore.uid(); } catch (e2) { return 'tr_' + Math.random().toString(36).slice(2); }
+    },
+
+    /* Merge an injected settings block over the §4 defaults, so a partial/legacy blob can never
+       leave a sub-object undefined. Never mutates the caller's object. */
+    _cortexLmSettings: function (settings) {
+      var d = (CogCore.localModels && CogCore.localModels.DEFAULTS) || {};
+      var src = (settings && typeof settings === 'object' && !Array.isArray(settings)) ? settings : {};
+      var out = {}, k;
+      for (k in d) if (Object.prototype.hasOwnProperty.call(d, k) && k !== 'needle' && k !== 'laya' && k !== 'sanitizer' && k !== 'dispatcher') out[k] = d[k];
+      for (k in src) if (Object.prototype.hasOwnProperty.call(src, k)) out[k] = src[k];
+      var subs = ['needle', 'laya', 'sanitizer', 'dispatcher'];
+      for (var s = 0; s < subs.length; s++) {
+        var name = subs[s], base = d[name] || {}, got = src[name], sub = {}, b, g;
+        for (b in base) if (Object.prototype.hasOwnProperty.call(base, b)) sub[b] = base[b];
+        if (got && typeof got === 'object' && !Array.isArray(got)) {
+          for (g in got) if (Object.prototype.hasOwnProperty.call(got, g)) sub[g] = got[g];
+        }
+        out[name] = sub;
+      }
+      return out;
+    },
+
+    _cortexSanitize: function (reply, allowedTools, deps, out) {
+      deps = (deps && typeof deps === 'object') ? deps : {};
+      var lm = CogCore._cortexLmSettings(deps.settings);
+
+      /* ---- STAGE 1: deterministic (Phase 11, unchanged) ---- */
+      var salv;
+      try { salv = CogCore.salvageToolCalls(reply, allowedTools); }
+      catch (e) { salv = { calls: [], changed: [], unrepairable: [] }; }
+      var detCalls = Array.isArray(salv.calls) ? salv.calls.slice() : [];
+      out.changed = Array.isArray(salv.changed) ? salv.changed.slice() : [];
+      out.unrepairable = Array.isArray(salv.unrepairable) ? salv.unrepairable.slice() : [];
+      out.calls = detCalls.slice();
+
+      if (detCalls.length && !out.unrepairable.length) {
+        out.source = 'deterministic'; out.accepted = true;
+        return out;   /* nothing suspect: Phase 11 behaviour, no I/O at all */
+      }
+
+      /* ---- decide whether to probe Needle (plan §4 phase 12, step 2) ---- */
+      var san = lm.sanitizer || {}, nd = lm.needle || {};
+      var mode = (san.mode === undefined || san.mode === null) ? 'auto' : String(san.mode);
+      var client = (deps.client && typeof deps.client.repair === 'function') ? deps.client : null;
+      var suspects = out.unrepairable.length > 0;
+      var proseOnly = detCalls.length === 0 && out.unrepairable.length === 0;
+      var wantProbe = false;
+      if (lm.enabled !== false && san.enabled !== false && nd.enabled !== false &&
+          san.deterministicPass !== false && client && mode !== 'off') {
+        if (mode === 'on') wantProbe = suspects || proseOnly;
+        else wantProbe = suspects;   /* 'auto' probes only on suspects; unknown modes behave as auto */
+      }
+
+      if (!wantProbe) {
+        if (detCalls.length) { out.source = 'deterministic'; out.accepted = true; }
+        else { out.source = 'original'; out.accepted = false; }
+        return out;
+      }
+
+      /* ---- STAGE 2: exactly one bounded, gated Needle probe ---- */
+      var minConf = (typeof nd.minConfidence === 'number' && isFinite(nd.minConfidence)) ? nd.minConfidence : 0.75;
+      var ms = (typeof nd.timeoutMs === 'number' && isFinite(nd.timeoutMs) && nd.timeoutMs > 0) ? nd.timeoutMs : 800;
+      var payload = CogCore._cortexRepairPayload(reply, allowedTools, out.unrepairable, out.trace_id);
+
+      var probe;
+      try { probe = client.repair(payload); }
+      catch (e) { probe = Promise.reject(e); }
+      if (!probe || typeof probe.then !== 'function') probe = Promise.resolve(probe);
+
+      var raced = CogCore._cortexRace(probe, ms, deps.timeout);
+      return raced.then(function (r) {
+        try {
+          if (r && r.expired) {
+            /* Bounded timeout: the transport may never honour an AbortSignal, so we race our own
+               timer. Pass the ORIGINAL reply through and flag the turn. Never hangs. */
+            out.calls = detCalls.slice();
+            out.source = detCalls.length ? 'deterministic' : 'original';
+            out.accepted = detCalls.length > 0;
+            out.degraded = true;
+            out.reason = 'timeout';
+            CogCore._cortexPostOutcome(deps, client, out.trace_id, 'timeout');
+            return out;
+          }
+          return CogCore._cortexApplyRepair(r ? r.value : null, out, detCalls, allowedTools, minConf, deps, client);
+        } catch (e) {
+          out.calls = detCalls.slice(); out.source = 'original'; out.accepted = false;
+          out.degraded = true; out.reason = 'error';
+          return out;
+        }
+      });
+    },
+
+    /*
+     * Race an awaited local call against OUR OWN timer — never the transport's AbortSignal (the
+     * sidecar/legacy fetch impl may ignore one entirely). Resolves {value, expired}; `expired`
+     * true means the timer won. `timeoutDep` may be a scheduler fn(fn, ms, fallbackValue) or an
+     * object with setTimeout; otherwise the real setTimeout is used.
+     */
+    _cortexRace: function (promise, ms, timeoutDep) {
+      return new Promise(function (resolve) {
+        var settled = false;
+        var done = function (value, expired) {
+          if (settled) return;
+          settled = true;
+          resolve({ value: value, expired: !!expired });
+        };
+        var fire = function () { done(null, true); };
+        var scheduled = false;
+        try {
+          if (typeof timeoutDep === 'function') { timeoutDep(fire, ms, null); scheduled = true; }
+          else if (timeoutDep && typeof timeoutDep.setTimeout === 'function') { timeoutDep.setTimeout(fire, ms); scheduled = true; }
+        } catch (e) { scheduled = false; }
+        if (!scheduled) { try { setTimeout(fire, ms); } catch (e2) { /* resolve on the promise then */ } }
+        Promise.resolve(promise).then(
+          function (v) { done(v, false); },
+          function (e) { done({ ok: false, degraded: true, error: String((e && e.message) || e) }, false); }
+        );
+      });
+    },
+
+    /* Build the /repair payload. Suspects for a real repair; the reply's prose for a prose probe.
+       Contains NO settings, NO API key: just the suspect, the candidate schemas and a trace id. */
+    _cortexRepairPayload: function (reply, allowedTools, unrepairable, traceId) {
+      var candidates = [];
+      try {
+        var list = Array.isArray(allowedTools) ? allowedTools.slice(0, 10) : [];
+        for (var i = 0; i < list.length; i++) candidates.push(CogCore._cortexCompactTool(list[i]));
+      } catch (e) { candidates = []; }
+      var suspect;
+      if (unrepairable && unrepairable.length) {
+        suspect = [];
+        for (var u = 0; u < unrepairable.length; u++) {
+          var su = unrepairable[u] || {};
+          suspect.push({
+            name: String(su.name === undefined || su.name === null ? '' : su.name),
+            arguments: su.args,
+            reason: String(su.reason || '')
+          });
+        }
+      } else {
+        var content = '';
+        try { content = CogCore._cortexRawCalls(reply).content || ''; } catch (e2) { content = ''; }
+        suspect = String(content);
+      }
+      return { suspect: suspect, candidates: candidates, schema: { tools: candidates }, trace_id: traceId };
+    },
+
+    _cortexCompactTool: function (t) {
+      var inner = (t && t.function && typeof t.function === 'object') ? t.function : (t || {});
+      return {
+        name: String(inner.name === undefined || inner.name === null ? '' : inner.name),
+        parameters: inner.parameters || { type: 'object', properties: {} }
+      };
+    },
+
+    /* Normalise a Needle `{calls:[{name,arguments}]}` reply into the harness's `{id,name,args}`
+       shape and mint an id (the Phase 7 validator requires one to correlate a tool result). */
+    _cortexNeedleCalls: function (calls, traceId) {
+      var out = [];
+      var tag = String(traceId === undefined || traceId === null ? 'tr' : traceId).replace(/[^a-z0-9]/gi, '').slice(0, 10) || 'tr';
+      for (var i = 0; i < (calls || []).length; i++) {
+        var c = calls[i] || {};
+        var fn = (c.function && typeof c.function === 'object') ? c.function : c;
+        var name = (c.name !== undefined && c.name !== null && c.name !== '') ? c.name : fn.name;
+        var args = c.args !== undefined ? c.args
+          : (c.arguments !== undefined ? c.arguments
+            : (fn.arguments !== undefined ? fn.arguments : fn.args));
+        var id = (c.id !== undefined && c.id !== null && String(c.id)) ? String(c.id) : ('call_needle_' + tag + '_' + i);
+        out.push({ id: id, name: String(name === undefined || name === null ? '' : name), args: args });
+      }
+      return out;
+    },
+
+    _cortexMergeCalls: function (a, b) {
+      var out = (a || []).slice();
+      for (var i = 0; i < (b || []).length; i++) {
+        var dup = false;
+        for (var j = 0; j < out.length; j++) {
+          if (out[j].name === b[i].name && CogCore._cortexSameArgs(out[j].args, b[i].args)) { dup = true; break; }
+        }
+        if (!dup) out.push(b[i]);
+      }
+      return out;
+    },
+
+    _cortexSameArgs: function (x, y) {
+      try { return JSON.stringify(x) === JSON.stringify(y); } catch (e) { return false; }
+    },
+
+    /* Gate a Needle reply and fold the verdict into `out`. The Phase 7 validator is the gate:
+       ok + at least one sanitized call + a numeric confidence >= minConfidence, or nothing. */
+    _cortexApplyRepair: function (res, out, detCalls, allowedTools, minConf, deps, client) {
+      var resCalls = (res && Array.isArray(res.calls)) ? res.calls : [];
+      var conf = (res && typeof res.confidence === 'number') ? res.confidence : null;  /* NaN stays below */
+      var harness = CogCore._cortexNeedleCalls(resCalls, out.trace_id);
+      var gate = CogCore.validateStructuredOutput(harness, allowedTools);
+      var degradedRes = !!(res && (res.ok === false || res.degraded));
+      var confOk = (typeof conf === 'number' && conf >= minConf);
+
+      if (!degradedRes && gate.ok && gate.sanitized.length > 0 && confOk) {
+        out.source = 'needle';
+        out.accepted = true;
+        out.confidence = conf;
+        out.calls = CogCore._cortexMergeCalls(detCalls, gate.sanitized);
+        out.unrepairable = [];          /* the successful repair RESOLVES the suspects */
+        out.degraded = false;
+        out.reason = '';
+        out.changed = out.changed.concat(['needle repaired ' + gate.sanitized.length + ' rite(s)']);
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'accepted');
+        return out;
+      }
+
+      out.calls = detCalls.slice();
+      out.source = detCalls.length ? 'deterministic' : 'original';
+      out.accepted = detCalls.length > 0;
+      out.confidence = conf;
+      out.degraded = degradedRes;
+      out.reason = degradedRes ? 'degraded'
+        : (resCalls.length === 0 ? 'empty' : (!gate.ok ? 'invalid' : 'below_threshold'));
+      CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+      return out;
+    },
+
+    /* Fire-and-forget ledger outcome. The client already never rejects; do not rely on that —
+       and NEVER await it (the ledger must not delay or hang the turn). */
+    _cortexPostOutcome: function (deps, client, traceId, action) {
+      try {
+        var c = (client && typeof client.outcome === 'function') ? client
+          : ((deps && deps.client && typeof deps.client.outcome === 'function') ? deps.client : null);
+        if (!c) return;
+        var p = c.outcome({ trace_id: traceId, action: action });
+        if (p && typeof p.then === 'function') p.then(function () {}, function () {});
+      } catch (e) { /* the ledger is a nicety; it must never break the turn */ }
+    },
+
     /**
      * providerProfileStore — persisted list of provider endpoint profiles.
      * DOM-free. Operates over an injected storage adapter that satisfies
