@@ -1146,6 +1146,214 @@
       } catch (e) { /* the ledger is a nicety; it must never break the turn */ }
     },
 
+    /* ================= PHASE 13 — LAYA GATES (F2) =================
+     * `cortexLayaGates(plan, deps)` — the single seam the agent turn uses to ask the local
+     * "System 1" Laya model TWO batched questions, both FAIL-OPEN:
+     *   - F2a PRE-FLIGHT (outbound): is each MUTATING rite's arguments plausibly valid for that
+     *     tool's schema? Below `laya.minConfidence` ⇒ the index is returned in `held` and the
+     *     caller must NOT dispatch it (it pushes a role:'tool' correction instead). Absence of
+     *     evidence (missing / non-numeric / null `noul`) is NOT a refusal — never hold on a
+     *     missing answer.
+     *   - F2b REPLY-ANOMALY (inbound): does a prose-only reply look like an error page, a
+     *     refusal, or a degenerate loop? At or above threshold ⇒ `anomaly.flagged:true`. The
+     *     reply CONTENT is never rewritten or deleted.
+     *
+     * Local inference is NEVER in the critical path: sidecar down / disabled / slow / lying ⇒
+     * fail open, nothing held, no flag, and the caller behaves byte-identically to Phase 12.
+     * Exactly ONE `/decide` request is issued per call — the pre-flight and anomaly questions
+     * are BATCHED into one payload, and BOTH kinds of question can never be present at once
+     * (a model reply is either dispatchable [pre-flight] or prose-only [anomaly]).
+     *
+     *   plan = { mutating:[{index,name,args,description?,parameters?}],  // not-read-only calls
+     *            prose:boolean,                                          // no dispatchable calls
+     *            utterance?:string,
+     *            reply:{toolCalls:[...], content:'...'} }
+     *   deps = { client, settings, traceId, timeout }
+     *
+     * Returns a plain object on every non-probing path, and a Promise when it actually probes,
+     * so `await cortexLayaGates(...)` is always correct and a no-deps caller stays synchronous.
+     *
+     *   {ok, degraded, reason, trace_id,
+     *    held:[<index into plan.mutating>...],      // pre-flight refusals
+     *    anomaly:null | {flagged:boolean, prob:number|null},
+     *    answers:null | {<key>:...},                // raw answers (ledger note / tests)
+     *    questions:{<key>:...},                     // EXACTLY what was sent ({} when nothing sent)
+     *    latency_ms}
+     *
+     * The `/decide` payload contains only `{state, questions, trace_id}` — never `settings`,
+     * never an API key, and NO `Authorization` header is ever sent.
+     */
+    cortexLayaGates: function (plan, deps) {
+      var out = {
+        ok: true, degraded: false, reason: '', trace_id: '',
+        held: [], anomaly: null, answers: null, questions: {}, latency_ms: 0
+      };
+      try {
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        out.trace_id = CogCore._cortexTraceId(deps);
+        plan = (plan && typeof plan === 'object') ? plan : {};
+        var lm = CogCore._cortexLmSettings(deps.settings);
+        var laya = lm.laya || {};
+        var client = (deps.client && typeof deps.client.decide === 'function') ? deps.client : null;
+
+        /* Rule 1 — probe only when opted in AND a usable client exists; otherwise ZERO I/O. */
+        if (lm.enabled === false || laya.enabled === false || !client) return out;
+
+        var questions = CogCore._layaQuestions(plan, laya);
+        out.questions = questions;
+        if (!Object.keys(questions).length) return out;   /* nothing to ask ⇒ do not call /decide */
+
+        var ms = (typeof laya.timeoutMs === 'number' && isFinite(laya.timeoutMs) && laya.timeoutMs > 0) ? laya.timeoutMs : 500;
+        var minConf = (typeof laya.minConfidence === 'number' && isFinite(laya.minConfidence)) ? laya.minConfidence : 0.70;
+
+        var payload = { state: CogCore._layaState(plan), questions: questions, trace_id: out.trace_id };
+
+        var probe;
+        try { probe = client.decide(payload); }
+        catch (e) { probe = Promise.reject(e); }
+        if (!probe || typeof probe.then !== 'function') probe = Promise.resolve(probe);
+
+        /* Bounded by OUR OWN timer via the EXISTING Phase 12 race helper (never a second one). */
+        var raced = CogCore._cortexRace(probe, ms, deps.timeout);
+        return raced.then(function (r) {
+          try {
+            if (r && r.expired) {
+              out.ok = false; out.degraded = true; out.reason = 'timeout';
+              out.held = []; out.anomaly = null;
+              CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+              return out;
+            }
+            return CogCore._cortexApplyLaya(r ? r.value : null, out, plan, minConf, deps, client);
+          } catch (e) {
+            out.ok = false; out.degraded = true; out.reason = 'error';
+            out.held = []; out.anomaly = null;
+            return out;
+          }
+        });
+      } catch (e) {
+        out.ok = false; out.degraded = true; out.reason = 'error';
+        out.held = []; out.anomaly = null; out.answers = null;
+        return out;
+      }
+    },
+
+    /* ---- Phase 13 internals (pure except for the injected client) ---- */
+
+    /* Build the batched `questions` map for a turn. Empty when the operator disabled the
+       relevant gate, when there is nothing to ask, or when a reply is neither mutating nor
+       prose-only. Both kinds are mutually exclusive by construction (see the seam comment). */
+    _layaQuestions: function (plan, laya) {
+      var q = {};
+      var mutating = (plan && Array.isArray(plan.mutating)) ? plan.mutating : [];
+      if (laya.preflight !== false && mutating.length) {
+        var pf = CogCore._layaPreflightQuestions(mutating);
+        for (var k in pf) if (Object.prototype.hasOwnProperty.call(pf, k)) q[k] = pf[k];
+      }
+      if (laya.anomaly !== false && plan && plan.prose === true) {
+        var content = '';
+        try { content = (plan.reply && plan.reply.content) || ''; } catch (e) { content = ''; }
+        q['anomaly'] = CogCore._layaAnomalyQuestion(content);
+      }
+      return q;
+    },
+
+    /* One `noul` question per mutating call: "do these arguments plausibly satisfy this tool's
+       schema?" Criteria carry the tool name, its schema description/parameters and the JSON
+       arguments under consideration. */
+    _layaPreflightQuestions: function (mutating) {
+      var q = {};
+      var list = Array.isArray(mutating) ? mutating : [];
+      for (var i = 0; i < list.length; i++) {
+        var m = list[i] || {};
+        var name = String(m.name === undefined || m.name === null ? '' : m.name);
+        var argsJson = '';
+        try { argsJson = JSON.stringify(m.args === undefined || m.args === null ? {} : m.args); }
+        catch (e) { argsJson = ''; }
+        q['pf_' + i] = {
+          type: 'noul',
+          instructions: 'Do these arguments plausibly satisfy the schema of the tool "' + name +
+            '"? Answer with the probability (0..1) that the call is well-formed and plausible for that tool.',
+          criteria: {
+            tool: name,
+            description: String(m.description === undefined || m.description === null ? '' : m.description),
+            parameters: (m.parameters && typeof m.parameters === 'object') ? m.parameters : null,
+            arguments: argsJson
+          }
+        };
+      }
+      return q;
+    },
+
+    /* The single reply-anomaly question. Carries the reply text verbatim; the local model only
+       returns a probability — it never gets to rewrite or delete anything. */
+    _layaAnomalyQuestion: function (content) {
+      return {
+        type: 'noul',
+        instructions: 'Does this machine reply look like an error page, a refusal, or a degenerate ' +
+          'loop rather than a real answer to the operator? Answer with the probability (0..1) that it is anomalous.',
+        criteria: { reply: String(content === undefined || content === null ? '' : content) }
+      };
+    },
+
+    /* A small, safe description of the turn for the sidecar's `state`. Best-effort only; it must
+       never throw and never carry anything but the turn's own content. */
+    _layaState: function (plan) {
+      var s = {};
+      try {
+        if (plan && plan.utterance !== undefined && plan.utterance !== null) s.utterance = String(plan.utterance);
+        var mut = (plan && Array.isArray(plan.mutating)) ? plan.mutating : [];
+        if (mut.length) {
+          s.tools = [];
+          for (var i = 0; i < mut.length; i++) {
+            var m = mut[i] || {};
+            s.tools.push({ name: String(m.name === undefined || m.name === null ? '' : m.name), arguments: m.args });
+          }
+        }
+        if (plan && plan.prose === true && plan.reply) s.reply = String(plan.reply.content || '');
+      } catch (e) { /* state is best-effort */ }
+      return s;
+    },
+
+    /* Score the batched response against `minConf` and post the fire-and-forget ledger action.
+       Pre-flight: `held` (below threshold). Anomaly: `flagged` (at or above threshold). A missing
+       / non-numeric / null `noul` is fail-open — it never holds and never flags. */
+    _cortexApplyLaya: function (res, out, plan, minConf, deps, client) {
+      var degradedRes = !!(res && (res.ok === false || res.degraded));
+      if (degradedRes) {
+        out.ok = false; out.degraded = true;
+        out.reason = String((res && res.reason) || 'degraded');
+        out.held = []; out.anomaly = null;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+      var answers = (res && res.answers && typeof res.answers === 'object' && !Array.isArray(res.answers)) ? res.answers : {};
+      out.answers = answers;
+      if (res && typeof res.latency_ms === 'number' && isFinite(res.latency_ms)) out.latency_ms = Math.round(res.latency_ms);
+
+      var held = [];
+      var mutating = (plan && Array.isArray(plan.mutating)) ? plan.mutating : [];
+      for (var i = 0; i < mutating.length; i++) {
+        var key = 'pf_' + i;
+        if (!Object.prototype.hasOwnProperty.call(out.questions, key)) continue;
+        var av = answers[key];
+        var noul = (av && typeof av.noul === 'number' && isFinite(av.noul)) ? av.noul : null;
+        if (noul !== null && noul < minConf) held.push(i);
+      }
+      out.held = held;
+
+      var an = null;
+      if (Object.prototype.hasOwnProperty.call(out.questions, 'anomaly')) {
+        var aa = answers['anomaly'];
+        var anoul = (aa && typeof aa.noul === 'number' && isFinite(aa.noul)) ? aa.noul : null;
+        an = { flagged: (anoul !== null && anoul >= minConf), prob: anoul };
+      }
+      out.anomaly = an;
+
+      var action = held.length ? 'rejected' : ((an && an.flagged) ? 'flagged' : 'accepted');
+      CogCore._cortexPostOutcome(deps, client, out.trace_id, action);
+      return out;
+    },
+
     /**
      * providerProfileStore — persisted list of provider endpoint profiles.
      * DOM-free. Operates over an injected storage adapter that satisfies

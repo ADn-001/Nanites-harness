@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 13 — Laya gates (F2) via the Node child**
+Next phase to work on: **Phase 14 — F3 cheap local dispatcher (Needle as pre-router)**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -750,23 +750,113 @@ Gate: **Satisfied.** On the committed tree:
   be MEASURED against the real child, not assumed from the spec.
 
 ## Phase 13 — Laya gates (F2) via the Node child
-Status: not started
-Test suite: `tests/frontend/phase13_laya_gates.test.js` + `/decide` cases in `test_e2e.py` +
-opt-in `tests/live/test_laya_live.py`
+Status: **DONE — with ONE exit criterion BLOCKED by the host (see "Gate" below).**
+Test suite: `tests/frontend/phase13_laya_gates.test.js` (12 blocks) + 11 `/decide` cases in
+`test_e2e.py` + opt-in `tests/live/test_laya_live.py` + `tests/fixtures/laya_stub_child.mjs`
 
-Deliverable: `localmodels/laya_child.mjs` (ESM, newline-delimited JSON on stdio, lazy
-`Laya.load`, nothing non-JSON on stdout), daemon lazy spawn + `POST /decide` (500 ms default,
-idle reap), frontend F2a pre-flight on mutating rites (refusal goes into the existing
-`role:'tool'` self-correction channel, never blocks the turn) and F2b reply-anomaly catch (flag
-only — never rewrites content). Do NOT invent a `precision`/float16 load option; the package's
-real options are listed in the plan §1.
-Gate: batching pinned (N questions ⇒ exactly one `/decide`), fail-open on timeout/down identical
-to Phase 12, read-only rites not pre-flighted; **kill-the-model test** green (full suites + a
-driven turn with `--no-needle --no-laya` behave identically to `localModels.enabled=false`); live
-Laya suite green on this machine with latency recorded here.
+Deliverable as planned: `localmodels/laya_child.mjs` (ESM, NDJSON on stdio, lazy
+`import('@receptron/laya')` + `Laya.load({cacheDir, executionProviders:['cpu'], onProgress})`,
+protocol JSON only on stdout, `systemOne` multiplexed behind a promise queue),
+`localmodels/package.json` + lockfile (`@receptron/laya` 0.1.2 + `onnxruntime-node` +
+`@huggingface/tokenizers`, its own `node_modules`), the daemon's lazy child manager
+(`--laya-timeout-ms` 500 / `--laya-idle-s` 120 / `--laya-child` / `LAYA_NODE`) with an NDJSON
+reader thread, idle reaper, `atexit`+SIGTERM reap and `POST /decide`, and the frontend
+`CogCore.cortexLayaGates(plan, deps)` seam wired into `runAgentLoop`: F2a outbound pre-flight on
+**mutating** rites only (a hold pushes a `role:'tool'` self-correction and does NOT dispatch) and
+F2b the prose-reply anomaly chip (`m.cortexAnomaly`, content untouched).
+
+Gate: **Satisfied except the live-model leg.** On the committed tree:
+- `npm test` exit 0 — `node tests/frontend/run.js` → `FRONTEND SUITE: ALL GREEN` (phase13: 0
+  FAILURES; phases 0,1,2,3,5,6,7,8,9,10,11,12 all 0 FAILURES) and `python3 test_e2e.py` →
+  `0 FAILURES` (95 ok, 15 of them new phase-13 `/decide` cases).
+- Kill-the-model test, green: the daemon with `--no-needle --no-laya` reports `degraded: []`,
+  `needle.enabled=false`, `laya.enabled=false`, `child_pid null`, and both `/decide` and `/repair`
+  answer `{ok:false,degraded:true,reason:'disabled'}` in <20 ms; with node+child absent the daemon
+  still boots and `/decide` answers `engine_missing` (never a 500). The frontend half is
+  `phase13` block 11: a driven turn with the sidecar down produces a transcript identical to a
+  `localModels.enabled=false` run and an identical bridge request log (raw text differs ONLY in
+  the rendered wall clock, 4/4 markers — see findings).
+- Integrator real-seam probe (mock-vs-mock is NOT enough — the Phase 12 lesson): the SHIPPED
+  `CogCore.cortexLayaGates` + SHIPPED `CogCore.localModels.client` driven from Node over real HTTP
+  against a REAL daemon — (A) daemon + the REAL `laya_child.mjs` (protocol framing: one
+  `/decide` answered in 175 ms as `{ok:false,degraded:true}`, daemon still alive afterwards,
+  `laya.child_pid` reported), and (B) daemon + the stub child (3 mutating calls ⇒ **exactly ONE**
+  `/decide` carrying `pf_0,pf_1,pf_2`; payload exactly `{state,questions,trace_id}`; a stricter
+  threshold holds all three; the anomaly question flags at noul 0.9; a `choice` answer's
+  probabilities reach the LEDGER and sum to 1; 8 real requests, ZERO `Authorization` headers and
+  ZERO key-looking bodies). All 20 probe checks green.
+- **BLOCKED (host, not code): the live Laya suite cannot be green on this machine.** This box is
+  postmarketOS/**musl** aarch64, and `onnxruntime-node`'s only Linux arm64 prebuild is
+  **glibc**-linked: `require('onnxruntime-node')` fails to relocate (`__getauxval`, `fcntl64`,
+  `open64`, … symbol not found), and with a `gcompat` + symbol-shim `LD_PRELOAD` the module *loads*
+  (`require` succeeds, `env` present) but creating the ONNX session **segfaults** (exit 139,
+  reproducible from a minimal `Laya.load` probe that never touches the daemon or child). The 1.6 GB
+  weights DID download and are cached at `~/.cache/receptron-laya` (`laya.onnx`, `laya.onnx.data`,
+  `laya_config.json`, `tokenizer/`), so the blocker is the runtime, not the model. Measured on the
+  real path: `/decide` against the real child answers `{ok:false,degraded:true}` — `child_gone`
+  after ~6.7 s under the preload, or the relocation error in ~150 ms without it — and the daemon
+  survives both. `tests/live/test_laya_live.py` therefore **FAILS LOUDLY** on this machine rather
+  than skipping (prerequisites present + engine cannot serve = failure); set
+  `COG_LIVE_LAYA_ALLOW_UNSERVABLE=1` to skip it deliberately. **The live leg is UNVERIFIED against a
+  real Laya model** — every other phase-13 guarantee is verified by the stub-child e2e, the
+  frontend suite and the real-seam probe. Documented for operators in `localmodels/README.md`
+  ("Known blocker: musl hosts").
 
 ### Findings
-(empty — fill in during this phase's Test/Debug Sprint)
+- **The real Laya model is unverified on this machine — do not read "green suites" as "Laya
+  works".** Root cause and evidence are in the Gate above. On a glibc host (macOS/Windows/normal
+  Linux) the same code should serve: nothing in the child, the daemon or the seam is
+  machine-specific. A future agent on a glibc box should run
+  `COG_LIVE_MODELS=1 python3 -m unittest tests/live/test_laya_live.py` and paste the measured
+  latencies + `usage.input_tokens` here (the suite prints them). Weights are already cached.
+- **"Turn" means ONE model reply (one agent-loop iteration), not one user send.** A send that
+  dispatches a mutating rite and then ends on prose issues TWO `/decide` requests (pre-flight on
+  iteration 0, anomaly on iteration 1). Inside one iteration pre-flight and anomaly are mutually
+  exclusive by construction (a reply either has dispatchable calls or it is prose-only), which is
+  what makes "exactly ONE `/decide` per turn" true and what the batching assertions pin. Do not
+  "helpfully" batch across iterations — the anomaly question is only meaningful once the reply is
+  known to be prose.
+- **`pf_<i>` / `held[i]` indices are into `plan.mutating`** (the not-read-only subset of
+  `gate.sanitized`), in order. The caller maps them back with the index it built the plan from —
+  do not re-derive the subset anywhere else or the alignment silently breaks.
+- **Fail-open is defined as "absence of evidence is not a refusal".** A missing / non-numeric /
+  `null` `noul` holds nothing and never flags; `held:[]` + `anomaly:null` on timeout, `ok:false`,
+  degraded response or a rejecting client, with `reason:'timeout'` for the race expiring and the
+  response's own reason otherwise. Ledger actions: `rejected` (something held), `flagged` (anomaly
+  fired), `accepted` (the probe answered and nothing fired), `passed_through` (degraded/timeout),
+  all fire-and-forget.
+- **A timed-out `/decide` does NOT kill the child** (deliberate): the first real decision pays for
+  a multi-second model load, so killing on a 500 ms budget would discard it every time. The idle
+  reaper (`--laya-idle-s`, verified by pid: `781069 → None` after 2.5 s idle → `781106` after the
+  next request) is the cleanup path.
+- **`degraded` semantics extended, not reversed:** a deliberately disabled engine is not degraded;
+  an enabled-but-lazy child is NOT degraded (lazy spawn-on-demand can serve), and an enabled Laya
+  is degraded only when it cannot serve at all — no `node` on PATH or no child script
+  (`'laya engine missing'`). The old hard-coded `'laya child not started'` reason is gone. New wire
+  reasons: `disabled`, `engine_missing`, `timeout`, `child_gone`.
+- **`laya.cache` is the UNEXPANDED `~/.cache/receptron-laya` string** (Phase 10's `expanduser` was
+  removed) so the response and the ledger never carry an absolute personal path. Keep it that way.
+- **Ledger `confidence` = the max numeric `noul`/`score` in the batch, `null` for a choice-only
+  batch** (never invented) — the frontend must read `null` as below-threshold.
+- **LANDMINE (test-design, cost one flaky red):** the rendered transcript embeds
+  `new Date(m.ts).toLocaleTimeString()`, so two runs are never byte-identical. The kill-the-model
+  comparison normalises clock markers out (`stableTranscript` in
+  `tests/frontend/phase13_laya_gates.test.js`); it prints "raw identical=… clock markers 4/4" as
+  evidence. Do NOT loosen that comparison further, and do not copy the raw-text comparison
+  pattern into a new suite.
+- **Headless mutating dispatch needs the approval modal clicked** — the phase-13 suite installs a
+  10 ms auto-approver interval inside its own `driveAgentTurn`. Reuse that, or a driven mutating
+  turn will hang with no dispatch.
+- `test_e2e.py` phase-13 cases all run against a **stub child**
+  (`tests/fixtures/laya_stub_child.mjs`, knobs `LAYA_STUB_HANG`, `LAYA_STUB_EXIT_AFTER_MS`) in a
+  temp dir — never boot a daemon in the repo, and never point a test at the real weights.
+- Setup scripts now really `npm install` Laya inside `localmodels/`; `package.json` +
+  `package-lock.json` are tracked on purpose (share-ready artifacts) and `localmodels/node_modules/`
+  stays git-ignored.
+- `bridge_daemon.log` re-dirtied by the suite run per codereview #27 — reverted before commit.
+- Not fixed here (out of scope, for the Phase 15 share-readiness pass): `codereview.md` line 59
+  still carries an absolute personal path (`/home/user/.config/autostart/...`).
+
 
 ## Phase 14 — F3 cheap local dispatcher (Needle as pre-router)
 Status: not started
@@ -864,3 +954,27 @@ machine-specific changes; PR opened against `main`.
      published, so it falls back to the highest available wheel for the runtime platform tag.
   6. `sanitizeReply` keeps the Phase 11 deterministic calls in `out.calls` even when the probe
      is skipped/timeout/rejected — a mixed turn never loses its repairable rite.
+- 2026-09-26 (Phase 13 session, cron): Phase 13 done and committed, with ONE exit criterion
+  blocked by the HOST (not the code) — read that phase's Gate/Findings before touching Laya.
+  Decisions a later session must not silently reverse:
+  1. `cortexLayaGates` and the daemon's `/decide` are FAIL-OPEN: absence of evidence (missing /
+     `null` / non-numeric `noul`) never holds a call and never flags a reply.
+  2. One `/decide` per agent-loop ITERATION (one model reply), never per user send, and never
+     across iterations — pre-flight (mutating replies) and anomaly (prose-only replies) are
+     mutually exclusive within an iteration by construction.
+  3. A timed-out `/decide` deliberately does NOT kill the child; `--laya-idle-s` reaping is the
+     cleanup path. Killing on a 500 ms budget would discard the first multi-second model load
+     every time.
+  4. Lazy is not degraded: the daemon reports a laya degraded reason only when it cannot serve at
+     all (`node` absent / child script absent = `'laya engine missing'`); the old
+     `'laya child not started'` reason is gone.
+  5. `laya.cache` stays the UNEXPANDED `~/.cache/receptron-laya` string so no absolute personal
+     path ever leaves the daemon.
+  6. `tests/live/test_laya_live.py` FAILS LOUDLY when every prerequisite is present but the engine
+     still cannot serve; `COG_LIVE_LAYA_ALLOW_UNSERVABLE=1` is the only way to make that a skip.
+     The live leg is therefore UNVERIFIED against a real Laya model as of this commit (musl host,
+     glibc-only onnxruntime prebuild). Weights are cached; re-run the live suite on a glibc host
+     and record the numbers in the Phase 13 findings.
+  7. `localmodels/package.json` + `package-lock.json` are TRACKED (share-ready artifacts) while
+     `localmodels/node_modules/` stays ignored — do not "tidy" them into `.gitignore`.
+

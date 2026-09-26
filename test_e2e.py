@@ -495,5 +495,325 @@ finally:
     except subprocess.TimeoutExpired: lmd.kill()
     shutil.rmtree(lmdir, ignore_errors=True)
 
+# ---------------- localmodels sidecar (Phase 13, workstream A: Laya /decide) ----------------
+# Every instance below runs with cwd=<temp dir>: a daemon is NEVER booted in the repo
+# tree, and neither is the Laya child it spawns.
+LAYA_STUB = os.path.join(BASE, 'tests', 'fixtures', 'laya_stub_child.mjs')
+LAYA_Q_NOUL = {'gate': {'type': 'noul',
+                        'instructions': 'Do these arguments plausibly satisfy the schema?',
+                        'criteria': 'true when the arguments look like a valid invocation'}}
+LAYA_Q_CHOICE = {'team': {'type': 'choice', 'instructions': 'Which team?',
+                          'criteria': {'billing': 'payments and refunds',
+                                       'support': 'product help and bugs'}}}
+LAYA_STATE = {'utterance': 'write the cleaned log to out/final.log', 'tool': 'write_file'}
+
+
+def laya_daemon(port, ledger_path, extra=(), env=None):
+    return subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+                             '--port', str(port), '--ledger', ledger_path] + list(extra),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=laya_dir, env=env)
+
+
+def laya_stop(proc):
+    proc.terminate()
+    try: proc.wait(timeout=5)
+    except subprocess.TimeoutExpired: proc.kill()
+
+
+def laya_ledger_lines(path):
+    if not os.path.isfile(path):
+        return []
+    return [json.loads(ln) for ln in open(path, encoding='utf-8') if ln.strip()]
+
+
+laya_dir = tempfile.mkdtemp(prefix='coglaya-')
+laya_ledger_a = os.path.join(laya_dir, 'a.jsonl')   # --no-laya daemon
+laya_ledger_b = os.path.join(laya_dir, 'b.jsonl')   # stub-child daemon
+laya_ledger_c = os.path.join(laya_dir, 'c.jsonl')   # hanging stub (timeout path)
+laya_ledger_d = os.path.join(laya_dir, 'd.jsonl')   # idle reap
+laya_ledger_e = os.path.join(laya_dir, 'e.jsonl')   # default daemon (lazy, not degraded)
+laya_ledger_f = os.path.join(laya_dir, 'f.jsonl')   # stub that dies mid-flight
+try:
+    # ---- case 1: the new flags exist ----
+    def laya_flags():
+        r = subprocess.run([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'), '--help'],
+                           capture_output=True, text=True, timeout=30)
+        return ('--laya-timeout-ms' in r.stdout and '--laya-idle-s' in r.stdout
+                and '--laya-child' in r.stdout)
+    lm_probe('localmodels (phase13): --laya-timeout-ms, --laya-idle-s and --laya-child flags exist', laya_flags)
+
+    # ---- cases 2, 3, 8: the --no-laya daemon (no child is ever spawned) ----
+    laya_port_a = 18935
+    laya_pa = laya_daemon(laya_port_a, laya_ledger_a, ['--no-laya'])
+    time.sleep(1.0)
+    try:
+        def laya_disabled_decide():
+            s, j = req(laya_port_a, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL,
+                                                'trace_id': 'tr_e2e_laya_off'})
+            h = req(laya_port_a, '/health')[1]
+            return (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                    and j.get('reason') == 'disabled'
+                    and isinstance(j.get('latency_ms'), int)
+                    and j.get('trace_id') == 'tr_e2e_laya_off'
+                    and j.get('answers') == {}
+                    and h['laya'].get('enabled') is False
+                    and h['laya'].get('child_pid') is None)
+        lm_probe('localmodels (phase13): --no-laya POST /decide => {ok:false,degraded:true,reason:disabled}, '
+                 '/health.laya.child_pid None', laya_disabled_decide)
+
+        def laya_foreign_origin_no_record():
+            before = open(laya_ledger_a, encoding='utf-8').read() if os.path.isfile(laya_ledger_a) else ''
+            s, j = req(laya_port_a, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL},
+                       origin='http://evil.example')
+            after = open(laya_ledger_a, encoding='utf-8').read() if os.path.isfile(laya_ledger_a) else ''
+            return (s == 403 and j.get('error') == 'origin not permitted' and before == after)
+        lm_probe('localmodels (phase13): foreign Origin POST /decide => 403 and NO ledger record',
+                 laya_foreign_origin_no_record)
+
+        def laya_413_wins():
+            s, j = req(laya_port_a, '/decide', raw=b'{"state":"' + b'a' * (2 * 1024 * 1024) + b'"}')
+            return s == 413 and j.get('ok') is False
+        lm_probe('localmodels (phase13): oversized POST /decide => 413 (size cap outranks routing)', laya_413_wins)
+
+        def laya_disabled_not_degraded():
+            h = req(laya_port_a, '/health')[1]
+            return h['laya'].get('enabled') is False and not any('laya' in str(r) for r in h.get('degraded', []))
+        lm_probe('localmodels (phase13): --no-laya => laya.enabled false and no laya degraded reason',
+                 laya_disabled_not_degraded)
+    finally:
+        laya_stop(laya_pa)
+
+    # ---- case 7: a default (laya-enabled) daemon is LAZY, not degraded ----
+    laya_port_e = 18939
+    laya_pe = laya_daemon(laya_port_e, laya_ledger_e)
+    time.sleep(1.0)
+    try:
+        def laya_default_not_degraded():
+            h = req(laya_port_e, '/health')[1]
+            return (h['laya'].get('enabled') is True and h['laya'].get('loaded') is False
+                    and h['laya'].get('child_pid') is None
+                    and isinstance(h['laya'].get('cache'), str) and h['laya']['cache'].startswith('~')
+                    and not any('laya' in str(r) for r in h.get('degraded', []))
+                    and not any('not started' in str(r) for r in h.get('degraded', [])))
+        lm_probe('localmodels (phase13): default daemon => laya enabled but lazy, no '
+                 "\"laya child not started\" degraded reason, cache is a '~' string", laya_default_not_degraded)
+    finally:
+        laya_stop(laya_pe)
+
+    # ---- case 7b: no `node` at all => enabled+degraded, /health still answers ----
+    laya_port_g = 18941
+    laya_ledger_g = os.path.join(laya_dir, 'g.jsonl')
+    laya_pg = laya_daemon(laya_port_g, laya_ledger_g,
+                          env=dict(os.environ, LAYA_NODE='/nonexistent-node-binary'))
+    time.sleep(1.0)
+    try:
+        def laya_node_absent():
+            s, h = req(laya_port_g, '/health')
+            if not (s == 200 and h.get('ok') is True and h['laya'].get('enabled') is True
+                    and h['laya'].get('child_pid') is None
+                    and 'laya engine missing' in h.get('degraded', [])):
+                print('   /health with no node: %s %r' % (s, h))
+                return False
+            s2, j2 = req(laya_port_g, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL})
+            return (s2 == 200 and j2.get('ok') is False and j2.get('degraded') is True
+                    and j2.get('reason') == 'engine_missing'
+                    and isinstance(j2.get('latency_ms'), int))
+        lm_probe('localmodels (phase13): no node on PATH => daemon still boots/answers /health, '
+                 "degraded lists 'laya engine missing', /decide => engine_missing", laya_node_absent)
+    finally:
+        laya_stop(laya_pg)
+
+    # ---- case 4: the stub child answers /decide; ledger carries probabilities ----
+    laya_port_b = 18936
+    laya_pb = laya_daemon(laya_port_b, laya_ledger_b, ['--laya-child', LAYA_STUB])
+    time.sleep(1.0)
+    try:
+        def laya_stub_decide():
+            tid = 'tr_e2e_laya_stub'
+            s, j = req(laya_port_b, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL,
+                                                'trace_id': tid})
+            if not (s == 200 and j.get('ok') is True and j.get('degraded') in (None, False)):
+                print('   /decide answered %s %r' % (s, j))
+                return False
+            answers, usage = j.get('answers'), j.get('usage')
+            if not (isinstance(answers, dict) and isinstance(answers.get('gate'), dict)
+                    and isinstance(answers['gate'].get('noul'), (int, float))
+                    and isinstance(usage, dict) and usage.get('input_tokens') == 42
+                    and j.get('trace_id') == tid and isinstance(j.get('latency_ms'), int)):
+                print('   unexpected decide envelope: %r' % j)
+                return False
+            h = req(laya_port_b, '/health')[1]
+            if not (isinstance(h['laya'].get('child_pid'), int) and h['laya'].get('loaded') is True
+                    and h['laya'].get('enabled') is True):
+                print('   health after decide: %r' % h.get('laya'))
+                return False
+            print('   /decide (stub) => %s' % json.dumps(j))
+            print('   /health.laya  => %s' % json.dumps(h['laya']))
+            return True
+        lm_probe('localmodels (phase13): stub child POST /decide => {ok:true, answers, usage}; '
+                 '/health.laya.child_pid int + loaded true', laya_stub_decide)
+
+        def laya_stub_ledger():
+            # A choice question (probabilities) PLUS a noul question (confidence) in ONE
+            # batched request: this is exactly how the frontend amortises a turn.
+            tid = 'tr_e2e_laya_prob'
+            qs = dict(LAYA_Q_CHOICE)
+            qs.update(LAYA_Q_NOUL)
+            s, j = req(laya_port_b, '/decide', {'state': LAYA_STATE, 'questions': qs,
+                                                'trace_id': tid})
+            if s != 200 or j.get('ok') is not True:
+                print('   choice decide answered %s %r' % (s, j))
+                return False
+            recs = [r for r in laya_ledger_lines(laya_ledger_b)
+                    if r.get('trace_id') == tid and r.get('op') == 'decide']
+            if len(recs) != 1:
+                print('   expected exactly 1 decide record for %s, got %r' % (tid, recs))
+                return False
+            rec = recs[0]
+            probs = (((rec.get('output') or {}).get('answers') or {}).get('team') or {}).get('probabilities')
+            if not isinstance(probs, dict) or not probs:
+                print('   decide record carried no probabilities: %r' % rec)
+                return False
+            total = sum(v for v in probs.values() if isinstance(v, (int, float)))
+            if abs(total - 1.0) > 0.02:
+                print('   probabilities do not sum to ~1: %r' % probs)
+                return False
+            if not (rec.get('model') == 'laya' and rec.get('input_redacted') is True
+                    and rec.get('action') is None and rec.get('degraded') is False
+                    and isinstance(rec.get('latency_ms'), int)
+                    and rec.get('confidence') == 0.9          # max numeric noul/score seen
+                    and 'state' in (rec.get('request') or {})
+                    and [q.get('key') for q in ((rec.get('request') or {}).get('questions') or [])]
+                    == ['team', 'gate']
+                    and {'key', 'type'} <= set(((rec.get('request') or {}).get('questions') or [{}])[0])):
+                print('   decide record malformed: %r' % rec)
+                return False
+            print('   decide ledger line (choice+noul) => %s' % json.dumps(rec))
+
+            # A choice-only batch has NOTHING to grade: confidence must stay null rather
+            # than being invented (the frontend reads null as below-threshold).
+            tid2 = 'tr_e2e_laya_prob_null'
+            s2, j2 = req(laya_port_b, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_CHOICE,
+                                                  'trace_id': tid2})
+            recs2 = [r for r in laya_ledger_lines(laya_ledger_b)
+                     if r.get('trace_id') == tid2 and r.get('op') == 'decide']
+            if s2 != 200 or len(recs2) != 1 or recs2[0].get('confidence') is not None:
+                print('   choice-only confidence should be null: %r' % recs2)
+                return False
+            return True
+        lm_probe('localmodels (phase13): /decide appends ONE ledger record with the child\'s '
+                 'probabilities (sum ~1), model laya, input_redacted true, confidence = max noul '
+                 '(null when there is nothing to grade)', laya_stub_ledger)
+    finally:
+        laya_stop(laya_pb)
+
+    # ---- case 5: timeout (hanging child) never wedges the server ----
+    laya_port_c = 18937
+    laya_pc = laya_daemon(laya_port_c, laya_ledger_c, ['--laya-child', LAYA_STUB, '--laya-timeout-ms', '300'],
+                          env=dict(os.environ, LAYA_STUB_HANG='1'))
+    time.sleep(1.0)
+    try:
+        def laya_timeout():
+            t0 = time.time()
+            s, j = req(laya_port_c, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL,
+                                                'trace_id': 'tr_e2e_laya_hang'})
+            dt = time.time() - t0
+            if not (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                    and j.get('reason') == 'timeout' and isinstance(j.get('latency_ms'), int)
+                    and j.get('trace_id') == 'tr_e2e_laya_hang'):
+                print('   hanging decide answered %s %r after %.2fs' % (s, j, dt))
+                return False
+            if dt >= 3.0:
+                print('   /decide took %.2fs (budget 300 ms)' % dt)
+                return False
+            h = req(laya_port_c, '/health')[1]
+            if not (h.get('ok') is True and 'laya' in h):
+                print('   /health wedged after the timeout: %r' % h)
+                return False
+            return True
+        lm_probe('localmodels (phase13): --laya-timeout-ms 300 + hanging child => {ok:false,degraded:true,'
+                 'reason:timeout} in well under 3 s, daemon still answers /health', laya_timeout)
+    finally:
+        laya_stop(laya_pc)
+
+    # ---- case 9 (extra): a child that dies mid-request => child_gone, no 500 ----
+    laya_port_f = 18940
+    laya_pf = laya_daemon(laya_port_f, laya_ledger_f, ['--laya-child', LAYA_STUB, '--laya-timeout-ms', '3000'],
+                          env=dict(os.environ, LAYA_STUB_EXIT_AFTER_MS='50'))
+    time.sleep(1.0)
+    try:
+        def laya_child_gone():
+            t0 = time.time()
+            s, j = req(laya_port_f, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL})
+            dt = time.time() - t0
+            if not (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                    and j.get('reason') == 'child_gone'):
+                print('   dying-child decide answered %s %r after %.2fs' % (s, j, dt))
+                return False
+            h = req(laya_port_f, '/health')[1]
+            pid = h['laya'].get('child_pid')
+            return h.get('ok') is True and (pid is None or isinstance(pid, int))
+        lm_probe('localmodels (phase13): child dies mid-request => {ok:false,degraded:true,reason:child_gone}, '
+                 'daemon survives (respawn is lazy)', laya_child_gone)
+
+        def laya_child_gone_ledger():
+            recs = [r for r in laya_ledger_lines(laya_ledger_f) if r.get('op') == 'decide']
+            return bool(recs) and all(r.get('degraded') is True for r in recs)
+        lm_probe('localmodels (phase13): a child_gone /decide still appends its degraded ledger record',
+                 laya_child_gone_ledger)
+    finally:
+        laya_stop(laya_pf)
+
+    # ---- case 6: idle reaping ----
+    laya_port_d = 18938
+    laya_pd = laya_daemon(laya_port_d, laya_ledger_d, ['--laya-child', LAYA_STUB, '--laya-idle-s', '1'])
+    time.sleep(1.0)
+    try:
+        def laya_reap():
+            s, j = req(laya_port_d, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL})
+            if s != 200 or j.get('ok') is not True:
+                print('   first decide answered %s %r' % (s, j))
+                return False
+            h1 = req(laya_port_d, '/health')[1]['laya']
+            if not isinstance(h1.get('child_pid'), int):
+                print('   no child pid after the first decide: %r' % h1)
+                return False
+            pid_before = h1['child_pid']
+            time.sleep(2.5)
+            h2 = req(laya_port_d, '/health')[1]['laya']
+            if h2.get('child_pid') is not None or h2.get('loaded') is not False:
+                print('   child was not reaped while idle: %r' % h2)
+                return False
+            s2, j2 = req(laya_port_d, '/decide', {'state': LAYA_STATE, 'questions': LAYA_Q_NOUL})
+            h3 = req(laya_port_d, '/health')[1]['laya']
+            if not (s2 == 200 and j2.get('ok') is True and isinstance(h3.get('child_pid'), int)
+                    and h3.get('loaded') is True):
+                print('   respawn after reap failed: %s %r / %r' % (s2, j2, h3))
+                return False
+            print('   reap: pid %s -> None after 2.5 s idle -> %s after the next decide'
+                  % (pid_before, h3['child_pid']))
+            return True
+        lm_probe('localmodels (phase13): --laya-idle-s 1 reaps the idle child (pid None) and the next '
+                 '/decide respawns + reloads', laya_reap)
+    finally:
+        laya_stop(laya_pd)
+
+    def laya_no_stray_files():
+        return set(os.listdir(laya_dir)) <= {'a.jsonl', 'b.jsonl', 'c.jsonl', 'd.jsonl',
+                                             'e.jsonl', 'f.jsonl', 'g.jsonl'}
+    lm_probe('localmodels (phase13): daemon + child wrote no pid/log file (ledger only)', laya_no_stray_files)
+
+    def laya_docs():
+        readme = open(os.path.join(BASE, 'localmodels', 'README.md'), encoding='utf-8').read()
+        sh = open(os.path.join(BASE, 'localmodels', 'setup.sh'), encoding='utf-8').read()
+        ps = open(os.path.join(BASE, 'localmodels', 'setup.ps1'), encoding='utf-8').read()
+        return ('POST /decide' in readme and 'laya_child.mjs' in readme and '--laya-idle-s' in readme
+                and 'npm install' in sh and 'npm install' in ps)
+    lm_probe('localmodels (phase13): README documents /decide + the child + the flags; setup scripts '
+             'install Laya via npm', laya_docs)
+finally:
+    shutil.rmtree(laya_dir, ignore_errors=True)
+
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)

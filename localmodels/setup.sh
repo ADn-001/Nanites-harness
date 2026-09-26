@@ -41,6 +41,24 @@ echo "[LOCAL CORTEX] installing cactus-needle (Apache-2.0) — the repair engine
 echo "[LOCAL CORTEX] downloading base weights + engine library (the only network use)"
 "$VPY" "$HERE/fetch_engine.py"
 
+# Laya (the decision engine) is OPTIONAL and separate: it is a Node ESM package and needs
+# its OWN node_modules, so this step runs `npm install` right here. It is deliberately
+# non-fatal - the Needle repair pass, and the whole harness, work without Laya. The 1.7 GB
+# of ONNX weights are NOT fetched here: the first Laya.load (the first /decide) downloads
+# and caches them under ~/.cache/receptron-laya (LAYA_CACHE overrides), reporting progress
+# as JSON lines on the child's stderr.
+echo "[LOCAL CORTEX] installing the Laya decision engine (Node >= 20) — optional"
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  echo "  node $(node --version)"
+  if npm install --no-audit --no-fund; then
+    echo "  Laya deps installed in $HERE/node_modules."
+  else
+    echo "[LOCAL CORTEX] WARNING: 'npm install' failed — Laya stays unavailable; Needle still works." >&2
+  fi
+else
+  echo "[LOCAL CORTEX] WARNING: node/npm not found on PATH — skipping Laya (optional)." >&2
+fi
+
 cat <<'EOT'
 
 [LOCAL CORTEX] Needle installed. Next steps:
@@ -55,10 +73,10 @@ cat <<'EOT'
      nothing about a repair leaves the machine. To point at a specific weights file,
      export NEEDLE_WEIGHTS=/path/to/base.cact (otherwise the cache above is used).
 
-  2. Laya is OPTIONAL and separate (Node >= 20, ~1.7 GB of ONNX weights on first use):
-
-         npm install            # inside localmodels/ (its own node_modules)
-         # weights cache to ~/.cache/receptron-laya (override with LAYA_CACHE)
+  2. Laya is OPTIONAL and separate (Node >= 20). Its npm deps were installed above into
+     localmodels/node_modules; re-run `npm install` in localmodels/ if that step was
+     skipped. The ~1.7 GB of ONNX weights download on the FIRST Laya.load (the first
+     /decide) and cache to ~/.cache/receptron-laya (override with LAYA_CACHE).
 
 [LOCAL CORTEX] Nothing is enabled by default: the harness works unchanged until you
 turn LOCAL CORTEX on, and nothing in this package ever contacts a remote service

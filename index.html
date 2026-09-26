@@ -178,6 +178,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
 .rite-call{margin:0 12px 8px;padding:7px 9px;border-left:2px solid var(--amber);background:rgba(255,179,71,.06);color:var(--amber);font-size:11.5px;letter-spacing:.08em;white-space:pre-wrap;word-break:break-word}
 .cortex-note{margin:0 12px 8px;padding:6px 9px;border-left:2px solid var(--phos);background:rgba(0,255,157,.05);color:var(--phos);font-size:11px;letter-spacing:.10em;white-space:pre-wrap;word-break:break-word}
 .cortex-note.degraded{border-left-color:var(--danger);background:rgba(255,71,71,.05);color:var(--danger)}
+.cortex-note.warn{border-left-color:var(--amber);background:rgba(255,176,0,.05);color:var(--amber)}
 .msg.rite-result{border-color:rgba(255,179,71,.4);background:rgba(255,179,71,.025)}
 .msg.rite-result .msg-head{color:var(--amber);border-color:rgba(255,179,71,.25)}
 .msg.rite-result .msg-body{color:#ffd99a;font-size:12.5px}
@@ -556,6 +557,9 @@ function msgHTML(m,i){
   /* PHASE 12 — operator-visible LOCAL CORTEX note (a repaired rite, or a degraded probe).
      Non-blocking: it never mutates the model's own text and never enters the request payload. */
   const cortexNote=m.cortexNote?`<div class="cortex-note${m.cortexDegraded?' degraded':''}">${esc(m.cortexNote)}</div>`:'';
+  /* PHASE 13 — operator-visible Laya reply-anomaly chip (F2b). Flag only: the model's own text
+     (`.msg-body`) is never touched, and this note never enters the request payload. */
+  const cortexAnomaly=m.cortexAnomaly?`<div class="cortex-note warn" id="cortex-anomaly">${esc(m.cortexAnomaly)}</div>`:'';
   const msgs=active()?.messages||[];
   const caret=(generating&&i===msgs.length-1&&m.role==='assistant')?'<span class="caret"></span>':'';
   const acts=`<div class="acts">
@@ -563,7 +567,7 @@ function msgHTML(m,i){
     <span data-a="copy" data-i="${i}">&#10697; COPY</span>
     <span data-a="del" data-i="${i}" class="danger">&#10005; PURGE</span></div>`;
   return `<div class="msg ${m.role}${isTool?' rite-result':''}"><div class="msg-head"><span>${who}${isTool&&m.name?' // '+esc(m.name):''}</span>
-    <span class="spacer"></span><span>${ts}</span></div>${think}${invoked}${cortexNote}
+    <span class="spacer"></span><span>${ts}</span></div>${think}${invoked}${cortexNote}${cortexAnomaly}
     <div class="msg-body" id="body-${i}">${body}${caret}</div>${acts}</div>`;
 }
 function renderMessages(){
@@ -966,6 +970,8 @@ async function lmUnloadModel(){
 function safeToolArgs(tc){
   try{return typeof tc.args==='string'?JSON.parse(tc.args||'{}'):(tc.args||{});}catch(e){return{raw:tc.args||''};}
 }
+/* PHASE 13 — the operator's most recent transmission, for the Laya /decide `state`. Best-effort. */
+function lastUserText(c){try{for(let i=(c?.messages||[]).length-1;i>=0;i--){const m=c.messages[i];if(m&&m.role==='user')return CogCore.contentText(m.content);}}catch(e){}return '';}
 function isReadRite(name,args={}){
   if(['read_file','list_dir','grep'].includes(name))return true;
   if(name==='write_file'||name==='run_command')return false;
@@ -1035,7 +1041,7 @@ async function runAgentLoop(c,m,sig){
     try{ san=await CogCore.sanitizeReply({toolCalls:finalized,content:acc.content},TOOL_SCHEMAS,{client:cortexClient,settings:lm}); }
     catch(e){ san=null; }
     if(!san||!Array.isArray(san.calls))san={calls:finalized,unrepairable:[],source:'deterministic',accepted:true,degraded:false,reason:'',changed:[]};
-    m.cortexNote='';m.cortexDegraded=false;
+    m.cortexNote='';m.cortexDegraded=false;m.cortexAnomaly='';m.cortexLayaDegraded=false;
     if(san.accepted&&san.source==='needle'){
       /* A real local repair. Surface it to the operator (never silently) as a non-blocking
          transcript note, and clear the suspect lead a later phase reads. */
@@ -1050,7 +1056,30 @@ async function runAgentLoop(c,m,sig){
     if(!m.toolCalls.length)m.toolCalls=finalized;
     if(san.unrepairable&&san.unrepairable.length&&!(san.accepted&&san.source==='needle'))m.cortexSuspects=san.unrepairable;
     m.ts=m.ts||Date.now();refreshLast();
-    if(!m.toolCalls.length)return;
+    if(!m.toolCalls.length){
+      /* PHASE 13 — LOCAL CORTEX Laya REPLY-ANOMALY (F2b, inbound). A prose-only reply (no
+         dispatchable calls at all) is offered to Laya once: does it look like an error page, a
+         refusal, or a degenerate loop? At/above threshold ⇒ a visible warning chip on the message
+         + a ledger action. The model's CONTENT is never rewritten, never deleted. Fail-open:
+         sidecar down/slow/disabled ⇒ no flag, byte-identical to Phase 12. Because this reply has
+         no dispatchable calls it never ran the F2a pre-flight, so it has issued no earlier
+         /decide — AT MOST ONE per reply. */
+      if(lm.enabled&&cortexClient&&CogCore.cortexLayaGates){
+        try{
+          let ao=CogCore.cortexLayaGates(
+            {mutating:[],prose:true,utterance:lastUserText(c),reply:{toolCalls:[],content:m.content||''}},
+            {client:cortexClient,settings:lm});
+          if(ao&&typeof ao.then==='function')ao=await ao;
+          if(ao&&ao.degraded)m.cortexLayaDegraded=true;
+          if(ao&&ao.anomaly&&ao.anomaly.flagged){
+            const p=(ao.anomaly.prob===null||ao.anomaly.prob===undefined)?'?':Number(ao.anomaly.prob).toFixed(2);
+            m.cortexAnomaly='[LOCAL CORTEX: REPLY ANOMALY FLAGGED — p='+p+']';
+          }
+        }catch(e){}
+      }
+      refreshLast();
+      return;
+    }
     /* DETERMINISTIC GATE: no model-authored call reaches the bridge unvalidated.
        Rejected calls are reported back as tool results so the spirit can correct. */
     const gate=CogCore.validateStructuredOutput(m.toolCalls,TOOL_SCHEMAS);
@@ -1059,8 +1088,42 @@ async function runAgentLoop(c,m,sig){
         content:'[RITE REJECTED BY VALIDATOR — NOT dispatched: '+e.error+'. Re-issue a corrected call, or answer in prose.]',ts:Date.now()});
     }
     if(gate.errors.length){save();renderMessages();}
+    /* PHASE 13 — LOCAL CORTEX Laya PRE-FLIGHT (F2a, outbound). One batched `/decide` over the
+       NOT-read-only rites asks whether each call's arguments plausibly satisfy its schema. A
+       below-threshold verdict HOLDS that call: it is never dispatched — a role:'tool' correction
+       is fed back into the SAME self-correction channel the Phase 7 validator uses. The local
+       model can never bypass a gate and never widens the allow-list: an un-held mutating rite
+       still goes through the UNCHANGED validator → approveToolCall → executeTool. Fail-open:
+       with the sidecar down/slow/disabled nothing is held (byte-identical to Phase 12). NOTE:
+       pre-flight (dispatchable calls) and the F2b anomaly (prose-only) are mutually exclusive,
+       so a single model reply issues AT MOST ONE /decide — never both. */
+    let heldCalls=[];
+    if(lm.enabled&&cortexClient&&CogCore.cortexLayaGates&&gate.sanitized.length){
+      try{
+        const mutating=gate.sanitized.filter(tc=>!isReadRite(tc.name,safeToolArgs(tc)));
+        if(mutating.length){
+          const planMut=mutating.map((tc,ix)=>{
+            const sc=(TOOL_SCHEMAS.find(s=>s.function&&s.function.name===tc.name)||{}).function||{};
+            return {index:ix,name:tc.name,args:safeToolArgs(tc),description:sc.description||'',parameters:sc.parameters||null};
+          });
+          let layaOut=CogCore.cortexLayaGates(
+            {mutating:planMut,prose:false,utterance:lastUserText(c),reply:{toolCalls:m.toolCalls,content:m.content||''}},
+            {client:cortexClient,settings:lm});
+          if(layaOut&&typeof layaOut.then==='function')layaOut=await layaOut;
+          if(layaOut&&layaOut.degraded)m.cortexLayaDegraded=true;
+          const heldSet=new Set((layaOut&&layaOut.held)||[]);
+          heldCalls=mutating.filter((tc,ix)=>heldSet.has(ix));
+        }
+      }catch(e){heldCalls=[];}
+    }
     for(const tc of gate.sanitized){
       if(sig.aborted)throw new DOMException('Aborted','AbortError');
+      if(heldCalls.includes(tc)){
+        c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,
+          content:'[RITE HELD BY LOCAL CORTEX — the local pre-flight judged these arguments implausible for '+tc.name+'. Re-issue a corrected call, or answer in prose.]',ts:Date.now()});
+        save();renderMessages();
+        continue;
+      }
       const result=await executeTool(tc);
       c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
       save();renderMessages();

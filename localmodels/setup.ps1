@@ -39,6 +39,28 @@ Write-Host '[LOCAL CORTEX] downloading base weights + engine library (the only n
 & $vpy (Join-Path $here 'fetch_engine.py')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# Laya (the decision engine) is OPTIONAL and separate: a Node ESM package with its OWN
+# node_modules, so this step runs `npm install` right here. Non-fatal on purpose - the
+# Needle repair pass, and the whole harness, work without Laya. The 1.7 GB of ONNX weights
+# are NOT fetched here: the first Laya.load (the first /decide) downloads and caches them
+# under %USERPROFILE%\.cache\receptron-laya (LAYA_CACHE overrides).
+Write-Host '[LOCAL CORTEX] installing the Laya decision engine (Node >= 20) — optional'
+$node = Get-Command node -ErrorAction SilentlyContinue
+$npm = Get-Command npm -ErrorAction SilentlyContinue
+if ($node -and $npm) {
+    # A failing native command must not abort the script ($ErrorActionPreference = 'Stop'):
+    # Laya is optional, so both a throw and a non-zero exit are a warning, not a failure.
+    $npmOk = $true
+    try { & npm install --no-audit --no-fund } catch { $npmOk = $false; Write-Warning $_ }
+    if ((-not $npmOk) -or ($LASTEXITCODE -ne 0)) {
+        Write-Warning "[LOCAL CORTEX] 'npm install' failed — Laya stays unavailable; Needle still works."
+    } else {
+        Write-Host "  Laya deps installed in $here\node_modules."
+    }
+} else {
+    Write-Warning '[LOCAL CORTEX] node/npm not found on PATH — skipping Laya (optional).'
+}
+
 Write-Host ''
 Write-Host '[LOCAL CORTEX] Needle installed. Next steps:'
 Write-Host ''
@@ -51,10 +73,10 @@ Write-Host '     The daemon sets NEEDLE_TELEMETRY=0 itself, so the anonymous usa
 Write-Host '     fire — nothing about a repair leaves the machine. To point at a specific weights'
 Write-Host '     file, set NEEDLE_WEIGHTS=C:\path\to\base.cact'
 Write-Host ''
-Write-Host '  2. Laya is OPTIONAL and separate (Node >= 20, ~1.7 GB of ONNX weights on first use):'
-Write-Host ''
-Write-Host '         npm install            # inside localmodels\ (its own node_modules)'
-Write-Host '         # weights cache to %USERPROFILE%\.cache\receptron-laya (override with LAYA_CACHE)'
+Write-Host '  2. Laya is OPTIONAL and separate (Node >= 20). Its npm deps were installed above'
+Write-Host '     into localmodels\node_modules; re-run `npm install` in localmodels\ if that step'
+Write-Host '     was skipped. The ~1.7 GB of ONNX weights download on the FIRST Laya.load (the'
+Write-Host '     first /decide) and cache to %USERPROFILE%\.cache\receptron-laya (LAYA_CACHE overrides).'
 Write-Host ''
 Write-Host '[LOCAL CORTEX] Nothing is enabled by default: the harness works unchanged until you'
 Write-Host 'turn LOCAL CORTEX on, and nothing in this package ever contacts a remote service'
