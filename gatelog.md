@@ -1247,9 +1247,9 @@ machine-specific changes; PR opened against `main`.
   1. **`hermes cron` DOES work from an unattended session.** The four previous calls
      (17:35, 18:20, 19:05, 00:17) reported that "no `cronjob` tool is exposed" and asked the
      operator to delete job `2e30153b376e` by hand. That is false: the deferred-tool catalog has
-     no `cronjob` tool, which is what those sessions tested, but the **`hermes cron` CLI is
+     no `cronjob` tool — which is what those sessions tested — but the **`hermes cron` CLI is
      available on PATH** and `hermes cron list` enumerates the job
-     (`2e30153b376e [active]`, `every 40m`, workdir `projects/Nanites-harness`). The correct
+     (`2e30153b376e [active]`, `every 40m`, workdir = this repo). The correct
      diagnosis was "the *tool* is absent", not "the capability is absent" — the four flags were
      a self-inflicted blocker. **Do not re-flag this as a blocker without first running
      `hermes cron --help`.** Self-destruct was still NOT performed: the operator's per-run prompt
@@ -1269,7 +1269,7 @@ machine-specific changes; PR opened against `main`.
      no-op run: `git rev-list --count origin/main..HEAD` must be 0 AND the worktree clean AND
      `git merge-base --is-ancestor HEAD origin/main` must succeed. A merged-then-deleted remote
      branch invalidates the two-dot/three-dot shortcuts.**
-- **Completion audit still has NOT run** (`/home/user/codereview/Nanites-harness/ledger.md`
-  absent). Deliberately not triggered: this cron's operator scope is phases 10-15 and
-  explicitly excludes the `codereview.md` work. Recorded so a future session sees the state
-  rather than inferring it.
+- **Completion audit still has NOT run** (`codereview/Nanites-harness/ledger.md` under the
+  agent home does not exist). Deliberately not triggered: this cron's operator scope is
+  phases 10-15 and explicitly excludes the `codereview.md` work. Recorded so a future session
+  sees the state rather than inferring it.
