@@ -1,1 +1,16 @@
 node_modules/
+
+# Local Cortex (Needle + Laya) runtime state — never commit machine-specific values.
+# The ledger holds redacted repair/decision traces; model caches live outside the repo
+# (~/.cache/cactus-needle, ~/.cache/receptron-laya) by default.
+var/
+localmodels/.venv/
+localmodels/node_modules/
+localmodels/.cache/
+localmodels/*.cact
+localmodels/.localmodels-env
+
+# Python bytecode: importing localmodels/ledger.py writes a .pyc next to it, and this
+# repo is share-ready — bytecode must never be tracked.
+__pycache__/
+*.py[cod]

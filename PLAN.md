@@ -61,3 +61,125 @@ Gate: phase 3 suite green + phases 1-2 + regression green. **COMPLETE.**
 - [x] 4.3 README updated for new features (profiles, agent prompt, attachments).
 Status: **COMPLETE (all phases 0-4 done; all suites green).**
 Gate: every plan checkbox above checked and all suites green. — **Satisfied: `npm test` full run green.**
+
+---
+
+## Phase 5 — Dynamic per-endpoint API key (bearer auth) [RECON DONE, NOT STARTED]
+**Why:** Provider endpoint profiles have no way to carry a credential. OpenAI-compatible
+endpoints require an API key, but the profile shape is `{id,name,backend,endpoint,model}`
+and **every** request to the model sends only `Content-Type` — there is no
+`Authorization: Bearer …` header anywhere, and no key field. Recon of the full git history
+(`90e51f8` incl.) confirms the key was **never** implemented (not hardcoded, not dynamic) in
+either `index.html` or `bridge.py`; the old "hardcoded key" the operator remembers is not in
+any committed revision. This phase makes the key a first-class, per-profile, dynamic value.
+- [x] 5.1 `appcore.js` `profileStore`: extend profile shape to
+      `{id,name,backend,endpoint,model,apiKey}`; `save()` persists it, `get()`/`apply()`
+      return it; backward-compatible with profiles saved without `apiKey` (default `''`).
+- [x] 5.2 Settings modal: add **API KEY (BEARER)** password input `#set-apikey` (with a
+      show/hide eye toggle) in the MACHINE-SPIRIT ENDPOINT field block, next to `#set-endpoint`.
+- [x] 5.3 `settings.apiKey` in the settings blob; `saveSet()` persists it; masked in the
+      `[WORKDIR CONTEXT]`/system introspection and never echoed anywhere except the header.
+- [x] 5.4 Auth header injection: helper `authHeaders()` → `{Authorization:'Bearer '+key}`
+      when `settings.apiKey` non-empty, else `{}`. Apply to the OpenAI path
+      (`/v1/chat/completions`) and the model-fetch endpoints (`/v1/models`,
+      `/api/v1/models`, `/api/tags`). OLLAMA/LM-Studio paths unchanged (no header unless a
+      key is set) so local no-auth backends keep working.
+- [x] 5.5 SAVE CURRENT AS PROFILE includes the key; LOAD writes it back into `#set-apikey`
+      and `settings.apiKey`; DELETE clears nothing global.
+- [x] 5.6 E2E `tests/frontend/phase5_apikey.test.js`: save/load roundtrip carries key;
+      applying a profile sets the live key; `/v1/chat/completions` request carries
+      `Authorization: Bearer <key>` when set and omits it when empty; key persists across a
+      simulated reload; auto-detected/keyless backends still send no header.
+Gate: phase 5 suite green + phases 0-4 + python regression green.
+
+## Phase 6 — Agentic system prompt redesign + structured-output contract [DONE]
+**Why:** `buildAgentSystemPrompt` advertises tools that **do not exist** (`shell_exec`,
+`clipboard access`) and **omits** tools that do (`git`, `run_command`). There is no explicit
+tool-call output template and no instruction to emit only valid JSON, so a small-context
+model can free-form a response instead of a machine-parseable tool call. Redesign for correct,
+robust agentic priming that works for small or large contexts.
+- [x] 6.1 Replace the hardcoded tool list in `buildAgentSystemPrompt` with a roster derived
+      from the actual `TOOL_SCHEMAS` (read_file, write_file, list_dir, grep, git,
+      run_command) and note `run_command` is disabled unless the bridge runs `--allow-exec`
+      (mirror `bridge.py` `ALLOW_EXEC`). Never hardcode a stale tool name.
+- [x] 6.2 Add an explicit **structured tool-call contract** to the prompt: the exact JSON
+      shape of a function call (`{"type":"function","function":{"name":…,"arguments":"{…}"}}`
+      — inline escaped-JSON `arguments`, exactly as `/v1/chat/completions` expects), a rule
+      that arguments must be valid JSON, one tool call per turn, observe the returned result,
+      then continue or stop. Cost-aware phrasing for small contexts.
+- [x] 6.3 Keep (and verify) the workdir-jail rule, relative-path rule, `list_dir(".")`=workdir
+      contents, absolute-host-path refusal, and the injected `[WORKDIR CONTEXT]` block.
+      Orient on the bound workdir (`settings.workdir`), not the project root.
+- [x] 6.4 E2E `tests/frontend/phase6_sysprompt.test.js`: prompt names all six real tools,
+      names **none** of `shell_exec`/`clipboard`, contains the JSON tool-call template, still
+      contains the relative-path + workdir rules, and the agent-mode payload includes the
+      tool schemas + `tool_choice:'auto'`.
+Status: **DONE (all suites green; commit `phase6: ...`).**
+Gate: phase 6 suite green + phase 5 + regression green.
+
+## Phase 7 — Structured output validator (deterministic protection layer) [DONE]
+**Why:** The harness currently trusts whatever the LLM returns and dispatches any
+`tool_calls` to the bridge. There is no deterministic schema/allow-list check between the
+endpoint and the executor. This phase adds a pure validator so only safe, well-formed
+structured output reaches the system the harness runs on.
+- [x] 7.1 `appcore.js`: `validateStructuredOutput(result, allowedTools)` — pure, deterministic,
+      seeded: parse `tool_calls`; fail on non-JSON `arguments`; each call has `id`/`name`/
+      `arguments`; `name` must be in `allowedTools` (the real `TOOL_SCHEMAS` names); arguments
+      parse to a plain object; per-tool schema arg check (minimal required-field/type checks).
+      Returns `{ok, errors:[…], sanitized}`. Never reaches for the network/fs.
+- [x] 7.2 `sanitizeToolCalls / rejectBeforeDispatch`: in the agent loop, run every
+      `tool_calls` array through the validator **before** `executeTool`; a failed call is
+      never dispatched — feed a `{role:'tool', …}` error back into the model loop instead
+      (so the model can correct), keeping the bridge safe.
+- [x] 7.3 Wire into `runAgentLoop`/`callOpenAI` dispatch path so the bridge only ever
+      receives validated tool names/args.
+- [x] 7.4 E2E `tests/frontend/phase7_validator.test.js`: valid call passes; malformed
+      `arguments` (non-JSON, non-object) rejected; unknown tool name rejected; bridge
+      dispatch is provably skipped for a rejected call (assert `events` never receive it).
+Status: **DONE (all suites green — `npm test` ALL GREEN).**
+Gate: phase 7 suite green + phases 5-6 + regression green. — **Satisfied.**
+
+## Phase 8 — Codereview #1 fix + close-out [COMPLETE]
+**Why:** The most severe recorded issue is `index.html:707`
+`acc.content+=o.content||acc.content` — on the `chat.end` aggregate stream shape a
+content-less assistant message self-appends the accumulated buffer, duplicating the response.
+- [x] 8.1 Fix to `acc.content+=o.content||''` (one-character-class change).
+- [x] 8.2 Add an e2e case (phase8 or fold into existing suite): a content-less `message`
+      object in `chat.end` output does **not** duplicate prior content.
+- [x] 8.3 Strike codereview issue **#1** from `codereview.md` (mark FIXED, keep the rest).
+- [x] 8.4 Full `npm test` green (frontend phases 0-7 + python regression); README/PLAN/
+      gatelog/REPORT updated; read-only re-review pass for new smells → `codereview.md`.
+Gate: full `npm test` green and codereview #1 struck off. **Satisfied — `npm test` ALL GREEN
+(frontend phases 0,1,2,3,5,6,7,8) + `python3 test_e2e.py` 0 FAILURES.**
+
+---
+
+## Phase 9 — Security hardening + live correctness bugs from codereview pass 3 [DONE]
+**Why:** All feature phases 0-8 are DONE and green, so the open work is the read-only review's
+priority list (`codereview.md`, pass 3). Item #14 is a live security hole (the daemon has **no**
+Origin guard, so any web page can re-point the workdir, plant `bridge.py`, spawn a worker and
+register login autostart), #15 lets an opaque `Origin: null` caller be treated as local, and #16/#17
+are operator-visible correctness bugs in the shipped path (attachment token pricing ~1 token; COPY
+on an attachment message yields `[object Object]`).
+- [x] 9.1 [SEC #14] `bridge_daemon.py`: add the same `_origin_allowed()` allow-list `bridge.py`
+      has (missing Origin = native/curl OK; `localhost`/`127.0.0.1` OK; everything else 403),
+      enforced on every `do_GET`/`do_POST` route; `--allow-any-origin` / `--allow-file-origin`
+      flags mirroring the bridge; startup banner + README updated.
+- [x] 9.2 [SEC #15] `bridge.py`: stop trusting `Origin: null` by default (a sandboxed iframe /
+      `data:` / `blob:` document on any site gets an opaque origin); gate it behind a new
+      `--allow-file-origin` flag; banner + README updated. Documented serving path
+      (`python -m http.server`) uses a `localhost` origin and is unaffected.
+- [x] 9.3 [BUG #16] `index.html`: the live `tok` must be the array-aware `CogCore.tok`
+      (multimodal attachment content is an array; `array.length` is parts, not chars), so the
+      `#ctx-pct` gauge, the `buildMessages()` budget walk and `compactChat` retention all price
+      attachments correctly and never yield `NaN`.
+- [x] 9.4 [BUG #17] `index.html` `msgAction('copy')`: use `CogCore.contentText(...)` so an
+      attachment message copies its text, not `[object Object],[object Object]`.
+- [x] 9.5 RED-first suites: daemon/bridge origin matrix cases in `test_e2e.py`; new
+      `tests/frontend/phase9_tok_copy.test.js` for the gauge/COPY fixes.
+- [x] 9.6 `codereview.md` items #14-#17 struck as FIXED; full `npm test` green.
+Gate: `python3 test_e2e.py` 0 FAILURES **and** `node tests/frontend/run.js` ALL GREEN
+(new phase 9 suite + phases 0,1,2,3,5,6,7,8).
+Status: **DONE — `npm test` exit 0 (python 0 FAILURES, FRONTEND SUITE: ALL GREEN); red-first
+evidence and the operator-visible behaviour change (`Origin: null` refused unless
+`--allow-file-origin`) are recorded in `gatelog.md` Phase 9.**

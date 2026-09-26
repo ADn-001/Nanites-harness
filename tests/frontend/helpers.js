@@ -83,7 +83,8 @@ function launchApp({ url = 'http://localhost:8080/index.html', routes = {}, seed
       window.fetch = (input, init) => {
         const key = typeof input === 'string' ? input : (input && input.url) || String(input);
         const method = ((init && init.method) || 'GET').toUpperCase();
-        events.push({ url: key, method: method, body: init && init.body ? String(init.body) : null });
+        const headers = Object.assign({}, init && init.headers);
+        events.push({ url: key, method: method, body: init && init.body ? String(init.body) : null, headers: headers });
         // Match mocks keyed by pathname (e.g. '/v1/models') regardless of host, so
         // path-keyed route tables work with absolute or relative fetch URLs.
         let pathname = key;

@@ -7,11 +7,11 @@
  */
 (function (root, factory) {
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = factory();
+    module.exports = factory(root);
   } else {
-    root.CogCore = factory();
+    root.CogCore = factory(root);
   }
-})(typeof self !== 'undefined' ? self : this, function () {
+})(typeof self !== 'undefined' ? self : this, function (root) {
   'use strict';
 
   var CogCore = {
@@ -126,22 +126,47 @@
     },
 
     /**
-     * Agent-mode orient prompt. Deliberately SHORT: it must stay effective for
-     * both large- and small-context models. Jails the agent to one working
-     * directory and teaches it how to drive the tool loop. `opts.workdir` is the
-     * bound directory taken from the user's settings.
-     */
-    buildAgentSystemPrompt: function (opts) {
-      opts = opts || {};
-      var workdir = opts.workdir || '(the bound working directory)';
-      return [
-        'You are COGITATOR, an autonomous coding agent. You use a tool loop: emit tool calls, observe the results returned between turns, and keep going until the task is done.',
-        'FILESYSTEM JAIL: your ONLY reachable filesystem root is WORKDIR below. Every path you place in a tool argument MUST be project-RELATIVE to WORKDIR (e.g. "src/app.py", "readme.md", or "." for the root itself). You will never be handed host-absolute paths such as /home/..., /etc/passwd, or C:\\...; do not invent them. If a step genuinely requires a path outside the workdir, refuse and ask the user to remount.',
-        'WORKDIR: ' + workdir,
-        'TOOLS available this session: list_dir, grep, read_file, write_file, shell_exec, and clipboard access. Tool results are returned verbatim between turns. Prefer tools over prose; keep prose concise.',
-        'STOPPING: ask for help only when you are blocked, lack a capability, or need a clarification you cannot resolve from the workdir listing.'
-      ].join('\n');
-    },
+         * Agent-mode orient prompt. Deliberately SHORT: it must stay effective for
+         * both large- and small-context models. Jails the agent to one working
+         * directory, teaches it how to drive the tool loop, and pins the tool roster
+         * to the LIVE TOOL_SCHEMAS passed in as `opts.tools`. `opts.workdir` is the
+         * bound directory taken from the user's settings.
+         */
+        _toolNames: function (tools) {
+          var names = [];
+          if (Array.isArray(tools)) {
+            for (var i = 0; i < tools.length; i++) {
+              var t = tools[i] || {};
+              var inner = t.function || t;
+              if (inner && typeof inner.name === 'string' && inner.name) {
+                names.push(inner.name);
+              }
+            }
+          }
+          if (!names.length) {
+            names = ['read_file', 'write_file', 'list_dir', 'grep', 'git', 'run_command'];
+          }
+          return names.filter(function (n, idx, arr) { return arr.indexOf(n) === idx; });
+        },
+
+        buildAgentSystemPrompt: function (opts) {
+          opts = opts || {};
+          var workdir = opts.workdir || '(the bound working directory)';
+          var toolNames = CogCore._toolNames(opts.tools);
+          var hasRunCmd = toolNames.indexOf('run_command') !== -1;
+          var toolsLine = 'TOOLS available this session: ' + toolNames.join(', ') + '.';
+          if (hasRunCmd) {
+            toolsLine += ' run_command is DISABLED unless the bridge was started with --allow-exec; if the model calls it and it is refused, do not retry it — choose another tool or report the limitation.';
+          }
+          return [
+            'You are COGITATOR, an autonomous coding agent. You use a tool loop: emit tool calls, observe the results returned between turns, and keep going until the task is done.',
+            'FILESYSTEM JAIL: your ONLY reachable filesystem root is WORKDIR below. Every path you place in a tool argument MUST be project-RELATIVE to WORKDIR (e.g. "src/app.py", "readme.md", or "." for the root itself). You will never be handed host-absolute paths such as /home/..., /etc/passwd, or C:\\\\...; do not invent them. If a step genuinely requires a path outside the workdir, refuse and ask the user to remount.',
+            'WORKDIR: ' + workdir,
+            toolsLine,
+            'TOOL-CALL CONTRACT: to call a tool, emit EXACTLY ONE function call as a JSON object {"type":"function","function":{"name":"<tool>","arguments":"{...}"}} where "arguments" is an inline, escaped JSON string (a plain object of the tool\'s parameters, not a narrative). Emit exactly one tool call per turn, then STOP and wait for the tool result. Observe the returned result, then either call the next tool or, once the task is complete, reply with your final answer in prose (no further tool call).',
+            'STOPPING: ask for help only when you are blocked, lack a capability, or need a clarification you cannot resolve from the workdir listing.'
+          ].join('\n');
+        },
 
     /**
      * Build the system-message prefix for a model request.
@@ -170,12 +195,1764 @@
       return msgs;
     },
 
+    /* ================= PHASE 7 — STRUCTURED OUTPUT VALIDATOR =================
+     * A pure, deterministic gate between the model endpoint and the tool bridge.
+     * Nothing here may touch the network, the filesystem, the DOM or localStorage:
+     * it is the last checkpoint before an LLM-authored call is handed to the machine.
+     *
+     *   validateStructuredOutput(result, allowedTools) -> {ok, errors, sanitized}
+     *
+     *  - `result` may be: an array of calls, {toolCalls:[…]} (this app's finalized shape),
+     *    or an OpenAI assistant message {tool_calls:[{id,type,function:{name,arguments}}]}.
+     *  - `allowedTools` may be TOOL_SCHEMAS-shaped entries ({type:'function',function:{…}})
+     *    or a plain list of names. Names AND per-tool required/typed parameters are taken
+     *    from it, so the validator can never disagree with the prompt/tool payload.
+     *  - Every call is rejected if it lacks an id or a name, names a tool outside the
+     *    allow-list, or carries `arguments` that are not a JSON object; a call is also
+     *    rejected when a schema-declared required field is absent or a declared type
+     *    does not match. Rejections are collected in `errors`; `sanitized` carries ONLY
+     *    the calls that may be dispatched, with `args` already parsed to a plain object.
+     *  - `ok` is true only when nothing was rejected.
+     */
+    _toolSpec: function (allowedTools) {
+      var spec = { names: [], required: {}, properties: {} };
+      if (!Array.isArray(allowedTools)) return spec;
+      for (var i = 0; i < allowedTools.length; i++) {
+        var t = allowedTools[i];
+        if (typeof t === 'string') {
+          if (t && spec.names.indexOf(t) === -1) spec.names.push(t);
+          continue;
+        }
+        var inner = (t || {}).function || t || {};
+        var n = inner && typeof inner.name === 'string' ? inner.name : '';
+        if (!n) continue;
+        if (spec.names.indexOf(n) === -1) spec.names.push(n);
+        var p = (inner && inner.parameters) || {};
+        spec.required[n] = Array.isArray(p.required) ? p.required.slice() : [];
+        spec.properties[n] = (p && p.properties) || {};
+      }
+      return spec;
+    },
+
+    /** Normalise the many tool-call shapes into [{id,name,args}] or null. */
+    _normalizeToolCalls: function (result) {
+      if (!result || typeof result !== 'object') return null;
+      var raw = Array.isArray(result) ? result
+        : (Array.isArray(result.toolCalls) ? result.toolCalls
+          : (Array.isArray(result.tool_calls) ? result.tool_calls : null));
+      if (!raw) return null;
+      return raw.map(function (c) {
+        c = c || {};
+        var fn = c.function || c || {};
+        var args = c.args !== undefined ? c.args
+          : (c.arguments !== undefined ? c.arguments
+            : (fn.arguments !== undefined ? fn.arguments : fn.args));
+        return {
+          id: c.id == null ? '' : String(c.id),
+          name: (c.name || fn.name) == null ? '' : String(c.name || fn.name),
+          args: args
+        };
+      });
+    },
+
+    /** Declared-type conformance for one already-parsed argument value. */
+    _argTypeOk: function (v, type) {
+      if (!type) return true;
+      switch (type) {
+        case 'string': return typeof v === 'string';
+        case 'number': return typeof v === 'number' && isFinite(v);
+        case 'integer': return typeof v === 'number' && v % 1 === 0;
+        case 'boolean': return typeof v === 'boolean';
+        case 'object': return v !== null && typeof v === 'object' && !Array.isArray(v);
+        case 'array': return Array.isArray(v);
+        default: return true;
+      }
+    },
+
+    validateStructuredOutput: function (result, allowedTools) {
+      var spec = CogCore._toolSpec(allowedTools);
+      var calls = CogCore._normalizeToolCalls(result);
+      var errors = [], sanitized = [];
+
+      if (calls === null) {
+        errors.push({ index: -1, id: '', name: '', error: 'tool_calls is not an array — nothing is dispatchable' });
+        return { ok: false, errors: errors, sanitized: [] };
+      }
+
+      for (var i = 0; i < calls.length; i++) {
+        var c = calls[i];
+        var name = c.name, id = c.id;
+        var bad = [];
+
+        if (!id) bad.push('missing "id" (this app assigns one; an empty id cannot be correlated to a tool result)');
+        if (!name) bad.push('missing tool "name"');
+        else if (spec.names.length && spec.names.indexOf(name) === -1) {
+          bad.push('unknown tool "' + name + '" — not in the allowed set (' + spec.names.join(', ') + ')');
+        }
+
+        var args = null, argsOk = true;
+        if (typeof c.args === 'string') {
+          var txt = c.args.trim();
+          if (!txt) txt = '{}';
+          try { args = JSON.parse(txt); }
+          catch (e) { argsOk = false; bad.push('arguments is not valid JSON'); }
+        } else if (c.args === undefined || c.args === null) {
+          argsOk = false; bad.push('arguments is not valid JSON (missing)');
+        } else {
+          args = c.args;
+        }
+
+        if (argsOk) {
+          if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+            argsOk = false; bad.push('arguments must be a JSON object, got ' + (Array.isArray(args) ? 'array' : typeof args));
+          }
+        }
+
+        if (argsOk && args && spec.names.indexOf(name) !== -1) {
+          var req = spec.required[name] || [];
+          for (var r = 0; r < req.length; r++) {
+            if (!(req[r] in args)) bad.push('missing required argument "' + req[r] + '"');
+          }
+          var props = spec.properties[name] || {};
+          for (var k in props) {
+            if (!Object.prototype.hasOwnProperty.call(props, k)) continue;
+            if (!(k in args)) continue;
+            if (!CogCore._argTypeOk(args[k], (props[k] || {}).type)) {
+              bad.push('argument "' + k + '" must be of type ' + (props[k] || {}).type);
+            }
+          }
+        }
+
+        if (bad.length) errors.push({ index: i, id: id, name: name, error: bad.join('; ') });
+        else sanitized.push({ id: id, name: name, args: args });
+      }
+
+      return { ok: errors.length === 0, errors: errors, sanitized: sanitized };
+    },
+
+    /* ================= PHASE 11 — DETERMINISTIC SALVAGE =================
+     * `salvageToolCalls(reply, allowedTools)` — pure. No network, no filesystem,
+     * no DOM, no localStorage, no clock. This is the cheap, ~0-cost repair stage
+     * that runs BEFORE `validateStructuredOutput` in the agent turn.
+     *
+     * REPAIRS FORMAT, NEVER SEMANTICS. It may strip a markdown fence, drop a
+     * trailing comma, re-parse a double-encoded `arguments` string, close a
+     * truncated JSON object (only when the closed text actually parses), and
+     * reconcile a tool NAME that is a near-miss of an allowed name. It may NEVER
+     * invent an argument value, fill a required field with a guess, or choose
+     * between two equally-close tool names — an ambiguous name is `unrepairable`,
+     * never a guess. A name that reconciles to nothing is `unrepairable` too.
+     *
+     *   salvageToolCalls(reply, allowedTools) -> {calls, changed, unrepairable, source}
+     *
+     *  - `reply` may be: an array of calls, `{toolCalls:[…]}`, `{tool_calls:[…]}`,
+     *    an OpenAI assistant message, an Ollama `{message:{tool_calls:[…]}}`, a
+     *    buffered `{type:'chat.end', result:{output:[…]}}`, a single bare call
+     *    object, a plain prose string, or `{content, tool_calls:[]}`.
+     *  - Emitted calls use the harness's own shape `{id, name, args}` with `args`
+     *    already parsed to a plain object (matching `validateStructuredOutput`'s
+     *    `sanitized[].args`). `id` is passed through unchanged — the caller mints
+     *    one when empty, exactly as `finalizeToolCalls` already does.
+     *  - `calls` holds ONLY calls that are ready to be validated/dispatched.
+     *    `unrepairable` holds `{id, name, args, reason}` for the calls this function
+     *    could NOT make dispatchable — the caller must still hand those to the
+     *    validator so they are rejected explicitly rather than silently dropped.
+     *  - `changed` is a human-readable list of the repairs applied (empty for a
+     *    clean turn — that is the false-repair guard: a legitimate call must come
+     *    back with the same name and the same argument VALUES and no `changed` entry).
+     *  - Never throws. Garbage in ⇒ {calls:[], changed:[], unrepairable:[…]}.
+     */
+    salvageToolCalls: function (reply, allowedTools) {
+      var names = CogCore._toolSpec(allowedTools).names;
+      var out = { calls: [], changed: [], unrepairable: [], source: 'deterministic' };
+      var got;
+      try { got = CogCore._cortexRawCalls(reply); } catch (e) { got = { raw: null, content: '' }; }
+      var raw = got.raw, content = got.content, i, k;
+
+      if (raw) {
+        for (i = 0; i < raw.length; i++) {
+          var c = raw[i] || {};
+          var fn = (c.function && typeof c.function === 'object') ? c.function : c;
+          var rawName = (c.name !== undefined && c.name !== null && c.name !== '') ? c.name : fn.name;
+          var cid = (c.id === undefined || c.id === null) ? '' : String(c.id);
+          var rawArgs = c.args !== undefined ? c.args
+            : (c.arguments !== undefined ? c.arguments
+              : (fn.arguments !== undefined ? fn.arguments : fn.args));
+
+          var nr = CogCore._cortexReconcileName(rawName, names);
+          var pa = CogCore._cortexParseArgs(rawArgs);
+
+          if (nr.reason || !pa.ok) {
+            out.unrepairable.push({
+              id: cid, name: String(rawName == null ? '' : rawName),
+              args: pa.ok ? pa.value : rawArgs,
+              reason: [nr.reason, pa.ok ? null : pa.reason].filter(Boolean).join('; ')
+            });
+            continue;
+          }
+          if (nr.changed) out.changed.push(nr.changed);
+          for (k = 0; k < pa.changed.length; k++) out.changed.push(pa.changed[k]);
+          out.calls.push({ id: cid, name: nr.name, args: pa.value });
+        }
+      }
+
+      /* Narration recovery: only when the reply carried NO call objects at all. */
+      if (!raw || !raw.length) {
+        var rc = null;
+        try { rc = CogCore._cortexRecoverFromNarration(content, names); } catch (e) { rc = null; }
+        if (rc && rc.ambiguous) {
+          out.unrepairable.push({ id: '', name: '', args: null, reason: rc.reason });
+        } else if (rc && rc.call) {
+          out.calls.push({ id: '', name: rc.call.name, args: rc.call.args });
+          for (k = 0; k < rc.changed.length; k++) out.changed.push(rc.changed[k]);
+        }
+      }
+      return out;
+    },
+
+    /* ---- Phase 11 internals (all pure) ---- */
+
+    /** Pull the raw call list + any prose content out of every supported reply shape. */
+    _cortexRawCalls: function (reply) {
+      var out = { raw: null, content: '' };
+      if (reply === null || reply === undefined) return out;
+      if (typeof reply === 'string') { out.content = reply; return out; }
+      if (Array.isArray(reply)) { out.raw = reply.slice(); return out; }
+      if (typeof reply !== 'object') return out;
+      if (typeof reply.content === 'string') out.content = reply.content;
+      var arr = function (v) { return Array.isArray(v) ? v : null; };
+      var raw = arr(reply.toolCalls) || arr(reply.tool_calls)
+        || (reply.message && (arr(reply.message.toolCalls) || arr(reply.message.tool_calls)))
+        || null;
+      if (!raw && reply.result && Array.isArray(reply.result.output)) {
+        var gathered = [];
+        for (var i = 0; i < reply.result.output.length; i++) {
+          var o = reply.result.output[i] || {};
+          if (Array.isArray(o.tool_calls)) gathered = gathered.concat(o.tool_calls);
+          else if (Array.isArray(o.toolCalls)) gathered = gathered.concat(o.toolCalls);
+          else if (o.type === 'function_call' || typeof o.name === 'string') gathered.push(o);
+          if (typeof o.content === 'string' && o.content) out.content += (out.content ? '\n' : '') + o.content;
+        }
+        if (gathered.length) raw = gathered;
+      }
+      /* a single bare call object (not wrapped in an array) */
+      if (!raw && typeof reply.name === 'string' &&
+          (reply.arguments !== undefined || reply.args !== undefined || reply.function)) raw = [reply];
+      out.raw = raw;
+      return out;
+    },
+
+    /** Lowercase + strip every non-alphanumeric char (separator/space/case folding). */
+    _cortexNormName: function (s) {
+      return String(s === null || s === undefined ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    },
+
+    /** Similarity in [0,1] from the Levenshtein distance over two normalised names. */
+    _cortexEditSim: function (a, b) {
+      a = String(a === null || a === undefined ? '' : a);
+      b = String(b === null || b === undefined ? '' : b);
+      var la = a.length, lb = b.length;
+      if (!la && !lb) return 1;
+      if (!la || !lb) return 0;
+      var prev = [], cur = [], i, j;
+      for (j = 0; j <= lb; j++) prev[j] = j;
+      for (i = 1; i <= la; i++) {
+        cur[0] = i;
+        for (j = 1; j <= lb; j++) {
+          var cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1;
+          var del = prev[j] + 1, ins = cur[j - 1] + 1, sub = prev[j - 1] + cost;
+          cur[j] = Math.min(del, ins, sub);
+        }
+        prev = cur.slice();
+      }
+      return 1 - prev[lb] / Math.max(la, lb);
+    },
+
+    /**
+     * Reconcile a model-authored tool name against the allowed names:
+     * exact -> case-insensitive -> separator-normalised -> nearest by similarity
+     * with a UNIQUE winner at >= 0.86. Returns {name, changed?|reason?}.
+     * NEVER guesses: an ambiguous near-miss returns a `reason`, not a winner.
+     */
+    _cortexReconcileName: function (name, names) {
+      var NEAR = 0.86;
+      var n = (name === null || name === undefined) ? '' : String(name);
+      if (!n) return { name: '', reason: 'missing tool name' };
+      if (!Array.isArray(names) || !names.length) return { name: n };
+      if (names.indexOf(n) !== -1) return { name: n };
+      var i, hits = [];
+      for (i = 0; i < names.length; i++) if (names[i].toLowerCase() === n.toLowerCase()) hits.push(names[i]);
+      if (hits.length === 1) return { name: hits[0], changed: 'tool name "' + n + '" -> "' + hits[0] + '" (case)' };
+      if (hits.length > 1) return { name: n, reason: 'ambiguous tool name "' + n + '" — ' + hits.join(' / ') + ' differ only by case' };
+      var norm = CogCore._cortexNormName(n);
+      hits = [];
+      for (i = 0; i < names.length; i++) if (CogCore._cortexNormName(names[i]) === norm) hits.push(names[i]);
+      if (hits.length === 1) return { name: hits[0], changed: 'tool name "' + n + '" -> "' + hits[0] + '" (separator)' };
+      if (hits.length > 1) return { name: n, reason: 'ambiguous tool name "' + n + '" — matches ' + hits.join(' / ') + ' after normalisation' };
+      var best = -1, winners = [], sim;
+      for (i = 0; i < names.length; i++) {
+        sim = CogCore._cortexEditSim(norm, CogCore._cortexNormName(names[i]));
+        if (sim > best + 1e-9) { best = sim; winners = [names[i]]; }
+        else if (Math.abs(sim - best) <= 1e-9) winners.push(names[i]);
+      }
+      if (best >= NEAR) {
+        if (winners.length === 1) {
+          return { name: winners[0], changed: 'tool name "' + n + '" -> "' + winners[0] + '" (near-miss ' + best.toFixed(2) + ')' };
+        }
+        return { name: n, reason: 'ambiguous tool name "' + n + '" — ' + winners.join(' / ') + ' are equally close at ' + best.toFixed(2) };
+      }
+      return { name: n, reason: 'unknown tool name "' + n + '" (closest "' + winners[0] + '" at ' + best.toFixed(2) + ')' };
+    },
+
+    /** The balanced `{…}` span starting at `start`, or null. String-literal aware. */
+    _cortexSpanObject: function (s, start) {
+      s = String(s === null || s === undefined ? '' : s);
+      if (!(start >= 0) || s.charAt(start) !== '{') return null;
+      var depth = 0, inStr = false, esc = false;
+      for (var i = start; i < s.length; i++) {
+        var ch = s.charAt(i);
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{') depth++;
+        else if (ch === '}') { depth--; if (depth === 0) return s.slice(start, i + 1); }
+      }
+      return null;
+    },
+
+    /** The first balanced `{…}` object inside a blob of text, or null. */
+    _cortexFirstObject: function (s) {
+      s = String(s === null || s === undefined ? '' : s);
+      return CogCore._cortexSpanObject(s, s.indexOf('{'));
+    },
+
+    /** Every balanced `{…}` object inside a blob of text (bounded). */
+    _cortexAllObjects: function (s) {
+      s = String(s === null || s === undefined ? '' : s);
+      var out = [], i = 0, span;
+      for (var guard = 0; guard < 64; guard++) {
+        var idx = s.indexOf('{', i);
+        if (idx === -1) break;
+        span = CogCore._cortexSpanObject(s, idx);
+        if (!span) break;
+        out.push(span);
+        i = idx + span.length;
+      }
+      return out;
+    },
+
+    /**
+     * Close an unbalanced JSON text: append the missing quote/closers, dropping a
+     * dangling separator first. Returns null when the text is already balanced.
+     * Only ever ADDS syntax — never a value.
+     */
+    _cortexCloseBalance: function (s) {
+      s = String(s === null || s === undefined ? '' : s);
+      var stack = [], inStr = false, esc = false, i, ch;
+      for (i = 0; i < s.length; i++) {
+        ch = s.charAt(i);
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{' || ch === '[') stack.push(ch);
+        else if (ch === '}' || ch === ']') stack.pop();
+      }
+      if (!stack.length && !inStr) return null;
+      var out = s;
+      if (inStr) out += '"';
+      out = out.replace(/,\s*$/, '');
+      for (i = stack.length - 1; i >= 0; i--) out += (stack[i] === '{' ? '}' : ']');
+      return out;
+    },
+
+    /**
+     * Parse a text into a plain JSON object using FORMAT-ONLY repairs, in order:
+     * as-is -> trailing commas dropped -> first balanced object -> close-balance
+     * -> a JSON string that itself contains the object (double-encoded). Returns
+     * the object or null. It never fabricates a member or a value.
+     */
+    _cortexTryParseObject: function (text, depth) {
+      var t = String(text === null || text === undefined ? '' : text).trim();
+      if (!t) return null;
+      if ((depth || 0) > 2) return null;
+      var variants = [t, t.replace(/,\s*([}\]])/g, '$1')];
+      var span = CogCore._cortexFirstObject(t);
+      if (span) { variants.push(span); variants.push(span.replace(/,\s*([}\]])/g, '$1')); }
+      var closed = CogCore._cortexCloseBalance(t);
+      if (closed) variants.push(closed);
+      if (span) { var closedSpan = CogCore._cortexCloseBalance(span); if (closedSpan) variants.push(closedSpan); }
+      /* A markdown fence — closed OR left unclosed by a truncated reply. */
+      var unfenced = t.replace(/^\s*```[A-Za-z0-9_-]*[ \t]*\r?\n?/, '').replace(/\r?\n?\s*```\s*$/, '');
+      if (unfenced !== t) {
+        variants.push(unfenced);
+        variants.push(unfenced.replace(/,\s*([}\]])/g, '$1'));
+        var uSpan = CogCore._cortexFirstObject(unfenced);
+        if (uSpan) {
+          variants.push(uSpan);
+          variants.push(uSpan.replace(/,\s*([}\]])/g, '$1'));
+          var uClosed = CogCore._cortexCloseBalance(uSpan);
+          if (uClosed) variants.push(uClosed);
+        }
+        var uAll = CogCore._cortexCloseBalance(unfenced);
+        if (uAll) variants.push(uAll);
+      }
+      for (var i = 0; i < variants.length; i++) {
+        var parsed;
+        try { parsed = JSON.parse(variants[i]); } catch (e) { continue; }
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+        if (typeof parsed === 'string' && parsed.trim().charAt(0) === '{') {
+          var inner = CogCore._cortexTryParseObject(parsed, (depth || 0) + 1);
+          if (inner) return inner;
+        }
+      }
+      return null;
+    },
+
+    /** Repair one call's `arguments` into a plain object. {ok, value, changed, reason}. */
+    _cortexParseArgs: function (raw) {
+      if (raw !== null && raw !== undefined && typeof raw === 'object') {
+        if (Array.isArray(raw)) return { ok: false, value: raw, changed: [], reason: 'arguments is an array, not an object' };
+        return { ok: true, value: raw, changed: [], reason: null };
+      }
+      if (raw === null || raw === undefined) return { ok: false, value: raw, changed: [], reason: 'arguments missing' };
+      var s = String(raw).trim();
+      if (!s) return { ok: true, value: {}, changed: ['empty arguments -> {}'], reason: null };
+
+      var changed = [], body = s;
+      var fence = body.match(/^```[A-Za-z0-9_-]*\s*\n?([\s\S]*?)\n?\s*```$/);
+      if (fence) { body = fence[1].trim(); changed.push('stripped a markdown fence from arguments'); }
+
+      /* Clean pass first: a legitimate JSON object string must stay repair-free. */
+      var direct = null;
+      try { direct = JSON.parse(body); } catch (e) { direct = null; }
+      if (direct !== null && typeof direct === 'object' && !Array.isArray(direct)) {
+        return { ok: true, value: direct, changed: changed, reason: null };
+      }
+      if (typeof direct === 'string' && direct.trim().charAt(0) === '{') {
+        var once = CogCore._cortexTryParseObject(direct);
+        if (once) return { ok: true, value: once, changed: changed.concat(['decoded double-encoded arguments']), reason: null };
+      }
+      var loose = CogCore._cortexTryParseObject(body);
+      if (loose) {
+        if (/,\s*[\]}]/.test(body)) changed.push('removed a trailing comma');
+        if (CogCore._cortexCloseBalance(body) || CogCore._cortexCloseBalance(CogCore._cortexFirstObject(body) || '')) {
+          changed.push('closed an unbalanced JSON object');
+        }
+        changed.push('extracted a parseable JSON object from the arguments');
+        return { ok: true, value: loose, changed: changed, reason: null };
+      }
+      return { ok: false, value: raw, changed: changed, reason: 'arguments is not a parseable JSON object' };
+    },
+
+    /** A `{name, arguments}`-shaped plain object -> a candidate call, or null. */
+    _cortexCallFromObject: function (obj) {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+      var fn = (obj.function && typeof obj.function === 'object') ? obj.function : obj;
+      var name = fn.name !== undefined ? fn.name : (obj.tool !== undefined ? obj.tool : obj.tool_name);
+      if (typeof name !== 'string' || !name) return null;
+      var args = fn.arguments !== undefined ? fn.arguments
+        : (fn.args !== undefined ? fn.args
+          : (obj.arguments !== undefined ? obj.arguments
+            : (obj.args !== undefined ? obj.args : obj.parameters)));
+      if (args === undefined) return null;
+      if (typeof args === 'string') {
+        var pa = CogCore._cortexParseArgs(args);
+        if (!pa.ok) return null;
+        args = pa.value;
+      }
+      if (args === null || typeof args !== 'object' || Array.isArray(args)) return null;
+      return { name: name, args: args };
+    },
+
+    /**
+     * Recover ONE call from a prose reply: either a `name({…})`-shaped span, or a
+     * JSON object carrying a name + arguments (fenced or bare). Returns
+     * {call, changed} | {ambiguous:true, reason} | null. More than one DISTINCT
+     * candidate is ambiguous and is refused rather than guessed.
+     */
+    _cortexRecoverFromNarration: function (content, names) {
+      var text = String(content === null || content === undefined ? '' : content);
+      if (!text.trim()) return null;
+      var cands = [], i;
+      var re = /([A-Za-z_][A-Za-z0-9_.-]*)\s*\(\s*\{/g, m;
+      while ((m = re.exec(text)) !== null) {
+        var open = m.index + m[0].length - 1;
+        var span = CogCore._cortexSpanObject(text, open);
+        var argsText = span;
+        if (!argsText) {
+          /* truncated narration: close-balance the tail and keep it only if it parses */
+          var closedTail = CogCore._cortexCloseBalance(text.slice(open));
+          if (closedTail) {
+            var tailObj = CogCore._cortexTryParseObject(closedTail);
+            if (tailObj) argsText = JSON.stringify(tailObj);
+          }
+        }
+        if (argsText) cands.push({ name: m[1], argsText: argsText, how: 'narration "name({…})"' });
+      }
+      var objs = CogCore._cortexAllObjects(text);
+      for (i = 0; i < objs.length; i++) {
+        var parsed = CogCore._cortexTryParseObject(objs[i]);
+        var cand = CogCore._cortexCallFromObject(parsed);
+        if (cand) cands.push({ name: cand.name, argsValue: cand.args, how: 'narrated JSON object' });
+      }
+
+      var kept = [], seen = {};
+      for (i = 0; i < cands.length; i++) {
+        var cd = cands[i];
+        var nr = CogCore._cortexReconcileName(cd.name, names);
+        if (nr.reason) continue;                        /* not an allowed tool: prose, not a call */
+        var args = cd.argsValue;
+        if (args === undefined) {
+          var pa = CogCore._cortexParseArgs(cd.argsText);
+          if (!pa.ok) continue;
+          args = pa.value;
+        }
+        if (!args || typeof args !== 'object' || Array.isArray(args)) continue;
+        var sig = nr.name + '|' + JSON.stringify(args);
+        if (seen[sig]) continue;
+        seen[sig] = 1;
+        kept.push({ name: nr.name, args: args, changed: nr.changed, how: cd.how });
+      }
+      if (!kept.length) return null;
+      if (kept.length > 1) {
+        return { ambiguous: true, reason: 'ambiguous narration — ' + kept.length + ' distinct candidate calls (' +
+          kept.map(function (k) { return k.name; }).join(', ') + ')' };
+      }
+      var win = kept[0];
+      var changed = ['recovered a tool call from narration (' + win.how + ')'];
+      if (win.changed) changed.push(win.changed);
+      return { call: { name: win.name, args: win.args }, changed: changed };
+    },
+
+    /* ================= PHASE 10 — LOCAL CORTEX CLIENT =================
+     * The ONLY door between the harness and the local-models sidecar (127.0.0.1:8932).
+     * Pure and DOM-free: the transport is INJECTED so jsdom/Node tests need no server,
+     * and the whole object may never throw or reject — the sidecar is opt-in, so a
+     * dead/missing/lying sidecar must degrade, never break the conversation.
+     *
+     *   CogCore.localModels.client(base, fetchImpl, clock) ->
+     *     { health(), repair(payload,opts), decide(payload,opts),
+     *       selectTool(payload,opts), outcome(payload,opts) }
+     *
+     *  - `base` is e.g. 'http://127.0.0.1:8932' (trailing slashes are tolerated).
+     *  - `fetchImpl` defaults to `root.fetch`; when neither exists every call resolves
+     *    {ok:false, degraded:true}.
+     *  - `clock` is an injected time source: an object with now() OR a function returning
+     *    ms. It is used ONLY for the elapsed-ms field; default Date.now.
+     *  - Every failure (network reject, abort/timeout, non-2xx, unparseable JSON, no fetch)
+     *    resolves {ok:false, degraded:true, error:'<short reason>'} — never a throw.
+     *  - No `Authorization` header is ever sent: the sidecar is local and must never
+     *    receive an API key.
+     */
+    localModels: {
+      /* The settings block (plan §4). Kept byte-comparable with DEF_SETTINGS.localModels.
+
+         THRESHOLDS ARE MEASURED, NOT GUESSED (Phase 15, real untuned base model, 14 real
+         daemon calls on the stock weights). `tools/tune_thresholds.py` over the resulting
+         ledger reported, for the `/select` dispatcher: acceptance 2/6 = 33%, and a
+         precision of only 66.7% anywhere between t=0.25 and t=0.35. The model's confidence
+         does NOT track correctness on the untuned weights -- it answered `list_dir` when
+         `read_file` was right at conf 0.96, and proposed a MUTATING `write_file` from a
+         prose question that mentioned no tool at all. Lowering the bar below 0.40 therefore
+         buys recall bought with mutating proposals, so `dispatcher.minConfidence` and
+         `needle.minConfidence` STAY at 0.75. That is fail-closed on purpose: with stock
+         weights the dispatcher rarely fires, and a friend who enables LOCAL CORTEX on an
+         untuned model gets a safe, quiet no-op rather than confidently wrong rites. Re-tune
+         only against a tuned checkpoint, and re-read the gatelog Phase 15 findings first.
+
+         The blank-argument guard (_cortexHasBlankRequired) is what makes a low threshold
+         survivable at all -- it is load-bearing, not defensive noise. Do not remove it. */
+      DEFAULTS: {
+        enabled: false,
+        needle: { enabled: false, minConfidence: 0.75, confirmBand: [0.5, 0.75], timeoutMs: 800 },
+        laya: { enabled: false, minConfidence: 0.70, timeoutMs: 500, preflight: true, anomaly: true },
+        sanitizer: { enabled: true, mode: 'auto', deterministicPass: true },
+        dispatcher: { enabled: false, autoReadOnly: true, timeoutMs: 800, minConfidence: 0.75 },
+        port: 8932,
+        ledger: 'var/local-models.jsonl'
+      },
+
+      /* Per-call bounded timeouts (ms). Overridable with opts.timeoutMs. */
+      TIMEOUTS: { health: 1500, repair: 800, decide: 500, select: 800, outcome: 1500 },
+
+      client: function (base, fetchImpl, clock) {
+        var b = '';
+        try { b = String(base == null ? '' : base).replace(/\/+$/, ''); } catch (e) { b = ''; }
+
+        var doFetch = (typeof fetchImpl === 'function') ? fetchImpl
+          : ((root && typeof root.fetch === 'function') ? function () { return root.fetch.apply(root, arguments); } : null);
+
+        var nowMs = function () {
+          try {
+            if (typeof clock === 'function') return clock();
+            if (clock && typeof clock.now === 'function') return clock.now();
+          } catch (e) { /* fall through to the wall clock */ }
+          try { return Date.now(); } catch (e) { return 0; }
+        };
+
+        var degraded = function (reason) {
+          return { ok: false, degraded: true, error: String(reason == null ? 'unavailable' : reason) };
+        };
+
+        var timeoutFor = function (opts, dflt) {
+          var v = opts && opts.timeoutMs;
+          return (typeof v === 'number' && isFinite(v) && v > 0) ? v : dflt;
+        };
+
+        /* One bounded request. ALWAYS resolves an object; never throws, never rejects. */
+        var request = function (method, path, payload, timeoutMs) {
+          if (!doFetch) return Promise.resolve(degraded('no fetch implementation available'));
+          var url = b + path;
+          var init = { method: method, headers: { 'Content-Type': 'application/json' } };
+          if (method !== 'GET') {
+            var bodyText = '{}';
+            try { bodyText = JSON.stringify(payload || {}); } catch (e) { bodyText = '{}'; }
+            init.body = bodyText;
+          }
+          try {
+            /* jsdom has no AbortSignal.timeout — build the signal DEFENSIVELY. */
+            init.signal = (root && root.AbortSignal && root.AbortSignal.timeout)
+              ? root.AbortSignal.timeout(timeoutMs) : undefined;
+          } catch (e) { init.signal = undefined; }
+
+          var started = nowMs();
+          return new Promise(function (resolve) {
+            var settled = false;
+            var done = function (v) { if (settled) return; settled = true; try { resolve(v); } catch (e) { /* nothing left to do */ } };
+
+            var p;
+            try { p = doFetch(url, init); }
+            catch (e) { return done(degraded('fetch threw: ' + ((e && e.message) || e))); }
+            if (!p || typeof p.then !== 'function') return done(degraded('fetch returned no promise'));
+
+            p.then(function (res) {
+              try {
+                if (!res) return done(degraded('empty response'));
+                if (res.ok === false) return done(degraded('http ' + (res.status || 'error')));
+                if (typeof res.json !== 'function') return done(degraded('response has no json()'));
+                return Promise.resolve(res.json()).then(function (json) {
+                  var out = Object.assign({}, (json && typeof json === 'object') ? json : {}, {
+                    /* keep the server's own ok:false; otherwise the body parsed => ok */
+                    ok: (json && json.ok === false) ? false : true
+                  });
+                  var elapsed = nowMs() - started;
+                  out.latency_ms = (typeof elapsed === 'number' && isFinite(elapsed) && elapsed >= 0) ? Math.round(elapsed) : 0;
+                  done(out);
+                }, function (e) { done(degraded('unparseable json: ' + ((e && e.message) || e))); });
+              } catch (e) { done(degraded('bad response: ' + ((e && e.message) || e))); }
+            }, function (e) { done(degraded('network: ' + ((e && e.message) || e))); });
+          });
+        };
+
+        return {
+          /* GET /health — is the sidecar alive, are the models loaded, is the ledger writable? */
+          health: function (opts) { return request('GET', '/health', null, timeoutFor(opts, 1500)); },
+          /* POST /repair — Needle: salvage a malformed tool call. */
+          repair: function (payload, opts) { return request('POST', '/repair', payload, timeoutFor(opts, 800)); },
+          /* POST /decide — Laya: gate a mutating rite / flag a reply anomaly. */
+          decide: function (payload, opts) { return request('POST', '/decide', payload, timeoutFor(opts, 500)); },
+          /* POST /select — cheap local pre-router candidate selection. */
+          selectTool: function (payload, opts) { return request('POST', '/select', payload, timeoutFor(opts, 800)); },
+          /* POST /ledger — record the operator/outcome verdict for a trace (payload as-is). */
+          outcome: function (payload, opts) { return request('POST', '/ledger', payload, timeoutFor(opts, 1500)); }
+        };
+      }
+    },
+
+    /* ================= PHASE 12 — NEEDLE REPAIR PASS (F1) =================
+     * `sanitizeReply(reply, allowedTools, deps)` — the single door the agent turn uses to turn a
+     * model reply into dispatchable calls. Stage 1 is the Phase 11 deterministic salvage
+     * (`salvageToolCalls`) and is COMPLETELY unchanged: if plain code can produce dispatchable
+     * calls with nothing left over, this function does NO I/O.
+     *
+     * Stage 2 (opt-in, OFF by default) offers the calls plain code could not resolve — and, in
+     * `mode:'on'`, a prose-only narration — to the local Needle sidecar, bounded by
+     * `needle.timeoutMs`. Local inference is NEVER in the critical path:
+     *   - sidecar down / disabled / unconfigured / slow / empty ⇒ the ORIGINAL reply and its
+     *     Phase 11 unrepairable suspects pass through byte-identically;
+     *   - a repair fixes FORMAT ONLY and is still gated by `validateStructuredOutput` before it
+     *     can be dispatched — the local model never widens the allow-list, and a name it invents
+     *     is rejected by the deterministic gate, not trusted;
+     *   - an empty `calls:[]` never manufactures a call (the turn ends as prose);
+     *   - it NEVER throws; any failure degrades to `source:'original'`.
+     *
+     * Return: {calls, source:'deterministic'|'needle'|'original', confidence, accepted,
+     *          trace_id, degraded, changed, unrepairable, reason}
+     * `calls` is ALWAYS what the caller should dispatch. Phase 11 deterministic calls are never
+     * dropped: a mixed turn (repairable + suspects) keeps its dispatchable call even when the
+     * probe is skipped, times out or is rejected. `unrepairable` holds the still-unresolved calls
+     * so the caller can re-attach them to the Phase 7 gate.
+     *
+     * `deps` is INJECTED so jsdom/Node tests need no server and the function stays pure:
+     *   {client, settings, traceId, timeout, now}
+     * The `/repair` and `/ledger` requests carry NO Authorization header and never the provider
+     * API key: only `{suspect, candidates, schema, trace_id}` / `{trace_id, action}` are sent.
+     *
+     * Returns a plain object on every non-probing path, and a Promise when it actually probes, so
+     * `await sanitizeReply(...)` is always correct and a no-deps caller stays synchronous.
+     */
+    sanitizeReply: function (reply, allowedTools, deps) {
+      var out = {
+        calls: [], source: 'original', confidence: null, accepted: false,
+        trace_id: '', degraded: false, changed: [], unrepairable: [], reason: '',
+        early: ''      /* PHASE 15: '' | 'used' | 'expired' — what happened to the early probe */
+      };
+      try {
+        out.trace_id = CogCore._cortexTraceId(deps);
+        return CogCore._cortexSanitize(reply, allowedTools, deps, out);
+      } catch (e) {
+        out.calls = []; out.source = 'original'; out.accepted = false;
+        out.degraded = true; out.reason = 'error';
+        return out;
+      }
+    },
+
+    /* ---- Phase 12 internals (pure except for the injected client) ---- */
+
+    _cortexTraceId: function (deps) {
+      try {
+        if (deps && typeof deps.traceId === 'function') {
+          var t = deps.traceId();
+          if (t !== undefined && t !== null && String(t)) return String(t);
+        }
+        if (deps && deps.traceId !== undefined && deps.traceId !== null && String(deps.traceId)) {
+          return String(deps.traceId);
+        }
+      } catch (e) { /* fall through to a fresh id */ }
+      try { return CogCore.uid(); } catch (e2) { return 'tr_' + Math.random().toString(36).slice(2); }
+    },
+
+    /* Merge an injected settings block over the §4 defaults, so a partial/legacy blob can never
+       leave a sub-object undefined. Never mutates the caller's object. */
+    _cortexLmSettings: function (settings) {
+      var d = (CogCore.localModels && CogCore.localModels.DEFAULTS) || {};
+      var src = (settings && typeof settings === 'object' && !Array.isArray(settings)) ? settings : {};
+      var out = {}, k;
+      for (k in d) if (Object.prototype.hasOwnProperty.call(d, k) && k !== 'needle' && k !== 'laya' && k !== 'sanitizer' && k !== 'dispatcher') out[k] = d[k];
+      for (k in src) if (Object.prototype.hasOwnProperty.call(src, k)) out[k] = src[k];
+      var subs = ['needle', 'laya', 'sanitizer', 'dispatcher'];
+      for (var s = 0; s < subs.length; s++) {
+        var name = subs[s], base = d[name] || {}, got = src[name], sub = {}, b, g;
+        for (b in base) if (Object.prototype.hasOwnProperty.call(base, b)) sub[b] = base[b];
+        if (got && typeof got === 'object' && !Array.isArray(got)) {
+          for (g in got) if (Object.prototype.hasOwnProperty.call(got, g)) sub[g] = got[g];
+        }
+        out[name] = sub;
+      }
+      return out;
+    },
+
+    _cortexSanitize: function (reply, allowedTools, deps, out) {
+      deps = (deps && typeof deps === 'object') ? deps : {};
+      var lm = CogCore._cortexLmSettings(deps.settings);
+
+      /* ---- STAGE 1: deterministic (Phase 11, unchanged) ---- */
+      var salv;
+      try { salv = CogCore.salvageToolCalls(reply, allowedTools); }
+      catch (e) { salv = { calls: [], changed: [], unrepairable: [] }; }
+      var detCalls = Array.isArray(salv.calls) ? salv.calls.slice() : [];
+      out.changed = Array.isArray(salv.changed) ? salv.changed.slice() : [];
+      out.unrepairable = Array.isArray(salv.unrepairable) ? salv.unrepairable.slice() : [];
+      out.calls = detCalls.slice();
+
+      if (detCalls.length && !out.unrepairable.length) {
+        out.source = 'deterministic'; out.accepted = true;
+        return out;   /* nothing suspect: Phase 11 behaviour, no I/O at all */
+      }
+
+      /* ---- decide whether to probe Needle (plan §4 phase 12, step 2) ---- */
+      var san = lm.sanitizer || {}, nd = lm.needle || {};
+      var mode = (san.mode === undefined || san.mode === null) ? 'auto' : String(san.mode);
+      var client = (deps.client && typeof deps.client.repair === 'function') ? deps.client : null;
+      var suspects = out.unrepairable.length > 0;
+      var proseOnly = detCalls.length === 0 && out.unrepairable.length === 0;
+      var wantProbe = false;
+      if (lm.enabled !== false && san.enabled !== false && nd.enabled !== false &&
+          san.deterministicPass !== false && client && mode !== 'off') {
+        if (mode === 'on') wantProbe = suspects || proseOnly;
+        else wantProbe = suspects;   /* 'auto' probes only on suspects; unknown modes behave as auto */
+      }
+
+      if (!wantProbe) {
+        if (detCalls.length) { out.source = 'deterministic'; out.accepted = true; }
+        else { out.source = 'original'; out.accepted = false; }
+        return out;
+      }
+
+      /* ---- PHASE 15 — the turn ALREADY spent its one repair probe, mid-stream ----
+         The accumulated deltas already held a call that plain code cannot repair, so
+         `cortexStreamDetect` started a fire-and-forget `/repair` while the reply was still
+         arriving. The budget is ONE probe per turn, so this stage must NOT ask again: it
+         folds the early answer into the very same verdict, through the very same Phase 7
+         gate, and every unusable shape (expired, degraded, empty, invalid, below threshold)
+         degrades to a pass-through exactly as it would have without the early probe. */
+      /* Read the thresholds BEFORE the early-probe fold below. `var` hoists the declaration but
+         not the assignment, so a `minConf` read above its assignment is `undefined` here and
+         `conf >= undefined` is false — which silently downgraded every early repair to
+         below_threshold/passed_through. */
+      var minConf = (typeof nd.minConfidence === 'number' && isFinite(nd.minConfidence)) ? nd.minConfidence : 0.75;
+      var ms = (typeof nd.timeoutMs === 'number' && isFinite(nd.timeoutMs) && nd.timeoutMs > 0) ? nd.timeoutMs : 800;
+
+      var early = (deps.earlyRepair && typeof deps.earlyRepair === 'object') ? deps.earlyRepair : null;
+      if (early) {
+        if (early.expired) {
+          out.calls = detCalls.slice();
+          out.source = detCalls.length ? 'deterministic' : 'original';
+          out.accepted = detCalls.length > 0;
+          out.degraded = true;
+          out.reason = 'timeout';
+          out.early = 'expired';
+          /* The settle step normally ledgered this already; posting again would count one
+             probe twice in the operator's ledger. */
+          if (!early.ledgered) CogCore._cortexPostOutcome(deps, client, out.trace_id, 'timeout');
+          return out;
+        }
+        out.early = 'used';
+        return CogCore._cortexApplyRepair(early.value || null, out, detCalls, allowedTools, minConf, deps, client);
+      }
+
+      /* ---- STAGE 2: exactly one bounded, gated Needle probe ---- */
+      var payload = CogCore._cortexRepairPayload(reply, allowedTools, out.unrepairable, out.trace_id);
+
+      var probe;
+      try { probe = client.repair(payload); }
+      catch (e) { probe = Promise.reject(e); }
+      if (!probe || typeof probe.then !== 'function') probe = Promise.resolve(probe);
+
+      var raced = CogCore._cortexRace(probe, ms, deps.timeout);
+      return raced.then(function (r) {
+        try {
+          if (r && r.expired) {
+            /* Bounded timeout: the transport may never honour an AbortSignal, so we race our own
+               timer. Pass the ORIGINAL reply through and flag the turn. Never hangs. */
+            out.calls = detCalls.slice();
+            out.source = detCalls.length ? 'deterministic' : 'original';
+            out.accepted = detCalls.length > 0;
+            out.degraded = true;
+            out.reason = 'timeout';
+            CogCore._cortexPostOutcome(deps, client, out.trace_id, 'timeout');
+            return out;
+          }
+          return CogCore._cortexApplyRepair(r ? r.value : null, out, detCalls, allowedTools, minConf, deps, client);
+        } catch (e) {
+          out.calls = detCalls.slice(); out.source = 'original'; out.accepted = false;
+          out.degraded = true; out.reason = 'error';
+          return out;
+        }
+      });
+    },
+
     /*
+     * Race an awaited local call against OUR OWN timer — never the transport's AbortSignal (the
+     * sidecar/legacy fetch impl may ignore one entirely). Resolves {value, expired}; `expired`
+     * true means the timer won. `timeoutDep` may be a scheduler fn(fn, ms, fallbackValue) or an
+     * object with setTimeout; otherwise the real setTimeout is used.
+     */
+    _cortexRace: function (promise, ms, timeoutDep) {
+      return new Promise(function (resolve) {
+        var settled = false;
+        var done = function (value, expired) {
+          if (settled) return;
+          settled = true;
+          resolve({ value: value, expired: !!expired });
+        };
+        var fire = function () { done(null, true); };
+        var scheduled = false;
+        try {
+          if (typeof timeoutDep === 'function') { timeoutDep(fire, ms, null); scheduled = true; }
+          else if (timeoutDep && typeof timeoutDep.setTimeout === 'function') { timeoutDep.setTimeout(fire, ms); scheduled = true; }
+        } catch (e) { scheduled = false; }
+        if (!scheduled) { try { setTimeout(fire, ms); } catch (e2) { /* resolve on the promise then */ } }
+        Promise.resolve(promise).then(
+          function (v) { done(v, false); },
+          function (e) { done({ ok: false, degraded: true, error: String((e && e.message) || e) }, false); }
+        );
+      });
+    },
+
+    /* Build the /repair payload. Suspects for a real repair; the reply's prose for a prose probe.
+       Contains NO settings, NO API key: just the suspect, the candidate schemas and a trace id. */
+    _cortexRepairPayload: function (reply, allowedTools, unrepairable, traceId) {
+      var candidates = [];
+      try {
+        var list = Array.isArray(allowedTools) ? allowedTools.slice(0, 10) : [];
+        for (var i = 0; i < list.length; i++) candidates.push(CogCore._cortexCompactTool(list[i]));
+      } catch (e) { candidates = []; }
+      var suspect;
+      if (unrepairable && unrepairable.length) {
+        suspect = [];
+        for (var u = 0; u < unrepairable.length; u++) {
+          var su = unrepairable[u] || {};
+          suspect.push({
+            name: String(su.name === undefined || su.name === null ? '' : su.name),
+            arguments: su.args,
+            reason: String(su.reason || '')
+          });
+        }
+      } else {
+        var content = '';
+        try { content = CogCore._cortexRawCalls(reply).content || ''; } catch (e2) { content = ''; }
+        suspect = String(content);
+      }
+      return { suspect: suspect, candidates: candidates, schema: { tools: candidates }, trace_id: traceId };
+    },
+
+    _cortexCompactTool: function (t) {
+      var inner = (t && t.function && typeof t.function === 'object') ? t.function : (t || {});
+      return {
+        name: String(inner.name === undefined || inner.name === null ? '' : inner.name),
+        parameters: inner.parameters || { type: 'object', properties: {} }
+      };
+    },
+
+    /* Normalise a Needle `{calls:[{name,arguments}]}` reply into the harness's `{id,name,args}`
+       shape and mint an id (the Phase 7 validator requires one to correlate a tool result). */
+    _cortexNeedleCalls: function (calls, traceId) {
+      var out = [];
+      var tag = String(traceId === undefined || traceId === null ? 'tr' : traceId).replace(/[^a-z0-9]/gi, '').slice(0, 10) || 'tr';
+      for (var i = 0; i < (calls || []).length; i++) {
+        var c = calls[i] || {};
+        var fn = (c.function && typeof c.function === 'object') ? c.function : c;
+        var name = (c.name !== undefined && c.name !== null && c.name !== '') ? c.name : fn.name;
+        var args = c.args !== undefined ? c.args
+          : (c.arguments !== undefined ? c.arguments
+            : (fn.arguments !== undefined ? fn.arguments : fn.args));
+        var id = (c.id !== undefined && c.id !== null && String(c.id)) ? String(c.id) : ('call_needle_' + tag + '_' + i);
+        out.push({ id: id, name: String(name === undefined || name === null ? '' : name), args: args });
+      }
+      return out;
+    },
+
+    _cortexMergeCalls: function (a, b) {
+      var out = (a || []).slice();
+      for (var i = 0; i < (b || []).length; i++) {
+        var dup = false;
+        for (var j = 0; j < out.length; j++) {
+          if (out[j].name === b[i].name && CogCore._cortexSameArgs(out[j].args, b[i].args)) { dup = true; break; }
+        }
+        if (!dup) out.push(b[i]);
+      }
+      return out;
+    },
+
+    _cortexSameArgs: function (x, y) {
+      try { return JSON.stringify(x) === JSON.stringify(y); } catch (e) { return false; }
+    },
+
+    /* Gate a Needle reply and fold the verdict into `out`. The Phase 7 validator is the gate:
+       ok + at least one sanitized call + a numeric confidence >= minConfidence, or nothing. */
+    _cortexApplyRepair: function (res, out, detCalls, allowedTools, minConf, deps, client) {
+      var resCalls = (res && Array.isArray(res.calls)) ? res.calls : [];
+      var conf = (res && typeof res.confidence === 'number') ? res.confidence : null;  /* NaN stays below */
+      var harness = CogCore._cortexNeedleCalls(resCalls, out.trace_id);
+      var gate = CogCore.validateStructuredOutput(harness, allowedTools);
+      var degradedRes = !!(res && (res.ok === false || res.degraded));
+      var confOk = (typeof conf === 'number' && conf >= minConf);
+
+      if (!degradedRes && gate.ok && gate.sanitized.length > 0 && confOk) {
+        out.source = 'needle';
+        out.accepted = true;
+        out.confidence = conf;
+        out.calls = CogCore._cortexMergeCalls(detCalls, gate.sanitized);
+        out.unrepairable = [];          /* the successful repair RESOLVES the suspects */
+        out.degraded = false;
+        out.reason = '';
+        out.changed = out.changed.concat(['needle repaired ' + gate.sanitized.length + ' rite(s)']);
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'accepted');
+        return out;
+      }
+
+      out.calls = detCalls.slice();
+      out.source = detCalls.length ? 'deterministic' : 'original';
+      out.accepted = detCalls.length > 0;
+      out.confidence = conf;
+      out.degraded = degradedRes;
+      out.reason = degradedRes ? 'degraded'
+        : (resCalls.length === 0 ? 'empty' : (!gate.ok ? 'invalid' : 'below_threshold'));
+      CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+      return out;
+    },
+
+    /* Fire-and-forget ledger outcome. The client already never rejects; do not rely on that —
+       and NEVER await it (the ledger must not delay or hang the turn). */
+    _cortexPostOutcome: function (deps, client, traceId, action) {
+      try {
+        var c = (client && typeof client.outcome === 'function') ? client
+          : ((deps && deps.client && typeof deps.client.outcome === 'function') ? deps.client : null);
+        if (!c) return;
+        var p = c.outcome({ trace_id: traceId, action: action });
+        if (p && typeof p.then === 'function') p.then(function () {}, function () {});
+      } catch (e) { /* the ledger is a nicety; it must never break the turn */ }
+    },
+
+    /* ================= PHASE 13 — LAYA GATES (F2) =================
+     * `cortexLayaGates(plan, deps)` — the single seam the agent turn uses to ask the local
+     * "System 1" Laya model TWO batched questions, both FAIL-OPEN:
+     *   - F2a PRE-FLIGHT (outbound): is each MUTATING rite's arguments plausibly valid for that
+     *     tool's schema? Below `laya.minConfidence` ⇒ the index is returned in `held` and the
+     *     caller must NOT dispatch it (it pushes a role:'tool' correction instead). Absence of
+     *     evidence (missing / non-numeric / null `noul`) is NOT a refusal — never hold on a
+     *     missing answer.
+     *   - F2b REPLY-ANOMALY (inbound): does a prose-only reply look like an error page, a
+     *     refusal, or a degenerate loop? At or above threshold ⇒ `anomaly.flagged:true`. The
+     *     reply CONTENT is never rewritten or deleted.
+     *
+     * Local inference is NEVER in the critical path: sidecar down / disabled / slow / lying ⇒
+     * fail open, nothing held, no flag, and the caller behaves byte-identically to Phase 12.
+     * Exactly ONE `/decide` request is issued per call — the pre-flight and anomaly questions
+     * are BATCHED into one payload, and BOTH kinds of question can never be present at once
+     * (a model reply is either dispatchable [pre-flight] or prose-only [anomaly]).
+     *
+     *   plan = { mutating:[{index,name,args,description?,parameters?}],  // not-read-only calls
+     *            prose:boolean,                                          // no dispatchable calls
+     *            utterance?:string,
+     *            reply:{toolCalls:[...], content:'...'} }
+     *   deps = { client, settings, traceId, timeout }
+     *
+     * Returns a plain object on every non-probing path, and a Promise when it actually probes,
+     * so `await cortexLayaGates(...)` is always correct and a no-deps caller stays synchronous.
+     *
+     *   {ok, degraded, reason, trace_id,
+     *    held:[<index into plan.mutating>...],      // pre-flight refusals
+     *    anomaly:null | {flagged:boolean, prob:number|null},
+     *    answers:null | {<key>:...},                // raw answers (ledger note / tests)
+     *    questions:{<key>:...},                     // EXACTLY what was sent ({} when nothing sent)
+     *    latency_ms}
+     *
+     * The `/decide` payload contains only `{state, questions, trace_id}` — never `settings`,
+     * never an API key, and NO `Authorization` header is ever sent.
+     */
+    cortexLayaGates: function (plan, deps) {
+      var out = {
+        ok: true, degraded: false, reason: '', trace_id: '',
+        held: [], anomaly: null, answers: null, questions: {}, latency_ms: 0
+      };
+      try {
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        out.trace_id = CogCore._cortexTraceId(deps);
+        plan = (plan && typeof plan === 'object') ? plan : {};
+        var lm = CogCore._cortexLmSettings(deps.settings);
+        var laya = lm.laya || {};
+        var client = (deps.client && typeof deps.client.decide === 'function') ? deps.client : null;
+
+        /* Rule 1 — probe only when opted in AND a usable client exists; otherwise ZERO I/O. */
+        if (lm.enabled === false || laya.enabled === false || !client) return out;
+
+        var questions = CogCore._layaQuestions(plan, laya);
+        out.questions = questions;
+        if (!Object.keys(questions).length) return out;   /* nothing to ask ⇒ do not call /decide */
+
+        var ms = (typeof laya.timeoutMs === 'number' && isFinite(laya.timeoutMs) && laya.timeoutMs > 0) ? laya.timeoutMs : 500;
+        var minConf = (typeof laya.minConfidence === 'number' && isFinite(laya.minConfidence)) ? laya.minConfidence : 0.70;
+
+        var payload = { state: CogCore._layaState(plan), questions: questions, trace_id: out.trace_id };
+
+        var probe;
+        try { probe = client.decide(payload); }
+        catch (e) { probe = Promise.reject(e); }
+        if (!probe || typeof probe.then !== 'function') probe = Promise.resolve(probe);
+
+        /* Bounded by OUR OWN timer via the EXISTING Phase 12 race helper (never a second one). */
+        var raced = CogCore._cortexRace(probe, ms, deps.timeout);
+        return raced.then(function (r) {
+          try {
+            if (r && r.expired) {
+              out.ok = false; out.degraded = true; out.reason = 'timeout';
+              out.held = []; out.anomaly = null;
+              CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+              return out;
+            }
+            return CogCore._cortexApplyLaya(r ? r.value : null, out, plan, minConf, deps, client);
+          } catch (e) {
+            out.ok = false; out.degraded = true; out.reason = 'error';
+            out.held = []; out.anomaly = null;
+            return out;
+          }
+        });
+      } catch (e) {
+        out.ok = false; out.degraded = true; out.reason = 'error';
+        out.held = []; out.anomaly = null; out.answers = null;
+        return out;
+      }
+    },
+
+    /* ---- Phase 13 internals (pure except for the injected client) ---- */
+
+    /* Build the batched `questions` map for a turn. Empty when the operator disabled the
+       relevant gate, when there is nothing to ask, or when a reply is neither mutating nor
+       prose-only. Both kinds are mutually exclusive by construction (see the seam comment). */
+    _layaQuestions: function (plan, laya) {
+      var q = {};
+      var mutating = (plan && Array.isArray(plan.mutating)) ? plan.mutating : [];
+      if (laya.preflight !== false && mutating.length) {
+        var pf = CogCore._layaPreflightQuestions(mutating);
+        for (var k in pf) if (Object.prototype.hasOwnProperty.call(pf, k)) q[k] = pf[k];
+      }
+      if (laya.anomaly !== false && plan && plan.prose === true) {
+        var content = '';
+        try { content = (plan.reply && plan.reply.content) || ''; } catch (e) { content = ''; }
+        q['anomaly'] = CogCore._layaAnomalyQuestion(content);
+      }
+      return q;
+    },
+
+    /* One `noul` question per mutating call: "do these arguments plausibly satisfy this tool's
+       schema?" Criteria carry the tool name, its schema description/parameters and the JSON
+       arguments under consideration. */
+    _layaPreflightQuestions: function (mutating) {
+      var q = {};
+      var list = Array.isArray(mutating) ? mutating : [];
+      for (var i = 0; i < list.length; i++) {
+        var m = list[i] || {};
+        var name = String(m.name === undefined || m.name === null ? '' : m.name);
+        var argsJson = '';
+        try { argsJson = JSON.stringify(m.args === undefined || m.args === null ? {} : m.args); }
+        catch (e) { argsJson = ''; }
+        q['pf_' + i] = {
+          type: 'noul',
+          instructions: 'Do these arguments plausibly satisfy the schema of the tool "' + name +
+            '"? Answer with the probability (0..1) that the call is well-formed and plausible for that tool.',
+          criteria: {
+            tool: name,
+            description: String(m.description === undefined || m.description === null ? '' : m.description),
+            parameters: (m.parameters && typeof m.parameters === 'object') ? m.parameters : null,
+            arguments: argsJson
+          }
+        };
+      }
+      return q;
+    },
+
+    /* The single reply-anomaly question. Carries the reply text verbatim; the local model only
+       returns a probability — it never gets to rewrite or delete anything. */
+    _layaAnomalyQuestion: function (content) {
+      return {
+        type: 'noul',
+        instructions: 'Does this machine reply look like an error page, a refusal, or a degenerate ' +
+          'loop rather than a real answer to the operator? Answer with the probability (0..1) that it is anomalous.',
+        criteria: { reply: String(content === undefined || content === null ? '' : content) }
+      };
+    },
+
+    /* A small, safe description of the turn for the sidecar's `state`. Best-effort only; it must
+       never throw and never carry anything but the turn's own content. */
+    _layaState: function (plan) {
+      var s = {};
+      try {
+        if (plan && plan.utterance !== undefined && plan.utterance !== null) s.utterance = String(plan.utterance);
+        var mut = (plan && Array.isArray(plan.mutating)) ? plan.mutating : [];
+        if (mut.length) {
+          s.tools = [];
+          for (var i = 0; i < mut.length; i++) {
+            var m = mut[i] || {};
+            s.tools.push({ name: String(m.name === undefined || m.name === null ? '' : m.name), arguments: m.args });
+          }
+        }
+        if (plan && plan.prose === true && plan.reply) s.reply = String(plan.reply.content || '');
+      } catch (e) { /* state is best-effort */ }
+      return s;
+    },
+
+    /* Score the batched response against `minConf` and post the fire-and-forget ledger action.
+       Pre-flight: `held` (below threshold). Anomaly: `flagged` (at or above threshold). A missing
+       / non-numeric / null `noul` is fail-open — it never holds and never flags. */
+    _cortexApplyLaya: function (res, out, plan, minConf, deps, client) {
+      var degradedRes = !!(res && (res.ok === false || res.degraded));
+      if (degradedRes) {
+        out.ok = false; out.degraded = true;
+        out.reason = String((res && res.reason) || 'degraded');
+        out.held = []; out.anomaly = null;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+      var answers = (res && res.answers && typeof res.answers === 'object' && !Array.isArray(res.answers)) ? res.answers : {};
+      out.answers = answers;
+      if (res && typeof res.latency_ms === 'number' && isFinite(res.latency_ms)) out.latency_ms = Math.round(res.latency_ms);
+
+      var held = [];
+      var mutating = (plan && Array.isArray(plan.mutating)) ? plan.mutating : [];
+      for (var i = 0; i < mutating.length; i++) {
+        var key = 'pf_' + i;
+        if (!Object.prototype.hasOwnProperty.call(out.questions, key)) continue;
+        var av = answers[key];
+        var noul = (av && typeof av.noul === 'number' && isFinite(av.noul)) ? av.noul : null;
+        if (noul !== null && noul < minConf) held.push(i);
+      }
+      out.held = held;
+
+      var an = null;
+      if (Object.prototype.hasOwnProperty.call(out.questions, 'anomaly')) {
+        var aa = answers['anomaly'];
+        var anoul = (aa && typeof aa.noul === 'number' && isFinite(aa.noul)) ? aa.noul : null;
+        an = { flagged: (anoul !== null && anoul >= minConf), prob: anoul };
+      }
+      out.anomaly = an;
+
+      var action = held.length ? 'rejected' : ((an && an.flagged) ? 'flagged' : 'accepted');
+      CogCore._cortexPostOutcome(deps, client, out.trace_id, action);
+      return out;
+    },
+
+    /* ================= PHASE 14 — CHEAP LOCAL DISPATCHER (F3) =================
+     * `cortexDispatch(plan, deps)` — the seam the agent turn calls ONCE per send, BEFORE the
+     * first big-model call, to ask the cheap local sidecar to PROPOSE a rite:
+     *
+     *   "the operator said 'inspect main.py' — which of the 6 allow-listed tools does that
+     *    mean, and with which arguments?"
+     *
+     * The whole point of the phase is to SPEND a large-model call only when the cheap one
+     * could not answer, and to never let the cheap one act on its own:
+     *  - the opt-in gate is HARD: `lm.enabled === false` OR `dispatcher.enabled === false` OR
+     *    no `client.selectTool` means ZERO `/select` requests — not a "cheap" probe. This is
+     *    the phase's hard gate and it must never be "improved" into a probe;
+     *  - a proposal is only ever a SUGGESTION. `readOnly` is decided by the INJECTED
+     *    `deps.isReadRite` callback (index.html ships its already-audited classifier) and
+     *    NEVER by the model's own claim — a proposal that labels `run_command` "readOnly"
+     *    is still mutating;
+     *  - `autoRun` requires readOnly AND both flags (`dispatcher.autoReadOnly` and the
+     *    harness-wide `settings.autoApproveRead`). A mutating proposal can NEVER have
+     *    `autoRun:true` whatever the flags say, so it always reaches the operator's proposal
+     *    card; and the card is the PROPOSAL's gate — `approveToolCall` remains the
+     *    EXECUTION gate, so even an ACCEPTed mutation is authorised the normal way;
+     *  - every proposal is re-gated by the UNCHANGED Phase 7 `validateStructuredOutput`
+     *    before the caller can dispatch it: the local model can neither widen the
+     *    allow-list nor invent a tool name;
+     *  - below/without a confidence, an empty `calls`, a degraded sidecar, a timeout or a
+     *    disabled dispatcher all yield `proposals:[]` and the turn proceeds exactly as it
+     *    would with the sidecar dead;
+     *  - the probe is bounded by `dispatcher.timeoutMs` through the EXISTING `_cortexRace`,
+     *    so local inference is never in the critical path.
+     *
+     *   plan = { utterance:string, tools:[ToolSchema] }
+     *   deps = { client, settings, traceId?, timeout?, isReadRite?, autoApproveRead? }
+     *
+     * Returns a plain object on every non-probing path and a Promise when it actually probes,
+     * so `await cortexDispatch(...)` is always correct and a no-deps caller stays synchronous
+     * and I/O-free (the same sync-or-async contract as `sanitizeReply` / `cortexLayaGates`).
+     *
+     *   {ok, degraded, reason, trace_id, canAutoRun, confidence, latency_ms,
+     *    proposals:[{id, name, args, readOnly, autoRun, confidence}]}
+     *
+     * The `/select` payload contains only `{input, candidates, trace_id}` — never settings,
+     * never an API key, and NO `Authorization` header is ever sent (the client guarantees it).
+     */
+    cortexDispatch: function (plan, deps) {
+      var out = {
+        ok: true, degraded: false, reason: '', trace_id: '',
+        canAutoRun: false, confidence: null, latency_ms: 0, proposals: []
+      };
+      try {
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        out.trace_id = CogCore._cortexTraceId(deps);
+        plan = (plan && typeof plan === 'object') ? plan : {};
+        var lm = CogCore._cortexLmSettings(deps.settings);
+        var disp = lm.dispatcher || {};
+        var client = (deps.client && typeof deps.client.selectTool === 'function') ? deps.client : null;
+
+        /* Rule 1 — the hard opt-in gate. Disabled means NO /select AT ALL. */
+        if (lm.enabled === false || disp.enabled === false || !client) {
+          out.reason = 'off';
+          return out;
+        }
+
+        /* Rule 2 — nothing to route ⇒ no probe (an empty utterance is not a question). */
+        var utterance = String(plan.utterance === undefined || plan.utterance === null ? '' : plan.utterance);
+        if (!utterance.trim()) { out.reason = 'no_input'; return out; }
+
+        var tools = Array.isArray(plan.tools) ? plan.tools : [];
+        var minConf = (typeof disp.minConfidence === 'number' && isFinite(disp.minConfidence)) ? disp.minConfidence : 0.75;
+        var ms = (typeof disp.timeoutMs === 'number' && isFinite(disp.timeoutMs) && disp.timeoutMs > 0) ? disp.timeoutMs : 800;
+        var payload = CogCore._cortexSelectPayload(utterance, tools, out.trace_id);
+
+        var probe;
+        try { probe = client.selectTool(payload); }
+        catch (e) { probe = Promise.reject(e); }
+        if (!probe || typeof probe.then !== 'function') probe = Promise.resolve(probe);
+
+        /* Bounded by OUR OWN timer via the EXISTING Phase 12 race helper. */
+        var raced = CogCore._cortexRace(probe, ms, deps.timeout);
+        return raced.then(function (r) {
+          try {
+            if (r && r.expired) {
+              out.ok = false; out.degraded = true; out.reason = 'timeout';
+              out.proposals = []; out.canAutoRun = false;
+              CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+              return out;
+            }
+            return CogCore._cortexApplySelect(r ? r.value : null, out, tools, minConf, deps, client);
+          } catch (e) {
+            out.ok = false; out.degraded = true; out.reason = 'error';
+            out.proposals = []; out.canAutoRun = false;
+            return out;
+          }
+        });
+      } catch (e) {
+        out.ok = false; out.degraded = true; out.reason = 'error';
+        out.proposals = []; out.canAutoRun = false;
+        return out;
+      }
+    },
+
+    /* ---- Phase 14 internals (pure except for the injected client) ---- */
+
+    /* Build the /select payload: the operator's own words, the compacted candidate schemas
+       (capped like every other cortex payload) and a trace id. NO settings, NO API key. */
+    _cortexSelectPayload: function (utterance, tools, traceId) {
+      var candidates = [];
+      try {
+        var list = Array.isArray(tools) ? tools.slice(0, 10) : [];
+        for (var i = 0; i < list.length; i++) candidates.push(CogCore._cortexCompactTool(list[i]));
+      } catch (e) { candidates = []; }
+      return {
+        input: String(utterance === undefined || utterance === null ? '' : utterance),
+        candidates: candidates,
+        trace_id: traceId
+      };
+    },
+
+    /*
+     * Does this call leave a REQUIRED argument present-but-BLANK?
+     *
+     * Found by the integrator's live probe against the REAL untuned Needle model, which
+     * really does answer `read_file {"path": ""}` at a real calibrated confidence. The
+     * Phase 7 validator checks an argument's presence and TYPE, and "" is a perfectly
+     * valid string, so such a proposal passes the gate — and an auto-run would have
+     * dispatched it to the bridge unattended. A read rite with no path is not a rite.
+     *
+     * This DOWNGRADES the proposal to the operator's card (a loss of auto-execution,
+     * never a discard): the operator still sees the tool, its arguments and its
+     * confidence, and can ACCEPT or IGNORE. Only STRING arguments are trimmed — a
+     * numeric 0, false or [] is a real value, and an absent OPTIONAL argument is fine.
+     * Never throws: an unknown tool or an unreadable schema means "not blank", which
+     * leaves the decision exactly where it was.
+     */
+    _cortexHasBlankRequired: function (name, args, allowedTools) {
+      try {
+        var list = Array.isArray(allowedTools) ? allowedTools : [];
+        var schema = null;
+        for (var i = 0; i < list.length; i++) {
+          var entry = list[i] || {};
+          var fn = (entry.function && typeof entry.function === 'object') ? entry.function : entry;
+          if (fn.name === name) { schema = fn.parameters || null; break; }
+        }
+        if (!schema || typeof schema !== 'object') return false;
+        var required = Array.isArray(schema.required) ? schema.required : [];
+        if (!required.length) return false;
+        var a = (args && typeof args === 'object' && !Array.isArray(args)) ? args : {};
+        for (var r = 0; r < required.length; r++) {
+          var v = a[required[r]];
+          if (typeof v === 'string' && v.trim() === '') return true;
+        }
+        return false;
+      } catch (e) { return false; }
+    },
+
+    /* Score a /select reply. The Phase 7 validator is the gate: a local proposal that fails
+       it is DISCARDED outright (`invalid`) — the cheap model can never widen the allow-list,
+       invent a name or drop a required argument. Confidence is never invented: a missing,
+       null or non-finite value is below threshold. `readOnly`/`autoRun` are decided HERE (in
+       the pure seam) so the decision is unit-testable without a browser. */
+    _cortexApplySelect: function (res, out, allowedTools, minConf, deps, client) {
+      var resCalls = (res && Array.isArray(res.calls)) ? res.calls : [];
+      var conf = (res && typeof res.confidence === 'number' && isFinite(res.confidence)) ? res.confidence : null;
+      var degradedRes = !!(res && (res.ok === false || res.degraded));
+      if (res && typeof res.latency_ms === 'number' && isFinite(res.latency_ms)) out.latency_ms = Math.round(res.latency_ms);
+      out.confidence = conf;
+
+      if (degradedRes) {
+        out.ok = false; out.degraded = true;
+        out.reason = String((res && res.reason) || 'degraded');
+        out.proposals = []; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+
+      /* Reuse the EXACT normaliser the Needle seam uses: it mints ids and speaks the
+         harness's {id,name,args} shape. Never introduce an `arguments` field — every shipped
+         consumer (safeToolArgs, isReadRite, the validator) reads `args`. */
+      var harness = CogCore._cortexNeedleCalls(resCalls, out.trace_id);
+      var gate = CogCore.validateStructuredOutput(harness, allowedTools);
+      var confOk = (conf !== null && conf >= minConf);
+
+      if (resCalls.length === 0) {
+        out.proposals = []; out.reason = 'empty'; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+      if (!gate.ok || gate.sanitized.length === 0) {
+        out.proposals = []; out.reason = 'invalid'; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+      if (!confOk) {
+        out.proposals = []; out.reason = 'below_threshold'; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+
+      /* Accepted. Now — and only now — decide read-only vs mutating. The classifier is
+         INJECTED; with no classifier supplied nothing is ever read-only, so a caller that
+         forgets to pass one gets the safe (card-everything) behaviour, not auto-execution. */
+      var isRead = (typeof deps.isReadRite === 'function') ? deps.isReadRite : function () { return false; };
+      var lm = CogCore._cortexLmSettings(deps.settings);
+      var disp = lm.dispatcher || {};
+      out.canAutoRun = (disp.autoReadOnly !== false) && (deps.autoApproveRead !== false);
+
+      var proposals = [];
+      for (var i = 0; i < gate.sanitized.length; i++) {
+        var c = gate.sanitized[i];
+        var readOnly = false;
+        try { readOnly = !!isRead(c.name, c.args); } catch (e) { readOnly = false; }
+        proposals.push({
+          id: c.id, name: c.name, args: c.args,
+          readOnly: readOnly,
+          /* A mutating proposal can NEVER auto-run, whatever the flags say. */
+          autoRun: (readOnly && out.canAutoRun &&
+            !CogCore._cortexHasBlankRequired(c.name, c.args, allowedTools)),
+          confidence: conf
+        });
+      }
+      out.proposals = proposals;
+      out.reason = '';
+      var anyAuto = false;
+      for (var k = 0; k < proposals.length; k++) if (proposals[k].autoRun) { anyAuto = true; break; }
+      CogCore._cortexPostOutcome(deps, client, out.trace_id, anyAuto ? 'accepted' : 'passed_through');
+      return out;
+    },
+
+    /* ================= PHASE 15 — INCREMENTAL (STREAMING) DETECTION =================
+     * `cortexStreamDetect(acc, deps)` — the CHEAP half of Phase 15, run against the deltas
+     * that have ACCUMULATED SO FAR, never against a finished reply.
+     *
+     * WHY this exists. `sanitizeReply` only runs when the stream is over, so a malformed call
+     * costs the operator the whole round-trip: read the whole reply, THEN ask the local model
+     * what the broken call meant. By then the answer is too late to save any latency. The
+     * cheap deterministic checks (name reconciliation + a JSON-prefix scan) can tell that a
+     * call is already broken from the first delta that carries a name, so the ONE repair probe
+     * this turn is allowed can be in flight while the rest of the reply is still streaming.
+     *
+     * The hard constraints, all of which the caller owns and this function only enables:
+     *  - it NEVER awaits, and returns a PLAIN OBJECT (never a promise), so `pumpSSE` cannot be
+     *    delayed by it even by accident;
+     *  - it never buffers the stream: it reads the accumulator it is handed and nothing else;
+     *  - `alreadyProbed` is the caller's per-turn latch. At most one probe per turn is a
+     *    property of the CALLER (index.html), not of this function — it only honours the latch
+     *    it is given, so the cheap stage stays first and one broken call cannot spend two
+     *    model calls;
+     *  - the started probe is fire-and-forget and comes back as `probe`, a promise that
+     *    ALWAYS resolves (never rejects) so the caller can attach whatever late/timeout
+     *    bookkeeping it likes without risking an unhandled rejection;
+     *  - it only STARTS a probe. It never applies, gates or dispatches anything: the result is
+     *    consumed at the turn's `finalizeToolCalls`/`sanitizeReply` point, where the unchanged
+     *    Phase 7 validator is still the gate.
+     *
+     *   acc  = the accumulator the stream pump has built: {toolCalls:[{id,name,args}], ...}
+     *   deps = { allowedTools, client, settings, alreadyProbed?, traceId? }
+     *
+     *   { ok, degraded, reason, trace_id, sawCall, suspects:[{name,args,reason}],
+     *     probeStarted:boolean, probe:null|Promise, payload:null|object }
+     *
+     * `reason` is one of: 'off' (not opted in / no client / already spent this turn's latch),
+     * 'already_probed', 'clean' (every call so far is well-formed), 'still_streaming' (a call
+     * is half-arrived but nothing is broken YET), 'error', or 'suspect'.
+     */
+    cortexStreamDetect: function (acc, deps) {
+      var out = {
+        ok: true, degraded: false, reason: '', trace_id: '',
+        sawCall: false, suspects: [], probeStarted: false, probe: null, payload: null
+      };
+      try {
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        out.trace_id = CogCore._cortexTraceId(deps);
+        var lm = CogCore._cortexLmSettings(deps.settings);
+        var san = lm.sanitizer || {}, nd = lm.needle || {};
+        var mode = (san.mode === undefined || san.mode === null) ? 'auto' : String(san.mode);
+        var client = (deps.client && typeof deps.client.repair === 'function') ? deps.client : null;
+
+        /* Rule 1 — the hard opt-in gate. Anything off means ZERO requests, not a cheap probe.
+           The deterministic stage is not negotiable: a caller that turned it off has said the
+           plain-code pass is the only pass. */
+        if (lm.enabled === false || san.enabled === false || nd.enabled === false ||
+            san.deterministicPass === false || mode === 'off' || !client) {
+          out.reason = 'off';
+          return out;
+        }
+        /* Rule 2 — the per-turn latch. One repair probe per turn, not per delta and not per
+           tool call; the CALLER owns the latch so it also covers the end-of-stream path. */
+        if (deps.alreadyProbed === true) {
+          out.reason = 'already_probed';
+          return out;
+        }
+
+        var slots = (acc && Array.isArray(acc.toolCalls)) ? acc.toolCalls : [];
+        if (!slots.length) { out.reason = 'clean'; return out; }
+        out.sawCall = true;
+        var names = CogCore._toolSpec(deps.allowedTools).names;
+
+        var waiting = false;
+        for (var i = 0; i < slots.length; i++) {
+          var slot = slots[i];
+          if (!slot || typeof slot !== 'object') continue;
+          if (!slot.name) { waiting = true; continue; }   /* the name has not arrived yet */
+
+          /* A name that reconciles to nothing allowed, or to two equally-close names, is
+             broken the moment it lands — no later delta can repair it. */
+          var nr = CogCore._cortexReconcileName(slot.name, names);
+          if (nr.reason) {
+            out.suspects.push({ id: String(slot.id || ''), name: String(slot.name), args: slot.args, reason: nr.reason });
+            continue;
+          }
+
+          /* Arguments: the deterministic parser first (fences, trailing commas, truncation,
+             double-encoding). Only what plain code CANNOT fix is a candidate, and of that only
+             what no future delta can fix — a merely half-arrived object is still_streaming. */
+          var pa = CogCore._cortexParseArgs(slot.args);
+          if (pa.ok) continue;
+          var state = CogCore._cortexJsonPrefix(slot.args);
+          if (state !== 'malformed') { waiting = true; continue; }
+          out.suspects.push({ id: String(slot.id || ''), name: String(slot.name), args: slot.args, reason: 'malformed arguments: ' + pa.reason });
+        }
+
+        if (!out.suspects.length) {
+          out.reason = waiting ? 'still_streaming' : 'clean';
+          return out;
+        }
+
+        out.payload = CogCore._cortexRepairPayload(null, deps.allowedTools, out.suspects, out.trace_id);
+        var probe;
+        try { probe = client.repair(out.payload); }
+        catch (e) { probe = Promise.reject(e); }
+        /* Never let a hostile transport turn the fire-and-forget probe into an unhandled
+           rejection in the caller's turn. */
+        out.probe = Promise.resolve(probe).then(function (v) { return v; }, function (e) {
+          return { ok: false, degraded: true, error: String((e && e.message) || e) };
+        });
+        out.probeStarted = true;
+        out.reason = 'suspect';
+        return out;
+      } catch (e) {
+        out.ok = false; out.degraded = true; out.reason = 'error';
+        out.suspects = []; out.probeStarted = false; out.probe = null; out.payload = null;
+        return out;
+      }
+    },
+
+    /**
+     * Classify a partially-arrived arguments text: can MORE deltas still complete it?
+     *   'complete'   — a whole JSON value; nothing more is coming and nothing is broken.
+     *   'partial'    — still extendable (`{"path":"mai`): wait for the next delta.
+     *   'malformed'  — appending more characters can NEVER make this valid JSON (a missing
+     *                  colon, single quotes, an extra closer, a literal that is not `true`):
+     *                  the deterministic pass will not fix it and neither will more stream.
+     * A single forward scan — no second copy of the text, no allocation beyond the result, and
+     * it never throws (an unreadable text is `malformed`, which is the fail-safe direction: the
+     * end-of-stream path is unchanged either way).
+     */
+    _cortexJsonPrefix: function (text) {
+      try {
+        var s = String(text === null || text === undefined ? '' : text);
+        var n = s.length, i = 0, k, c, r;
+
+        var ws = function () {
+          while (i < n) { c = s.charAt(i); if (c === ' ' || c === '\t' || c === '\n' || c === '\r') i++; else break; }
+        };
+        var lit = function (w) {
+          for (k = 0; k < w.length; k++) {
+            if (i >= n) return 0;                     /* ran out mid-literal: still partial */
+            if (s.charAt(i) !== w.charAt(k)) return -1;
+            i++;
+          }
+          return 1;
+        };
+        var str = function () {
+          i++;                                        /* the opening quote */
+          while (i < n) {
+            c = s.charAt(i);
+            if (c === '\\') { if (i + 1 >= n) { i = n; return 0; } i += 2; continue; }
+            if (c === '"') { i++; return 1; }
+            /* A raw newline inside a JSON string is never legal and no later delta can
+               close it, so this is as terminal as a missing colon. */
+            if (c === '\n' || c === '\r') return -1;
+            i++;
+          }
+          return 0;
+        };
+        var num = function () {
+          var st = i;
+          if (s.charAt(i) === '-') i++;
+          while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+          if (i < n && s.charAt(i) === '.') { i++; while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++; }
+          if (i < n && (s.charAt(i) === 'e' || s.charAt(i) === 'E')) {
+            i++;
+            if (s.charAt(i) === '+' || s.charAt(i) === '-') i++;
+            while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+          }
+          if (i > st) return 1;
+          return (i >= n) ? 0 : -1;
+        };
+        var value = function () {
+          ws();
+          if (i >= n) return 0;
+          c = s.charAt(i);
+          if (c === '{') return object();
+          if (c === '[') return array();
+          if (c === '"') return str();
+          if (c === 't') return lit('true');
+          if (c === 'f') return lit('false');
+          if (c === 'n') return lit('null');
+          if (c === '-' || (c >= '0' && c <= '9')) return num();
+          return -1;
+        };
+        var object = function () {
+          i++; ws();
+          if (i >= n) return 0;
+          if (s.charAt(i) === '}') { i++; return 1; }
+          for (;;) {
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) !== '"') return -1;       /* a key must be a quoted string */
+            r = str(); if (r !== 1) return r;
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) !== ':') return -1;       /* the classic missing colon */
+            i++;
+            r = value(); if (r !== 1) return r;
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) === ',') { i++; continue; }
+            if (s.charAt(i) === '}') { i++; return 1; }
+            return -1;
+          }
+        };
+        var array = function () {
+          i++; ws();
+          if (i >= n) return 0;
+          if (s.charAt(i) === ']') { i++; return 1; }
+          for (;;) {
+            r = value(); if (r !== 1) return r;
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) === ',') { i++; continue; }
+            if (s.charAt(i) === ']') { i++; return 1; }
+            return -1;
+          }
+        };
+
+        r = value();
+        if (r === 0) return 'partial';
+        if (r < 0) return 'malformed';
+        ws();
+        return (i < n) ? 'malformed' : 'complete';    /* trailing junk: an extra `}` etc. */
+      } catch (e) { return 'malformed'; }
+    },
+
+    /**
+     * `_cortexStreamSettle(turn, deps)` — consume the turn's ONE early probe at the moment the
+     * turn decides (the `finalizeToolCalls`/`sanitizeReply` point). The caller owns `turn`:
+     *
+     *   turn = { probe, trace_id, settled:false, value:null, decided:false,
+     *            discarded:false, ledgered:false }
+     *
+     * Returns `{present:false}` as a PLAIN OBJECT when the turn never spent a probe (so a
+     * no-cortex turn is byte-identical and synchronous), otherwise
+     * `{present:true, expired, value, trace_id, ledgered}`.
+     *
+     * The rules this encodes, in the order they matter:
+     *  - an already-settled probe is handed over SYNCHRONOUSLY — the common case costs no
+     *    await at all, which is what keeps the streaming path free of extra microtask turns;
+     *  - a probe still in flight is awaited through the EXISTING `_cortexRace`, bounded by
+     *    `needle.timeoutMs`, so a hanging sidecar can never hang a turn;
+     *  - `alreadyDecided:true` (the caller already moved on) takes NOTHING out of a straggler
+     *    and ledgers it via `_cortexStreamLate`: too late to matter, and never 'accepted';
+     *  - a probe is ledgered AT MOST ONCE. The expiry posts `timeout` here and marks the turn,
+     *    so the value landing afterwards is a discard, not a second line in the operator's
+     *    ledger.
+     */
+    _cortexStreamSettle: function (turn, deps) {
+      try {
+        if (!turn || !turn.probe) return { present: false };
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        var traceId = String(turn.trace_id || CogCore._cortexTraceId(deps));
+        var client = (deps.client && typeof deps.client.repair === 'function') ? deps.client : null;
+
+        /* The turn already decided without this probe: whatever lands now is discarded. */
+        if (deps.alreadyDecided === true) {
+          turn.decided = true;
+          turn.discarded = true;
+          CogCore._cortexStreamLate(turn, deps);
+          return { present: true, expired: true, value: null, trace_id: traceId };
+        }
+
+        turn.decided = true;
+        if (turn.settled === true) {
+          turn.discarded = true;      /* consumed: a re-read must be a no-op, not a second ledger */
+          return { present: true, expired: false, value: turn.value, trace_id: traceId, ledgered: false };
+        }
+
+        var nd = CogCore._cortexLmSettings(deps.settings).needle || {};
+        var ms = (typeof nd.timeoutMs === 'number' && isFinite(nd.timeoutMs) && nd.timeoutMs > 0) ? nd.timeoutMs : 800;
+        var p = turn.probe;
+
+        /* Watch the arrival the moment we start waiting: if it lands AFTER the race expired the
+           turn is already discarded, and that straggler is ledgered (once) as a non-accepting
+           outcome instead of vanishing silently. */
+        if (p && typeof p.then === 'function') {
+          p.then(function (v) {
+            turn.settled = true; turn.value = v;
+            if (turn.discarded) CogCore._cortexStreamLate(turn, deps);
+          }, function () {
+            turn.settled = true;
+            if (turn.discarded) CogCore._cortexStreamLate(turn, deps);
+          });
+        }
+
+        return CogCore._cortexRace(p, ms, deps.timeout).then(function (r) {
+          turn.discarded = true;
+          if (r && r.expired) {
+            turn.ledgered = true;
+            CogCore._cortexPostOutcome(deps, client, traceId, 'timeout');
+            return { present: true, expired: true, value: null, trace_id: traceId, ledgered: true };
+          }
+          var v = r ? r.value : null;
+          turn.settled = true; turn.value = v; turn.ledgered = true;
+          return { present: true, expired: false, value: v, trace_id: traceId, ledgered: true };
+        });
+      } catch (e) { return { present: false }; }
+    },
+
+    /**
+     * Ledger a probe result the turn could not use. Fire-and-forget, at most ONE line per
+     * probe, and the action word is taken from the EXISTING vocabulary rather than invented:
+     * `passed_through` is exactly what happened — the turn decided on the original reply and
+     * this answer changed nothing. Never `accepted`: nothing from a discarded result is ever
+     * dispatched. Never throws: the ledger is a nicety, not a gate.
+     */
+    _cortexStreamLate: function (turn, deps) {
+      try {
+        if (!turn || turn.ledgered === true) return false;
+        turn.ledgered = true;
+        var client = (deps && deps.client && typeof deps.client.outcome === 'function') ? deps.client : null;
+        if (!client) return false;
+        var p = client.outcome({ trace_id: String(turn.trace_id || ''), action: 'passed_through' });
+        if (p && typeof p.then === 'function') p.then(function () {}, function () {});
+        return true;
+      } catch (e) { return false; }
+    },
+
+    /**
      * providerProfileStore — persisted list of provider endpoint profiles.
      * DOM-free. Operates over an injected storage adapter that satisfies
      * {getItem,setItem,removeItem} (localStorage in the browser, fake in tests).
-     * Profile shape: {id, name, backend, endpoint, model}.
-     * A profile is a saved snapshot of {backend, endpoint, model}; "applying" it
+     * Profile shape: {id, name, backend, endpoint, model, apiKey}.
+     * A profile is a saved snapshot of {backend, endpoint, model, apiKey}; "applying" it
      * returns that slice so the caller can rewrite the live settings.
      */
     profileStore: {
@@ -206,12 +1983,14 @@
       /** Insert (no id) or update in place (with id). Returns the saved profile. */
       save: function (storage, profile) {
         var a = this._read(storage);
+        var existing = (profile && profile.id) ? this.get(storage, profile.id) : null;
         var rec = {
           id: profile && profile.id ? profile.id : CogCore.uid(),
           name: String((profile && profile.name) || '').trim() || 'UNNAMED PROFILE',
           backend: (profile && profile.backend) || 'auto',
           endpoint: (profile && profile.endpoint) || '',
-          model: (profile && profile.model) || ''
+          model: (profile && profile.model) || '',
+          apiKey: profile && profile.apiKey !== undefined ? String(profile.apiKey) : (existing ? String(existing.apiKey || '') : '')
         };
         var i = a.findIndex(function (p) { return p.id === rec.id; });
         if (i >= 0) a[i] = rec; else a.push(rec);

@@ -8,7 +8,8 @@ Run this INSIDE the project directory you want the agent to operate on:
     python bridge.py --port 9000
     python bridge.py --allow-git-write   # permit git add/commit/restore/...
     python bridge.py --allow-exec        # permit run_command (DANGEROUS)
-    python bridge.py --allow-any-origin  # disable localhost/null Origin guard
+    python bridge.py --allow-any-origin  # disable the Origin guard entirely
+    python bridge.py --allow-file-origin # trust a null Origin (file:// page)
 
 The frontend sends {name, arguments} to POST /tools/execute and gets back
 {ok: true, result: "..."} or {ok: false, error: "..."}.
@@ -39,7 +40,15 @@ ROOT = os.path.abspath(os.getcwd())
 ALLOW_EXEC = False
 ALLOW_GIT_WRITE = False
 ALLOW_ANY_ORIGIN = False
+ALLOW_FILE_ORIGIN = False
 PORT = 8931
+
+def origins_desc():
+    if ALLOW_ANY_ORIGIN:
+        return "ANY"
+    if ALLOW_FILE_ORIGIN:
+        return "localhost / null (file:// trusted)"
+    return "localhost only (null refused)"
 
 def jail(path):
     if not path:
@@ -215,8 +224,14 @@ class Handler(BaseHTTPRequestHandler):
         if ALLOW_ANY_ORIGIN:
             return True
         origin = self.headers.get("Origin")
-        if not origin or origin == "null":
+        if not origin:
+            # curl / native callers send no Origin at all.
             return True
+        if origin == "null":
+            # A browser sends "null" for a sandboxed iframe, a data:/blob:
+            # document, or a file:// page — i.e. any hostile page can get an
+            # opaque origin. Trust it only behind the explicit opt-in.
+            return ALLOW_FILE_ORIGIN
         low = origin.lower()
         return low.startswith("http://localhost:") or low.startswith("http://127.0.0.1:") or low in ("http://localhost", "http://127.0.0.1")
 
@@ -238,7 +253,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/").endswith("health"):
             self._json(200, {"ok": True, "root": ROOT, "port": PORT,
                              "allow_exec": ALLOW_EXEC, "allow_git_write": ALLOW_GIT_WRITE,
-                             "allow_any_origin": ALLOW_ANY_ORIGIN, "tools": sorted(TOOLS)})
+                             "allow_any_origin": ALLOW_ANY_ORIGIN, "allow_file_origin": ALLOW_FILE_ORIGIN,
+                             "origins": origins_desc(), "tools": sorted(TOOLS)})
         else:
             self._json(404, {"ok": False, "error": "unknown rite"})
     def do_POST(self):
@@ -268,23 +284,25 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[BRIDGE] %s\n" % (fmt % args))
 
 def main():
-    global ROOT, ALLOW_EXEC, ALLOW_GIT_WRITE, ALLOW_ANY_ORIGIN, PORT
+    global ROOT, ALLOW_EXEC, ALLOW_GIT_WRITE, ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN, PORT
     ap = argparse.ArgumentParser(description="Cogitator tool bridge")
     ap.add_argument("--root", default=os.getcwd(), help="project root jail (default: cwd)")
     ap.add_argument("--port", type=int, default=8931)
     ap.add_argument("--allow-exec", action="store_true", help="enable run_command tool")
     ap.add_argument("--allow-git-write", action="store_true", help="enable write git rites")
     ap.add_argument("--allow-any-origin", action="store_true", help="allow non-local web origins (not recommended)")
+    ap.add_argument("--allow-file-origin", action="store_true", help="trust a null Origin (file:// page) — not recommended")
     a = ap.parse_args()
     ROOT = os.path.abspath(a.root); ALLOW_EXEC = a.allow_exec
-    ALLOW_GIT_WRITE = a.allow_git_write; ALLOW_ANY_ORIGIN = a.allow_any_origin; PORT = a.port
+    ALLOW_GIT_WRITE = a.allow_git_write; ALLOW_ANY_ORIGIN = a.allow_any_origin
+    ALLOW_FILE_ORIGIN = a.allow_file_origin; PORT = a.port
     print("=" * 56)
     print(" COGITATOR BRIDGE v2 — the machine extends into the physical")
     print("   root       : %s" % ROOT)
     print("   port       : %d" % PORT)
     print("   git write  : %s" % ("ENABLED" if ALLOW_GIT_WRITE else "disabled (read-only)"))
     print("   exec       : %s" % ("ENABLED" if ALLOW_EXEC else "disabled"))
-    print("   origins    : %s" % ("ANY" if ALLOW_ANY_ORIGIN else "localhost / null only"))
+    print("   origins    : %s" % origins_desc())
     print("   health     : http://localhost:%d/health" % PORT)
     print("=" * 56)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

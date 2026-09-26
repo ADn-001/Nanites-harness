@@ -176,6 +176,9 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
 #agent-toggle{letter-spacing:.18em}
 #agent-toggle.on{color:var(--amber);border-color:rgba(255,179,71,.65);box-shadow:0 0 10px rgba(255,179,71,.18)}
 .rite-call{margin:0 12px 8px;padding:7px 9px;border-left:2px solid var(--amber);background:rgba(255,179,71,.06);color:var(--amber);font-size:11.5px;letter-spacing:.08em;white-space:pre-wrap;word-break:break-word}
+.cortex-note{margin:0 12px 8px;padding:6px 9px;border-left:2px solid var(--phos);background:rgba(0,255,157,.05);color:var(--phos);font-size:11px;letter-spacing:.10em;white-space:pre-wrap;word-break:break-word}
+.cortex-note.degraded{border-left-color:var(--danger);background:rgba(255,71,71,.05);color:var(--danger)}
+.cortex-note.warn{border-left-color:var(--amber);background:rgba(255,176,0,.05);color:var(--amber)}
 .msg.rite-result{border-color:rgba(255,179,71,.4);background:rgba(255,179,71,.025)}
 .msg.rite-result .msg-head{color:var(--amber);border-color:rgba(255,179,71,.25)}
 .msg.rite-result .msg-body{color:#ffd99a;font-size:12.5px}
@@ -296,6 +299,10 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
         <input id="set-endpoint" placeholder="https://xxxx.trycloudflare.com">
         <button class="tbtn" id="test-conn">TEST</button>
       </div>
+      <div class="row" style="margin-top:6px">
+        <input id="set-apikey" type="password" placeholder="API KEY (bearer, optional for OpenAI-compatible endpoints)">
+        <button class="tbtn" id="api-key-eye" title="show/hide API key">&nbsp;&#128065;&nbsp;</button>
+      </div>
       <div id="test-result" style="font-size:10px;margin-top:4px;letter-spacing:.15em"></div>
     </div>
     <div class="field">
@@ -360,6 +367,30 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
     <div class="field chk"><input id="set-agent" type="checkbox"><label for="set-agent" style="margin:0">&#9763; AGENT MODE — MACHINE-SPIRIT MAY INVOKE BRIDGE RITES</label></div>
     <div class="field chk"><input id="set-auto-read" type="checkbox" checked><label for="set-auto-read" style="margin:0">AUTO-AUTHORIZE READ-ONLY RITES (FILE READ / LIST / GREP / SAFE GIT INQUIRY)</label></div>
     <div class="field">
+      <label>LOCAL CORTEX — SIDECAR 127.0.0.1 / NEEDLE + LAYA (OPT-IN, LOCAL ONLY)</label>
+      <div style="font-size:9.5px;color:var(--phos-dim);letter-spacing:.12em;line-height:1.8;margin-bottom:6px">
+        NEEDLE AND LAYA ARE OPT-IN MODELS THAT RUN LOCALLY ON THIS MACHINE; THEY ARE OFF BY DEFAULT AND NOTHING BELOW REACHES THE NETWORK. WHILE "ENABLE LOCAL CORTEX" IS UNTICKED THE PAGE NEVER CONTACTS THE SIDECAR PORT AT ALL, AND THE HARNESS WORKS IDENTICALLY WHEN THE MODELS ARE ABSENT. A DEAD OR SILENT SIDECAR READS AS OFFLINE/DEGRADED AND FAILS OPEN — IT NEVER BLOCKS, NEVER THROWS, NEVER ASKS FOR AN API KEY.
+      </div>
+      <div class="field chk"><input id="set-lm-enabled" type="checkbox"><label for="set-lm-enabled" style="margin:0">ENABLE LOCAL CORTEX (OPT-IN — EVERYTHING BELOW IS OFF BY DEFAULT AND RUNS LOCALLY)</label></div>
+      <div class="field chk"><input id="set-lm-needle" type="checkbox"><label for="set-lm-needle" style="margin:0">NEEDLE — REPAIR MALFORMED TOOL CALLS (LOCAL, OPT-IN)</label></div>
+      <div class="field"><label>NEEDLE MIN CONFIDENCE (0—1, STEP .05)</label><input id="set-lm-needle-conf" type="number" min="0" max="1" step=".05" value="0.75"></div>
+      <div class="field"><label>NEEDLE TIMEOUT (MS)</label><input id="set-lm-needle-timeout" type="number" min="50" step="50" value="800"></div>
+      <div class="field chk"><input id="set-lm-laya" type="checkbox"><label for="set-lm-laya" style="margin:0">LAYA — PRE-FLIGHT + ANOMALY GATES (LOCAL, OPT-IN)</label></div>
+      <div class="field"><label>LAYA MIN CONFIDENCE (0—1, STEP .05)</label><input id="set-lm-laya-conf" type="number" min="0" max="1" step=".05" value="0.70"></div>
+      <div class="field"><label>LAYA TIMEOUT (MS)</label><input id="set-lm-laya-timeout" type="number" min="50" step="50" value="500"></div>
+      <div class="field chk"><input id="set-lm-laya-preflight" type="checkbox" checked><label for="set-lm-laya-preflight" style="margin:0">LAYA PRE-FLIGHT ON MUTATING RITES</label></div>
+      <div class="field chk"><input id="set-lm-laya-anomaly" type="checkbox" checked><label for="set-lm-laya-anomaly" style="margin:0">LAYA REPLY-ANOMALY FLAG</label></div>
+      <div class="field chk"><input id="set-lm-sanitizer" type="checkbox" checked><label for="set-lm-sanitizer" style="margin:0">DETERMINISTIC SANITIZER PASS (FREE — NO MODEL, ON BY DEFAULT)</label></div>
+      <div class="field chk"><input id="set-lm-dispatcher" type="checkbox"><label for="set-lm-dispatcher" style="margin:0">LOCAL DISPATCHER (CHEAP PRE-ROUTER — OPT-IN)</label></div>
+      <div class="field chk"><input id="set-lm-dispatcher-autoread" type="checkbox" checked><label for="set-lm-dispatcher-autoread" style="margin:0">AUTO-RUN READ-ONLY DISPATCHER PROPOSALS</label></div>
+      <div class="field"><label>DISPATCHER MIN CONFIDENCE (0—1, STEP .05)</label><input id="set-lm-dispatcher-conf" type="number" min="0" max="1" step=".05" value="0.75"></div>
+      <div class="field"><label>DISPATCHER TIMEOUT (MS)</label><input id="set-lm-dispatcher-timeout" type="number" min="50" step="50" value="800"></div>
+      <div class="field"><label>LOCAL CORTEX SIDECAR PORT (127.0.0.1 ONLY)</label><input id="set-lm-port" type="number" min="1" max="65535" value="8932"></div>
+      <div class="field"><label>LOCAL CORTEX LEDGER (APPEND-ONLY JSONL PATH, RELATIVE TO THE REPO)</label><input id="set-lm-ledger" type="text" value="var/local-models.jsonl"></div>
+      <div id="lm-status" style="font-size:10px;margin-top:6px;letter-spacing:.15em;color:var(--phos-dim)">LOCAL CORTEX: DISABLED</div>
+      <button class="tbtn" id="test-cortex" style="margin-top:6px">&#9881; PROBE LOCAL CORTEX</button>
+    </div>
+    <div class="field">
       <label>CANTICLE / SYSTEM PROMPT</label>
       <textarea id="set-sys" placeholder="You are a machine-spirit of the Adeptus Mechanicus..."></textarea>
     </div>
@@ -404,6 +435,25 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
   </div>
 </div>
 
+<div class="modal" id="cortex-proposal-modal">
+  <div class="modal-box">
+    <h2>&#11041; LOCAL CORTEX PROPOSAL</h2>
+    <div style="font-size:10px;color:var(--phos-dim);letter-spacing:.16em">THE CHEAP LOCAL MODEL SUGGESTS THIS RITE — IT CANNOT RUN IT ALONE</div>
+    <div style="display:flex;align-items:center;gap:10px;margin:8px 0">
+      <span id="cortex-proposal-kind" class="write">MUTATION</span>
+      <span id="cortex-proposal-name" style="letter-spacing:.15em"></span>
+    </div>
+    <div style="font-size:10px;color:var(--phos-dim);letter-spacing:.16em">ARGUMENTS</div>
+    <pre id="cortex-proposal-args"></pre>
+    <div id="cortex-proposal-conf" style="font-size:10.5px;color:var(--phos);letter-spacing:.12em"></div>
+    <div id="cortex-proposal-warning" style="font-size:10.5px;color:var(--amber);letter-spacing:.12em;line-height:1.7"></div>
+    <div class="modal-btns">
+      <button class="tbtn" id="cortex-proposal-ignore" style="color:var(--danger);border-color:rgba(255,59,59,.55)">&#10005; IGNORE — ASK THE BIG MODEL</button>
+      <button class="tbtn" id="cortex-proposal-accept" style="border-color:var(--phos)">&#10003; ACCEPT PROPOSAL</button>
+    </div>
+  </div>
+</div>
+
 <script src="appcore.js"></script>
 <script>
 "use strict";
@@ -412,17 +462,45 @@ const LS_CHATS='cogitator.chats', LS_SET='cogitator.settings', LS_ACTIVE='cogita
 const DEF_SETTINGS={endpoint:'',model:'',system:'',backend:'auto',
   temperature:0.7,topP:0.9,presence:0,frequency:0,ctxLimit:131072,compactAt:70,autoCompact:true,
   flashAttention:false,kvOffload:false,workdir:null,autoBridge:true,
-  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:''};
+  agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:'',apiKey:'',
+  localModels:{enabled:false,
+  needle:{enabled:false,minConfidence:0.75,confirmBand:[0.5,0.75],timeoutMs:800},
+  laya:{enabled:false,minConfidence:0.70,timeoutMs:500,preflight:true,anomaly:true},
+  sanitizer:{enabled:true,mode:'auto',deterministicPass:true},
+  dispatcher:{enabled:false,autoReadOnly:true,timeoutMs:800,minConfidence:0.75},
+  port:8932, ledger:'var/local-models.jsonl'}};
 let settings={...DEF_SETTINGS};
 try{Object.assign(settings,JSON.parse(localStorage.getItem(LS_SET)||'{}'));}catch(e){}
 try{settings.profiles=(window.CogCore&&CogCore.profileStore)?CogCore.profileStore.list(localStorage):(settings.profiles||[]);}catch(e){}
+/* LOCAL CORTEX normaliser — a partial/legacy/corrupt stored blob must NEVER leave
+   settings.localModels with undefined sub-objects (every later phase indexes into it). */
+function normLocalModels(v){
+  const d=DEF_SETTINGS.localModels;
+  const out=Object.assign({},d);
+  const src=(v&&typeof v==='object'&&!Array.isArray(v))?v:{};
+  for(const name of ['needle','laya','sanitizer','dispatcher']){
+    const base=d[name],got=src[name];
+    const sub=Object.assign({},base);
+    if(got&&typeof got==='object'&&!Array.isArray(got)){
+      for(const k in base){if(Object.prototype.hasOwnProperty.call(base,k)&&Object.prototype.hasOwnProperty.call(got,k))sub[k]=got[k];}
+    }
+    out[name]=sub;
+  }
+  if(typeof src.enabled==='boolean')out.enabled=src.enabled;
+  const p=(typeof src.port==='number')?src.port:parseInt(src.port,10);
+  if(typeof p==='number'&&isFinite(p)&&p>0)out.port=p;
+  if(typeof src.ledger==='string'&&src.ledger)out.ledger=src.ledger;
+  return out;
+}
+try{settings.localModels=normLocalModels(settings.localModels);}catch(e){settings.localModels=normLocalModels(null);saveSet();}
 let chats=[]; try{chats=JSON.parse(localStorage.getItem(LS_CHATS)||'[]');}catch(e){}
 let activeId=localStorage.getItem(LS_ACTIVE)||null;
 let abortCtl=null, generating=false, sidebarOpen=false, backendType='unknown';
 const $=id=>document.getElementById(id);
 const api=path=>{let e=(settings.endpoint||'').trim().replace(/\/+$/,'');return e+path;};
+const authHeaders=()=>{const k=(settings.apiKey||'').trim();return k?{'Authorization':'Bearer '+k}:{};};
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const tok=s=>Math.max(1,Math.ceil((s||'').length/4));
+const tok=s=>CogCore.tok(s);
 const fmtK=n=>n<1000?String(Math.round(n)):(n/1000).toFixed(1)+'k';
 function save(){try{localStorage.setItem(LS_CHATS,JSON.stringify(chats));}catch(e){console.warn('archive full',e);}}
 function saveSet(){try{localStorage.setItem(LS_SET,JSON.stringify(settings));}catch(e){console.warn('settings archive inaccessible',e);}}
@@ -497,6 +575,12 @@ function msgHTML(m,i){
     return `<div class="rite-call">&#9881; INVOKED RITE: ${esc(t.name||'unknown')} ${esc(args)}</div>`;
   }).join('');
   const body=isUser||isTool?esc(CogCore.contentText(m.content)):renderMd(m.content);
+  /* PHASE 12 — operator-visible LOCAL CORTEX note (a repaired rite, or a degraded probe).
+     Non-blocking: it never mutates the model's own text and never enters the request payload. */
+  const cortexNote=m.cortexNote?`<div class="cortex-note${m.cortexDegraded?' degraded':''}">${esc(m.cortexNote)}</div>`:'';
+  /* PHASE 13 — operator-visible Laya reply-anomaly chip (F2b). Flag only: the model's own text
+     (`.msg-body`) is never touched, and this note never enters the request payload. */
+  const cortexAnomaly=m.cortexAnomaly?`<div class="cortex-note warn" id="cortex-anomaly">${esc(m.cortexAnomaly)}</div>`:'';
   const msgs=active()?.messages||[];
   const caret=(generating&&i===msgs.length-1&&m.role==='assistant')?'<span class="caret"></span>':'';
   const acts=`<div class="acts">
@@ -504,7 +588,7 @@ function msgHTML(m,i){
     <span data-a="copy" data-i="${i}">&#10697; COPY</span>
     <span data-a="del" data-i="${i}" class="danger">&#10005; PURGE</span></div>`;
   return `<div class="msg ${m.role}${isTool?' rite-result':''}"><div class="msg-head"><span>${who}${isTool&&m.name?' // '+esc(m.name):''}</span>
-    <span class="spacer"></span><span>${ts}</span></div>${think}${invoked}
+    <span class="spacer"></span><span>${ts}</span></div>${think}${invoked}${cortexNote}${cortexAnomaly}
     <div class="msg-body" id="body-${i}">${body}${caret}</div>${acts}</div>`;
 }
 function renderMessages(){
@@ -548,7 +632,7 @@ ${code}</span>`;
 }
 function msgAction(a,i){
   const c=active();if(!c)return;
-  if(a==='copy'){navigator.clipboard?.writeText(c.messages[i].content);}
+  if(a==='copy'){navigator.clipboard?.writeText(CogCore.contentText(c.messages[i].content));}
   else if(a==='del'){c.messages.splice(i,1);save();renderMessages();renderList();}
   else if(a==='regen'){regenerate();}
 }
@@ -581,7 +665,7 @@ async function buildMessages(opts={}){
     if(listing!==null)workdirCtx={path:settings.workdir,listing:listing};
   }
   const sys=CogCore.buildSystemMessages({
-    system: settings.agent ? CogCore.buildAgentSystemPrompt({workdir:settings.workdir||'(the bound working directory)'}) : settings.system,
+    system: settings.agent ? CogCore.buildAgentSystemPrompt({workdir:settings.workdir||'(the bound working directory)',tools:TOOL_SCHEMAS}) : settings.system,
     summary: c.summary,
     workdirCtx: workdirCtx
   });
@@ -699,12 +783,69 @@ function mergeToolDelta(acc,t){
   acc.toolCalls=acc.toolCalls.filter(Boolean);
 }
 function newAcc(){return{content:'',thinking:'',toolCalls:[],_fallback:0};}
+/* PHASE 15 — INCREMENTAL DETECTION wiring.
+   `cortexTurn` is the ONE per-turn holder the stream pump and the end-of-stream stage share.
+   It is deliberately a module-level singleton rather than a pump argument: `pumpSSE` is called
+   from three places (callOpenAI, callOllamaNative, readSSE) and threading a mutable per-turn
+   object through all of them would change their signatures for no benefit.
+
+   It is ALWAYS null unless the current agent turn opted in, so a turn with the cortex absent
+   behaves exactly as it did before this phase: `cortexStreamTick` returns immediately, no
+   request is made, and `cortexSettle` yields `{present:false}`. */
+let cortexTurn=null;
+function cortexTurnBegin(client,settings){
+  /* One holder per turn, carrying the "already spent" latch. The latch lives here (not in
+     the seam) so the SAME probe budget covers both the early probe and the end-of-stream
+     stage — one model call per turn, whichever path spends it. */
+  cortexTurn={client:client,settings:settings,probe:null,settled:false,decided:false,
+    discarded:false,value:null,ledgered:false,trace_id:'',probed:false};
+  return cortexTurn;
+}
+function cortexTurnEnd(){cortexTurn=null;}
+/* Called from the stream pumps after deltas are merged. Returns nothing and awaits nothing:
+   a probe it starts is fire-and-forget, so visible tokens are never delayed by local
+   inference. Never throws — a detector fault must not break streaming. */
+function cortexStreamTick(acc){
+  try{
+    const t=cortexTurn;
+    if(!t||t.probed||!acc||!Array.isArray(acc.toolCalls)||!acc.toolCalls.length)return;
+    if(!CogCore||!CogCore.cortexStreamDetect)return;
+    const det=CogCore.cortexStreamDetect(acc,{allowedTools:TOOL_SCHEMAS,client:t.client,
+      settings:t.settings,alreadyProbed:t.probed,traceId:t.trace_id});
+    if(det&&det.probeStarted&&det.probe){
+      /* Fire-and-forget by contract: the promise is STASHED, never awaited here. Awaiting it
+         would make every visible token wait on a local model, and an `await` in this
+         non-async function is a page-level SyntaxError that takes the whole app down. */
+      t.probed=true;t.probe=det.probe;t.trace_id=det.trace_id||t.trace_id;
+    }
+  }catch(e){}
+}
+/* Consumed once, at the turn's decision point, immediately before the end-of-stream
+   `sanitizeReply` call. Returns a PLAIN `{present:false}` when there was no early probe, so
+   the no-cortex path stays byte-identical.
+
+   This is ASYNC on purpose: `_cortexStreamSettle` returns a PROMISE whenever it actually has
+   to wait for an in-flight probe, and a plain object on the no-wait paths. Awaiting handles
+   both. Reading `.present` off the returned value synchronously is the bug that shipped
+   first: the promise has no `present`, so every early probe looked absent and the turn spent
+   a SECOND `/repair` at the end-of-stream stage. */
+async function cortexSettle(turn,alreadyDecided){
+  try{
+    const t=turn||cortexTurn;
+    if(!t||!t.probe)return{present:false};
+    const r=await CogCore._cortexStreamSettle(t,{client:t.client,settings:t.settings,
+      alreadyDecided:!!alreadyDecided});
+    /* Hand `sanitizeReply` exactly the shape it folds. */
+    return(r&&r.present)?{present:true,trace_id:r.trace_id,value:r.value||null,expired:!!r.expired,
+      ledgered:!!r.ledgered}:{present:false};
+  }catch(e){return{present:false};}
+}
 function processStreamObject(j,acc){
   if(j.error){throw new Error(j.error.message||String(j.error));}
   if(j.type==='chat.end'&&j.result){
     for(const o of (j.result.output||[])){
       if(o.type==='reasoning')acc.thinking+=o.content||'';
-      if(o.type==='message')acc.content+=o.content||acc.content;
+      if(o.type==='message')acc.content+=o.content||'';
       for(const t of (o.tool_calls||[]))mergeToolDelta(acc,t);
     }
     return;
@@ -728,6 +869,9 @@ async function pumpSSE(body,acc,onDelta){
       if(!data||data==='[DONE]')continue;
       let j;try{j=JSON.parse(data);}catch(e){continue;}
       processStreamObject(j,acc);
+      /* PHASE 15 — cheap incremental detection on the ACCUMULATED deltas. Fire-and-forget:
+         it never awaits, so `onDelta` still fires on exactly the same schedule as before. */
+      cortexStreamTick(acc);
       onDelta&&onDelta(acc);
     }
   }
@@ -758,7 +902,7 @@ async function callModel(messages,options,nonStream,signal){
 async function callOpenAI(messages,options,nonStream,signal){
   const body={model:settings.model,messages,stream:!nonStream,...options};
   if(settings.agent){body.tools=TOOL_SCHEMAS;body.tool_choice='auto';}
-  const r=await fetch(api('/v1/chat/completions'),{method:'POST',headers:{'Content-Type':'application/json'},
+  const r=await fetch(api('/v1/chat/completions'),{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},
     signal:signal||undefined,body:JSON.stringify(body)});
   if(!r.ok)throw new Error('HTTP '+r.status);
   if(nonStream){
@@ -789,6 +933,8 @@ async function callOllamaNative(messages,options,nonStream,signal){
     const parts=buf.split('\n');buf=parts.pop()||'';
     for(const line of parts){if(!line.trim())continue;let j;try{j=JSON.parse(line);}catch(e){continue;}
       processOllamaObject(j,acc);
+      /* PHASE 15 — same cheap tick on the native Ollama line-delimited stream. */
+      cortexStreamTick(acc);
       const c=active();const m=c?.messages[c.messages.length-1];
       if(m){m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=acc.toolCalls;refreshLast();}
     }
@@ -804,7 +950,7 @@ async function readSSE(body,m){
   m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=acc.toolCalls;
   return acc;
 }
-async function fetchLMSModels(){const r=await fetch(api('/api/v1/models'),{signal:apiSig()});
+async function fetchLMSModels(){const r=await fetch(api('/api/v1/models'),{signal:apiSig(),headers:authHeaders()});
   if(!r.ok)return null;const d=await r.json();const arr=d.models||d.data||[];
   const names=arr.map(m=>typeof m==='string'?m:(m.id||m.key||m.model_key||m.name)).filter(Boolean);
   return names.length?names:null;}
@@ -815,17 +961,17 @@ function fetchBlocked(e){return e&&(e.name==='TypeError'||/failed to fetch|netwo
 async function detectBackend(){
   const errors=[];
   try{
-    const r=await fetch(api('/v1/models'),{signal:apiSig()});
+    const r=await fetch(api('/v1/models'),{signal:apiSig(),headers:authHeaders()});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const d=await r.json();
     const n=(Array.isArray(d.data)?d.data:[]).map(m=>m.id||m.name||m.model).filter(Boolean);
     if(!n.length)throw new Error('EMPTY MODEL LIST');
     let lms=false;
-    try{const q=await fetch(api('/api/v0/models'),{signal:apiSig()});if(q.ok){const qd=await q.json();if(qd&&qd.object==='list')lms=true;}}catch(e){}
+    try{const q=await fetch(api('/api/v0/models'),{signal:apiSig(),headers:authHeaders()});if(q.ok){const qd=await q.json();if(qd&&qd.object==='list')lms=true;}}catch(e){}
     return{backend:lms?'lmstudio':'openai',names:n};
   }catch(e){errors.push('/v1/models: '+(fetchBlocked(e)?'FETCH BLOCKED':(e.message||'NO RESPONSE')));}
   try{
-    const r=await fetch(api('/api/tags'),{signal:apiSig()});
+    const r=await fetch(api('/api/tags'),{signal:apiSig(),headers:authHeaders()});
     if(r.ok){const d=await r.json().catch(()=>null);
       const n=(d&&Array.isArray(d.models)?d.models:[]).map(m=>m.name).filter(Boolean);
       if(n.length)return{backend:'ollama',names:n};
@@ -907,6 +1053,8 @@ async function lmUnloadModel(){
 function safeToolArgs(tc){
   try{return typeof tc.args==='string'?JSON.parse(tc.args||'{}'):(tc.args||{});}catch(e){return{raw:tc.args||''};}
 }
+/* PHASE 13 — the operator's most recent transmission, for the Laya /decide `state`. Best-effort. */
+function lastUserText(c){try{for(let i=(c?.messages||[]).length-1;i>=0;i--){const m=c.messages[i];if(m&&m.role==='user')return CogCore.contentText(m.content);}}catch(e){}return '';}
 function isReadRite(name,args={}){
   if(['read_file','list_dir','grep'].includes(name))return true;
   if(name==='write_file'||name==='run_command')return false;
@@ -919,6 +1067,88 @@ function isReadRite(name,args={}){
   if(sub==='tag')return rest.every(a=>['-l','--list','-n','-n1','-n2','-n3','-n4','-n5','-n6','-n7','-n8','-n9','--no-color'].includes(a)||a.startsWith('-n')||a.startsWith('--sort=')||a.startsWith('--contains')||a.startsWith('--points-at'));
   if(sub==='stash')return rest[0]==='list'||rest[0]==='show';
   return FRONT_GIT_READ.has(sub);
+}
+/* PHASE 14 — LOCAL CORTEX PROPOSAL CARD.
+   The cheap local model can PROPOSE a rite but never authorise one. This modal is the
+   PROPOSAL's gate (a separate, mandatory gate from `approveToolCall`, which remains the
+   EXECUTION gate): every mutating proposal lands here, and only an explicit ACCEPT lets it
+   proceed down the UNCHANGED validator -> approveToolCall -> executeTool route. IGNORE (or
+   dismissing the card) means zero dispatch and the ordinary model call proceeds. */
+let proposalResolve=null;
+function settleCortexProposal(v){const r=proposalResolve;proposalResolve=null;const modal=$('cortex-proposal-modal');if(modal)modal.classList.remove('open');if(r)r(!!v);}
+function approveCortexProposal(p){
+  const args=(p&&typeof p.args==='object')?p.args:(()=>{try{return JSON.parse(p&&p.args)||{};}catch(e){return{};}})();
+  const read=isReadRite((p&&p.name)||'',args);
+  return new Promise(resolve=>{
+    proposalResolve=resolve;
+    const kind=$('cortex-proposal-kind'),name=$('cortex-proposal-name'),argBox=$('cortex-proposal-args'),
+          conf=$('cortex-proposal-conf'),warn=$('cortex-proposal-warning');
+    if(kind){kind.textContent=read?'READ-ONLY':'MUTATION';kind.className=read?'read':'write';}
+    if(name)name.textContent=(p&&p.name)||'unknown rite';
+    if(argBox)argBox.textContent=JSON.stringify(args,null,2);
+    const c=(p&&typeof p.confidence==='number')?Number(p.confidence).toFixed(2):'?';
+    if(conf)conf.textContent='LOCAL CORTEX CONFIDENCE: '+c;
+    if(warn)warn.textContent=read
+      ?'This rite only inspects the bound project. ACCEPT still routes it through the normal validator and authorization.'
+      :'This rite can alter files, git state, or execute a command. The local model has NO authority here — a mutating proposal can only run on your explicit ACCEPT, and it still passes the normal authorization rite.';
+    $('cortex-proposal-modal')?.classList.add('open');
+  });
+}
+/* PHASE 14 — one cheap `/select` per SEND, before the first big-model call, and the routing
+   of whatever comes back. Everything here is a SUGGESTION channel:
+     - autoRun:readOnly proposal ⇒ the UNCHANGED validator -> approveToolCall -> executeTool
+       route, with an operator-visible transcript note;
+     - everything else ⇒ the proposal card, and NOTHING is dispatched without an explicit
+       ACCEPT;
+     - low confidence / empty / invalid / degraded / sidecar down / IGNORE ⇒ NO dispatch and
+       the model call proceeds exactly as it would with the sidecar dead.
+   `iter===0` is load-bearing: the dispatcher must not re-probe on every agent iteration.
+   NOTE on the candidate set: all 6 TOOL_SCHEMAS are offered, and the candidate-subset stage is
+   INTENTIONALLY ABSENT — 6 tools is far below the ~50 a real router would need before
+   subsetting buys anything, and a subset stage would be a new local decision to gate. */
+async function runCortexDispatch(c,m,iter){
+  const lm=normLocalModels(settings.localModels);
+  if(!(settings.agent&&lm.enabled&&lm.dispatcher.enabled&&CogCore.cortexDispatch))return null;
+  let client=null;
+  try{client=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch);}catch(e){client=null;}
+  if(!client)return null;
+  let d=null;
+  try{
+    d=CogCore.cortexDispatch(
+      {utterance:lastUserText(c),tools:TOOL_SCHEMAS},
+      {client,settings:lm,isReadRite,autoApproveRead:settings.autoApproveRead});
+    if(d&&typeof d.then==='function')d=await d;
+  }catch(e){return {dispatch:null,note:''};}
+  const proposals=(d&&Array.isArray(d.proposals))?d.proposals:[];
+  if(!proposals.length)return {dispatch:d,note:''};
+  const auto=[],card=[];
+  for(const p of proposals)(p.autoRun?auto:card).push(p);
+  const autoRan=[];
+  for(const p of auto){
+    const gate=CogCore.validateStructuredOutput([{id:p.id,name:p.name,args:p.args}],TOOL_SCHEMAS);
+    if(!gate.ok||!gate.sanitized.length)continue;   /* the Phase 7 gate is never weakened */
+    for(const tc of gate.sanitized){
+      const result=await executeTool(tc);
+      c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
+      autoRan.push(tc.name);
+    }
+  }
+  for(const p of card){
+    let accepted=false;
+    try{accepted=await approveCortexProposal(p);}catch(e){accepted=false;}
+    if(!accepted)continue;                          /* IGNORE ⇒ zero dispatch, model proceeds */
+    const gate=CogCore.validateStructuredOutput([{id:p.id,name:p.name,args:p.args}],TOOL_SCHEMAS);
+    if(!gate.ok||!gate.sanitized.length)continue;
+    for(const tc of gate.sanitized){
+      const result=await executeTool(tc);
+      c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
+    }
+    save();renderMessages();
+  }
+  /* The loop re-initialises m.cortexNote on every iteration (it belongs to the MODEL's
+     repair/anomaly verdict), so the dispatch note is returned for re-application rather than
+     left on the message here. */
+  return {dispatch:d,note:autoRan.length?('[LOCAL CORTEX: read-only rite proposed — '+autoRan.join(', ')+']'):''};
 }
 let approvalResolve=null;
 function settleApproval(v){const r=approvalResolve;approvalResolve=null;const modal=$('agent-modal');if(modal)modal.classList.remove('open');if(r)r(v);}
@@ -952,14 +1182,150 @@ function finalizeToolCalls(acc,msgIndex){
     name:t.name||'',args:t.args||'{}'}));
 }
 async function runAgentLoop(c,m,sig){
+  /* The operator-visible note a LOCAL DISPATCHER auto-run left for this send's message. The
+     loop re-initialises m.cortexNote per iteration for the MODEL's own verdicts, so the
+     dispatch note is re-applied underneath them. */
+  let dispatchNote='';
   for(let iter=0;iter<12;iter++){
     if(sig.aborted)throw new DOMException('Aborted','AbortError');
-    const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
-    m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=finalizeToolCalls(acc,m.ts||Date.now());
-    m.ts=m.ts||Date.now();refreshLast();
-    if(!m.toolCalls.length)return;
-    for(const tc of m.toolCalls){
+    /* PHASE 14 — LOCAL CORTEX DISPATCHER (F3), ONCE per send and BEFORE the first
+       big-model call (iter===0: never re-probe per iteration). A high-confidence read-only
+       proposal auto-runs through the UNCHANGED validator -> approveToolCall -> executeTool
+       route and leaves its note on the message; anything else goes to the proposal card and
+       dispatches NOTHING without an explicit operator ACCEPT. Every other outcome
+       (low confidence / empty / invalid / degraded / sidecar down / IGNORE) is a pure
+       pass-through: the model call below proceeds exactly as it would with the sidecar
+       dead. Bounded by dispatcher.timeoutMs, so local inference is never in the path. */
+    if(iter===0){
+      let dr=null;
+      try{dr=await runCortexDispatch(c,m,iter);}catch(e){dr=null;}
+      if(dr&&dr.note)dispatchNote=dr.note;
       if(sig.aborted)throw new DOMException('Aborted','AbortError');
+    }
+    const lm=normLocalModels(settings.localModels);
+    let cortexClient=null;
+    try{
+      /* ONE client per turn, built only when the operator opted in — with enabled:false the page
+         makes ZERO requests to the sidecar port. */
+      if(lm.enabled)cortexClient=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch);
+    }catch(e){cortexClient=null;}
+    /* PHASE 15 — open the turn's single-probe holder BEFORE the model call, so the stream pump
+       can start the ONE repair probe mid-flight. The latch it carries is shared with the
+       end-of-stream stage below, so a turn spends at most one `/repair` on either path.
+       When the operator has not opted in, `cortexClient` is null and the seam's opt-in gate
+       refuses anyway — the turn then costs zero requests exactly as in Phase 14. */
+    const cTurn=cortexTurnBegin(cortexClient,lm);
+    let acc=null;
+    try{ acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig); }
+    finally{ /* the pump must never keep ticking at the next send's holder */
+      if(cortexTurn===cTurn)cortexTurnEnd(); }
+    m.content=acc.content;m.thinking=acc.thinking;
+    const finalized=finalizeToolCalls(acc,m.ts||Date.now());
+    /* PHASE 15 — consume the turn's ONE early probe HERE, at the decision point, and hand it to
+       `sanitizeReply` as `earlyRepair`. The bounded wait is inside `_cortexStreamSettle`, so a
+       hanging sidecar cannot hang the turn; a result that never arrived in time is an ordinary
+       pass-through, and one that lands after this point is discarded (but still ledgered). */
+    const earlyRepair=await cortexSettle(cTurn,false);
+    /* PHASE 12 — LOCAL CORTEX repair pass. Stage 1 is the Phase 11 deterministic salvage
+       (unchanged): fences, trailing commas, string / double-encoded / truncated arguments,
+       near-miss tool names, narrated calls — FORMAT only, never an invented argument value.
+       Stage 2 may offer what plain code cannot resolve to the local Needle sidecar, bounded
+       and confidence-gated. Local inference is NEVER in the critical path: with the sidecar
+       down, disabled, unconfigured or slow this is byte-identical to Phase 11 and the ORIGINAL
+       reply passes through untouched. Whatever cannot be resolved still stays in the turn so
+       the Phase 7 validator rejects it explicitly (re-attached below).
+       `earlyRepair` is the turn's ONE probe from the Phase 15 mid-stream detection: when it is
+       present this stage asks NOTHING further and folds that answer into the same verdict. */
+    let san=null;
+    try{ san=await CogCore.sanitizeReply({toolCalls:finalized,content:acc.content},TOOL_SCHEMAS,
+      {client:cortexClient,settings:lm,earlyRepair:(earlyRepair&&earlyRepair.present!==false)?earlyRepair:null}); }
+    catch(e){ san=null; }
+    if(!san||!Array.isArray(san.calls))san={calls:finalized,unrepairable:[],source:'deterministic',accepted:true,degraded:false,reason:'',changed:[]};
+    m.cortexNote='';m.cortexDegraded=false;m.cortexAnomaly='';m.cortexLayaDegraded=false;
+    if(san.accepted&&san.source==='needle'){
+      /* A real local repair. Surface it to the operator (never silently) as a non-blocking
+         transcript note, and clear the suspect lead a later phase reads. */
+      m.cortexNote='[LOCAL CORTEX: RITE REPAIRED — '+((san.calls||[]).map(t=>t.name).filter(Boolean).join(', ')||'unknown')+']';
+      delete m.cortexSuspects;
+    }else if(san.degraded&&san.reason==='timeout'){
+      m.cortexDegraded=true;
+      m.cortexNote='[LOCAL CORTEX: NEEDLE TIMED OUT — ORIGINAL RITE PASSED THROUGH]';
+    }
+    /* PHASE 14 — re-apply the dispatcher's auto-run note under the model's own verdicts. */
+    if(dispatchNote)m.cortexNote=(m.cortexNote?(m.cortexNote+' '):'')+dispatchNote;
+    m.toolCalls=(san.calls||[]).concat((san.unrepairable||[]).map(u=>({id:u.id,name:u.name,args:u.args})))
+      .map((t,ix)=>({id:t.id||('call_san_'+iter+'_'+ix+'_'+Date.now().toString(36)),name:t.name,args:t.args}));
+    if(!m.toolCalls.length)m.toolCalls=finalized;
+    if(san.unrepairable&&san.unrepairable.length&&!(san.accepted&&san.source==='needle'))m.cortexSuspects=san.unrepairable;
+    m.ts=m.ts||Date.now();refreshLast();
+    if(!m.toolCalls.length){
+      /* PHASE 13 — LOCAL CORTEX Laya REPLY-ANOMALY (F2b, inbound). A prose-only reply (no
+         dispatchable calls at all) is offered to Laya once: does it look like an error page, a
+         refusal, or a degenerate loop? At/above threshold ⇒ a visible warning chip on the message
+         + a ledger action. The model's CONTENT is never rewritten, never deleted. Fail-open:
+         sidecar down/slow/disabled ⇒ no flag, byte-identical to Phase 12. Because this reply has
+         no dispatchable calls it never ran the F2a pre-flight, so it has issued no earlier
+         /decide — AT MOST ONE per reply. */
+      if(lm.enabled&&cortexClient&&CogCore.cortexLayaGates){
+        try{
+          let ao=CogCore.cortexLayaGates(
+            {mutating:[],prose:true,utterance:lastUserText(c),reply:{toolCalls:[],content:m.content||''}},
+            {client:cortexClient,settings:lm});
+          if(ao&&typeof ao.then==='function')ao=await ao;
+          if(ao&&ao.degraded)m.cortexLayaDegraded=true;
+          if(ao&&ao.anomaly&&ao.anomaly.flagged){
+            const p=(ao.anomaly.prob===null||ao.anomaly.prob===undefined)?'?':Number(ao.anomaly.prob).toFixed(2);
+            m.cortexAnomaly='[LOCAL CORTEX: REPLY ANOMALY FLAGGED — p='+p+']';
+          }
+        }catch(e){}
+      }
+      refreshLast();
+      return;
+    }
+    /* DETERMINISTIC GATE: no model-authored call reaches the bridge unvalidated.
+       Rejected calls are reported back as tool results so the spirit can correct. */
+    const gate=CogCore.validateStructuredOutput(m.toolCalls,TOOL_SCHEMAS);
+    for(const e of gate.errors){
+      c.messages.push({role:'tool',name:e.name||'unknown_rite',toolCallId:e.id||('call_rejected_'+iter+'_'+e.index),
+        content:'[RITE REJECTED BY VALIDATOR — NOT dispatched: '+e.error+'. Re-issue a corrected call, or answer in prose.]',ts:Date.now()});
+    }
+    if(gate.errors.length){save();renderMessages();}
+    /* PHASE 13 — LOCAL CORTEX Laya PRE-FLIGHT (F2a, outbound). One batched `/decide` over the
+       NOT-read-only rites asks whether each call's arguments plausibly satisfy its schema. A
+       below-threshold verdict HOLDS that call: it is never dispatched — a role:'tool' correction
+       is fed back into the SAME self-correction channel the Phase 7 validator uses. The local
+       model can never bypass a gate and never widens the allow-list: an un-held mutating rite
+       still goes through the UNCHANGED validator → approveToolCall → executeTool. Fail-open:
+       with the sidecar down/slow/disabled nothing is held (byte-identical to Phase 12). NOTE:
+       pre-flight (dispatchable calls) and the F2b anomaly (prose-only) are mutually exclusive,
+       so a single model reply issues AT MOST ONE /decide — never both. */
+    let heldCalls=[];
+    if(lm.enabled&&cortexClient&&CogCore.cortexLayaGates&&gate.sanitized.length){
+      try{
+        const mutating=gate.sanitized.filter(tc=>!isReadRite(tc.name,safeToolArgs(tc)));
+        if(mutating.length){
+          const planMut=mutating.map((tc,ix)=>{
+            const sc=(TOOL_SCHEMAS.find(s=>s.function&&s.function.name===tc.name)||{}).function||{};
+            return {index:ix,name:tc.name,args:safeToolArgs(tc),description:sc.description||'',parameters:sc.parameters||null};
+          });
+          let layaOut=CogCore.cortexLayaGates(
+            {mutating:planMut,prose:false,utterance:lastUserText(c),reply:{toolCalls:m.toolCalls,content:m.content||''}},
+            {client:cortexClient,settings:lm});
+          if(layaOut&&typeof layaOut.then==='function')layaOut=await layaOut;
+          if(layaOut&&layaOut.degraded)m.cortexLayaDegraded=true;
+          const heldSet=new Set((layaOut&&layaOut.held)||[]);
+          heldCalls=mutating.filter((tc,ix)=>heldSet.has(ix));
+        }
+      }catch(e){heldCalls=[];}
+    }
+    for(const tc of gate.sanitized){
+      if(sig.aborted)throw new DOMException('Aborted','AbortError');
+      if(heldCalls.includes(tc)){
+        c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,
+          content:'[RITE HELD BY LOCAL CORTEX — the local pre-flight judged these arguments implausible for '+tc.name+'. Re-issue a corrected call, or answer in prose.]',ts:Date.now()});
+        save();renderMessages();
+        continue;
+      }
       const result=await executeTool(tc);
       c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
       save();renderMessages();
@@ -1184,6 +1550,7 @@ document.addEventListener('click',e=>{
 
 $('open-settings').onclick=()=>{
   $('set-endpoint').value=settings.endpoint;
+  $('set-apikey').value=settings.apiKey||'';
   $('set-backend').value=settings.backend||'auto';
   toggleLMStudioOps();
   $('set-model').value=settings.model;
@@ -1202,9 +1569,93 @@ $('open-settings').onclick=()=>{
   $('test-result').textContent='';
   refreshWorkdirUI();refreshBridgeChip();
   refreshProfileList();
+  restoreCortexFields();
+  if(settings.localModels&&settings.localModels.enabled)refreshCortexStatus();
   $('settings-modal').classList.add('open');
   testConnection(true);
 };
+/* ================= LOCAL CORTEX OPS (PHASE 10) =================
+   Opt-in, OFF by default. While settings.localModels.enabled is falsy the page makes
+   ZERO requests to the sidecar port — refreshCortexStatus() returns before touching fetch. */
+function restoreCortexFields(){
+  const lm=normLocalModels(settings.localModels);
+  if($('set-lm-enabled'))$('set-lm-enabled').checked=!!lm.enabled;
+  if($('set-lm-needle'))$('set-lm-needle').checked=!!lm.needle.enabled;
+  if($('set-lm-needle-conf'))$('set-lm-needle-conf').value=lm.needle.minConfidence;
+  if($('set-lm-needle-timeout'))$('set-lm-needle-timeout').value=lm.needle.timeoutMs;
+  if($('set-lm-laya'))$('set-lm-laya').checked=!!lm.laya.enabled;
+  if($('set-lm-laya-conf'))$('set-lm-laya-conf').value=lm.laya.minConfidence;
+  if($('set-lm-laya-timeout'))$('set-lm-laya-timeout').value=lm.laya.timeoutMs;
+  if($('set-lm-laya-preflight'))$('set-lm-laya-preflight').checked=!!lm.laya.preflight;
+  if($('set-lm-laya-anomaly'))$('set-lm-laya-anomaly').checked=!!lm.laya.anomaly;
+  if($('set-lm-sanitizer'))$('set-lm-sanitizer').checked=!!lm.sanitizer.enabled;
+  if($('set-lm-dispatcher'))$('set-lm-dispatcher').checked=!!lm.dispatcher.enabled;
+  if($('set-lm-dispatcher-autoread'))$('set-lm-dispatcher-autoread').checked=!!lm.dispatcher.autoReadOnly;
+  if($('set-lm-dispatcher-conf'))$('set-lm-dispatcher-conf').value=lm.dispatcher.minConfidence;
+  if($('set-lm-dispatcher-timeout'))$('set-lm-dispatcher-timeout').value=lm.dispatcher.timeoutMs;
+  if($('set-lm-port'))$('set-lm-port').value=lm.port;
+  if($('set-lm-ledger'))$('set-lm-ledger').value=lm.ledger;
+}
+function writeCortexFields(){
+  const d=DEF_SETTINGS.localModels;
+  const lm=normLocalModels(settings.localModels);   /* never leave undefined sub-objects */
+  const numf=(id,def)=>{const el=$(id);if(!el)return def;const v=parseFloat(el.value);return isFinite(v)?v:def;};
+  const numi=(id,def)=>{const el=$(id);if(!el)return def;const v=parseInt(el.value,10);return isFinite(v)?v:def;};
+  lm.enabled=!!($('set-lm-enabled')&&$('set-lm-enabled').checked);
+  lm.needle.enabled=!!($('set-lm-needle')&&$('set-lm-needle').checked);
+  lm.needle.minConfidence=numf('set-lm-needle-conf',d.needle.minConfidence);
+  lm.needle.timeoutMs=numi('set-lm-needle-timeout',d.needle.timeoutMs);
+  lm.laya.enabled=!!($('set-lm-laya')&&$('set-lm-laya').checked);
+  lm.laya.minConfidence=numf('set-lm-laya-conf',d.laya.minConfidence);
+  lm.laya.timeoutMs=numi('set-lm-laya-timeout',d.laya.timeoutMs);
+  lm.laya.preflight=!!($('set-lm-laya-preflight')&&$('set-lm-laya-preflight').checked);
+  lm.laya.anomaly=!!($('set-lm-laya-anomaly')&&$('set-lm-laya-anomaly').checked);
+  lm.sanitizer.enabled=!!($('set-lm-sanitizer')&&$('set-lm-sanitizer').checked);
+  lm.dispatcher.enabled=!!($('set-lm-dispatcher')&&$('set-lm-dispatcher').checked);
+  lm.dispatcher.autoReadOnly=!!($('set-lm-dispatcher-autoread')&&$('set-lm-dispatcher-autoread').checked);
+  lm.dispatcher.minConfidence=numf('set-lm-dispatcher-conf',d.dispatcher.minConfidence);
+  lm.dispatcher.timeoutMs=numi('set-lm-dispatcher-timeout',d.dispatcher.timeoutMs);
+  lm.port=numi('set-lm-port',d.port);
+  const led=$('set-lm-ledger');
+  lm.ledger=(led&&led.value.trim())?led.value.trim():d.ledger;
+  settings.localModels=lm;
+}
+async function refreshCortexStatus(){
+  try{
+    const el=$('lm-status');
+    const lm=normLocalModels(settings.localModels);
+    if(!lm.enabled){if(el)el.textContent='LOCAL CORTEX: DISABLED';return;}
+    if(el)el.textContent='LOCAL CORTEX: PROBING…';
+    let r=null;
+    try{
+      if(!(window.CogCore&&CogCore.localModels&&CogCore.localModels.client))throw new Error('client unavailable');
+      r=await CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/').health();
+    }catch(e){r={ok:false,degraded:true,error:String((e&&e.message)||e)};}
+    if(!el)return;
+    if(!r||r.ok===false){
+      el.textContent='LOCAL CORTEX: OFFLINE (degraded)'+(r&&r.error?' — '+r.error:'');
+      return;
+    }
+    const nd=r.needle||{},ly=r.laya||{};
+    const needle=nd.enabled?(nd.loaded?'loaded':'unloaded'):'off';
+    const laya=ly.enabled?(ly.loaded?'loaded':'unloaded'):'off';
+    let txt='LOCAL CORTEX: needle '+needle+(nd.weights?'/'+nd.weights:'')+' · laya '+laya+
+      ' · ledger '+((r.ledger&&r.ledger.path)||lm.ledger||'(unknown)');
+    const deg=Array.isArray(r.degraded)?r.degraded.filter(Boolean):[];
+    if(deg.length)txt+=' · degraded: '+deg.join('; ');
+    /* PHASE 14 — ledger-driven proposal counters. Tolerate an OLDER daemon that reports no
+       `counts` object at all by simply omitting the suffix; never throw, never guess. */
+    const cnt=(r.ledger&&typeof r.ledger.counts==='object'&&r.ledger.counts)?r.ledger.counts:null;
+    if(cnt){
+      const n=k=>(typeof cnt[k]==='number'&&isFinite(cnt[k]))?Math.round(cnt[k]):0;
+      txt+=' · proposals '+n('proposals')+' · accepted '+n('accepted')+' · ignored '+n('ignored');
+    }
+    el.textContent=txt;
+  }catch(e){
+    const el=$('lm-status');if(el)el.textContent='LOCAL CORTEX: OFFLINE (degraded)';
+  }
+}
+if($('test-cortex'))$('test-cortex').onclick=()=>{refreshCortexStatus();};
 /* ================= PROFILE OPS ================= */
 function refreshProfileList(){
   const sel=$('prof-list');if(!sel)return;
@@ -1220,9 +1671,11 @@ $('prof-save').onclick=()=>{
   const name=($('prof-name').value||'').trim()||'UNNAMED PROFILE';
   const rec=CogCore.profileStore.save(localStorage,{
     id:settings.activeProfile||undefined,
-    name:name,backend:$('set-backend').value,endpoint:$('set-endpoint').value,model:$('set-model').value
+    name:name,backend:$('set-backend').value,endpoint:$('set-endpoint').value,model:$('set-model').value,apiKey:$('set-apikey').value
   });
-  settings.activeProfile=rec.id;saveSet();
+  settings.activeProfile=rec.id;
+  settings.apiKey=$('set-apikey').value;
+  saveSet();
   refreshProfileList();
   $('prof-result').innerHTML='<span style="color:var(--phos)">&#10003; PROFILE INSCRIBED: '+esc(name)+'</span>';
 };
@@ -1232,8 +1685,9 @@ $('prof-load').onclick=()=>{
   $('set-endpoint').value=p.endpoint;
   $('set-backend').value=p.backend;
   $('set-model').value=p.model||'';
+  $('set-apikey').value=p.apiKey||'';
   settings.activeProfile=p.id;
-  settings.endpoint=p.endpoint;settings.backend=p.backend;settings.model=p.model;
+  settings.endpoint=p.endpoint;settings.backend=p.backend;settings.model=p.model;settings.apiKey=p.apiKey||'';
   saveSet();refreshProfileList();
   $('prof-result').innerHTML='<span style="color:var(--phos-dim)">LOADED: '+esc(p.name)+' &#8594; '+esc(p.endpoint)+(p.model?' / '+esc(p.model):'')+'</span>';
   testConnection(true);
@@ -1241,10 +1695,11 @@ $('prof-load').onclick=()=>{
 $('prof-del').onclick=()=>{
   const id=$('prof-list').value;if(!id)return;
   CogCore.profileStore.remove(localStorage,id);
-  if(settings.activeProfile===id){settings.activeProfile='';settings.endpoint='';settings.backend='auto';settings.model='';}
+  if(settings.activeProfile===id){settings.activeProfile='';settings.endpoint='';settings.backend='auto';settings.model='';settings.apiKey='';}
   saveSet();refreshProfileList();
   $('prof-result').innerHTML='<span style="color:var(--phos-dim)">PROFILE PURGED.</span>';
 };
+if($('api-key-eye'))$('api-key-eye').onclick=()=>{$('set-apikey').type=($('set-apikey').type==='password'?'text':'password');};
 $('set-temp').oninput=e=>$('temp-val').textContent=e.target.value;
 $('set-topp').oninput=e=>$('topp-val').textContent=e.target.value;
 $('set-pres').oninput=e=>$('pres-val').textContent=e.target.value;
@@ -1253,6 +1708,7 @@ $('set-thresh').oninput=e=>$('set-thresh-val').textContent=e.target.value+'%';
 $('set-ctx').oninput=e=>$('ctx-limit-val').textContent='('+e.target.value+')';
 $('save-settings').onclick=()=>{
   settings.endpoint=$('set-endpoint').value.trim()||DEF_SETTINGS.endpoint;
+  settings.apiKey=$('set-apikey').value||'';
   settings.backend=$('set-backend').value;
   toggleLMStudioOps();
   const chosenModel=$('set-model').value;
@@ -1271,6 +1727,7 @@ $('save-settings').onclick=()=>{
   settings.topP=parseFloat($('set-topp').value);
   settings.presence=parseFloat($('set-pres').value);
   settings.frequency=parseFloat($('set-freq').value);
+  writeCortexFields();
   saveSet();$('settings-modal').classList.remove('open');
   $('model-name').textContent=settings.model||'—';ctxUsage();testConnection(true);
 };
@@ -1292,7 +1749,14 @@ $('agent-toggle').onclick=()=>{settings.agent=!settings.agent;saveSet();syncAgen
 $('agent-approve').onclick=()=>settleApproval(true);
 $('agent-deny').onclick=()=>settleApproval(false);
 $('agent-modal').onclick=e=>{if(e.target.id==='agent-modal')settleApproval(false);};
+/* PHASE 14 — proposal card: ACCEPT proceeds, IGNORE and dismissing are both "no dispatch,
+   ask the big model". Escape IGNOREs the card WITHOUT aborting the turn (the card is the
+   proposal's gate, not the rite's). */
+$('cortex-proposal-accept').onclick=()=>settleCortexProposal(true);
+$('cortex-proposal-ignore').onclick=()=>settleCortexProposal(false);
+$('cortex-proposal-modal').onclick=e=>{if(e.target.id==='cortex-proposal-modal')settleCortexProposal(false);};
 document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&proposalResolve){e.preventDefault();settleCortexProposal(false);return;}
   if(e.key==='Escape'&&approvalResolve){e.preventDefault();settleApproval(false);if(abortCtl)abortCtl.abort();}
 });
 
