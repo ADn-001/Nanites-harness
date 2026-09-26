@@ -1083,6 +1083,12 @@ machine-specific changes; PR opened against `main`.
 
 ## Notes
 
+- **Repo path (2026-09-26, no-op cron call).** The cron job's prompt still names
+  `/home/user/Nanites-harness`, which **no longer exists**. The checkout lives at
+  `/home/user/projects/Nanites-harness` (the `projects/` layout the dev-sprint skill mandates).
+  A session that trusts the prompt path gets `cd: No such file or directory` and can wrongly
+  conclude there is no project. **Resolve to `/home/user/projects/Nanites-harness`** until the
+  job's prompt is edited.
 - 2026-09-23 (planning session): Phases 10-15 planned and entered here; **no code written yet**.
   This session's scope was recon + brainstorming + the plan document + this gatelog update.
 - The two documents in `Laya_needle_expansion/` came from a session without codebase context: they
