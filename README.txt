@@ -258,6 +258,172 @@ When the model requests a rite:
 - **COUNTERMAND** refuses it and returns that refusal to the model
 - **ESC** also countermands the pending rite
 
+## Local Cortex (optional)
+
+LOCAL CORTEX is an **optional** localhost sidecar that sits in front of the model reply
+and helps produce **well-formed tool calls**. It is a piece of *middleware around tool
+calls* — not a chat model, and not a replacement for the model you already talk to.
+
+It is written in Python, talks to nothing but your own machine, and offers two small
+local models:
+
+- **Needle** — repairs a malformed or misnamed tool call, and (optionally) proposes a
+  cheap pre-route for a request before the big model is consulted.
+- **Laya** — gates: it can hold a mutating rite for a second opinion before it runs, and
+  can flag a reply that looks anomalous.
+
+**It is OFF by default, and it stays off until you turn it on.** A fresh install — yours or
+a friend's — behaves exactly as it did before LOCAL CORTEX existed. Nothing is
+downloaded, spawned or loaded, and the page does not even contact the sidecar port while
+the master toggle is unticked. If you never enable it, you will never notice it.
+
+### Installing it
+
+Linux / macOS:
+
+```bash
+bash localmodels/setup.sh
+```
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File localmodels\setup.ps1
+```
+
+Both scripts create a virtualenv under `localmodels/`, install the Needle package, and
+really fetch the base weights plus the engine library into the package's own cache
+(`~/.cache/cactus-needle/…`). The download is idempotent — a cached file is skipped, so
+re-running the script is safe. Run the daemon with that venv's python:
+
+```bash
+localmodels/.venv/bin/python localmodels/local_models_daemon.py
+```
+
+```powershell
+localmodels\.venv\Scripts\python.exe localmodels\local_models_daemon.py
+```
+
+The same scripts also run `npm install` inside `localmodels/` for the optional **Laya**
+gate. That step needs **Node.js >= 20**, and it is the *only* reason Node is needed for
+LOCAL CORTEX — skip it if you do not want Laya. Laya's weights are a **~1.7 GB download
+and they are NOT fetched by the installer**; they arrive lazily on Laya's first real use,
+and only if you have enabled Laya, into a cache under `~/.cache/receptron-laya`. If Node
+is missing, that step is skipped with a warning and everything else still works.
+
+### Settings
+
+In **RITES/CONFIG** → the **LOCAL CORTEX** block. Defaults as shipped:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enabled` | `false` | master switch for the whole sidecar |
+| `needle.enabled` | `false` | enable the Needle repair pass |
+| `needle.minConfidence` | `0.75` | below this, the original call is passed through untouched |
+| `needle.confirmBand` | `[0.5, 0.75]` | reserved low-confidence band; kept in the saved settings, not currently acted on |
+| `needle.timeoutMs` | `800` | bounded budget around one model call |
+| `laya.enabled` | `false` | enable the Laya gates |
+| `laya.minConfidence` | `0.70` | pre-flight: a mutating rite scoring below this is held for a correction instead of being dispatched. A *missing* answer is never a refusal |
+| `laya.timeoutMs` | `500` | bounded budget around one gate request |
+| `laya.preflight` | `true` | ask Laya about a mutating rite before it runs |
+| `laya.anomaly` | `true` | ask Laya to flag a suspicious-looking reply |
+| `sanitizer.enabled` | `true` | deterministic salvage pass — free, no model involved |
+| `sanitizer.mode` | `'auto'` | `'auto'` (probe only when a call looks suspect), `'on'` (also probe prose-only replies), `'off'` (never probe) |
+| `sanitizer.deterministicPass` | `true` | run the free deterministic pass first |
+| `dispatcher.enabled` | `false` | cheap local pre-router (proposes a rite before the big model) |
+| `dispatcher.autoReadOnly` | `true` | may auto-run a *read-only* proposal (also needs the existing read-only auto-approve flag) |
+| `dispatcher.timeoutMs` | `800` | bounded budget around one proposal |
+| `dispatcher.minConfidence` | `0.75` | placeholder, deliberately out of reach of the untuned stock model — see the note below |
+| `port` | `8932` | sidecar port, `127.0.0.1` only |
+| `ledger` | `var/local-models.jsonl` | append-only decision log, relative to the repo |
+
+A useful default to be blunt about: the shipped stock model is not calibrated, and the
+`dispatcher.minConfidence` of `0.75` sits above what it actually scores. In practice the
+dispatcher therefore almost never fires. That is the safe direction to fail, but it means
+if you lower that number, keep the blank-argument guard in place — a required string
+argument that trims to empty must still be shown to you as a card rather than run.
+
+The daemon takes the same knobs on the command line, if you prefer:
+
+```text
+--port PORT                 sidecar port (default 8932)
+--no-needle                 do not enable the Needle repair engine
+--no-laya                   do not enable the Laya decision engine
+--ledger PATH               ledger JSONL path
+--needle-timeout-ms MS      bounded timeout around the model call (default 800)
+--needle-select-timeout-ms MS   bounded timeout around one proposal (default 800)
+--preload-needle            warm the engine in the background at boot
+--laya-timeout-ms MS        bounded timeout around one Laya request (default 500)
+--laya-idle-s N             reap the Laya child after N idle seconds (default 120, 0 disables)
+--laya-child PATH           path to the Laya child script
+--allow-any-origin          allow non-local web origins (not recommended)
+--allow-file-origin         trust a null Origin (file:// page) — not recommended
+```
+
+### It is never in the critical path
+
+This is the important part. **Local inference is never required for the harness to work.**
+
+If the sidecar is down, disabled, unconfigured, slow, still loading, or the models are
+simply not present, then:
+
+- every LOCAL CORTEX feature degrades to plain deterministic behaviour or straight
+  pass-through, and the original rite is used as-is;
+- no request ever blocks forever — every call has a bounded timeout and answers
+  "degraded" instead of hanging;
+- the agent loop is completely unaffected, and no error is thrown into your turn;
+- the whole harness stays fully functional. The chat, the agent mode and the bridge rites
+  do not depend on any of this.
+
+If you never install it, never start it, or start it and it dies, the only visible effect
+is the LOCAL CORTEX status line reading offline.
+
+### Privacy
+
+- **Nothing leaves your machine.** There is no external service, endpoint, router or cloud
+  fallback anywhere in this package — localhost only, and the sidecar binds `127.0.0.1`.
+- The only network use is the one-time model-weight download at install or first use, and
+  only if you ask for it.
+- **The sidecar never receives your provider API key.** No `Authorization` header is ever
+  sent to it.
+- The decision ledger (`var/local-models.jsonl`) is a local, append-only JSONL file. The
+  writer strips authorization/bearer/`sk-…`-looking values, your configured API key and
+  absolute home paths, and truncates long fields. It is git-ignored, and the daemon writes
+  no other file — no pid file, no log file.
+
+### Safety
+
+- Repairs fix **format, never semantics**. Needle only ever proposes a call from the tool
+  schemas it was offered; it cannot invent a tool, and it never executes anything itself.
+- Every tool call — repaired or not — still goes through the existing structured-output
+  validator before anything runs.
+- Mutating rites still require operator approval. A local model can propose, never
+  authorise.
+- A gate that has no answer holds nothing: absence of evidence is not a refusal, and nothing
+  is blocked just because a model was unavailable, slow or missing.
+
+### Checking it
+
+The sidecar exposes a `GET /health` on its port. With the port left at the default:
+
+```bash
+curl http://127.0.0.1:8932/health
+```
+
+It reports whether each engine is enabled/loaded, where the ledger is, and a `degraded`
+list of anything that is on but cannot serve right now. A feature you deliberately
+switched off reads as *off*, not degraded. Probing health never starts a model or
+triggers a download.
+
+In the app, the LOCAL CORTEX block shows a **LOCAL CORTEX** status line, and the
+**PROBE LOCAL CORTEX** button refreshes it. While the master toggle is off it reads
+`LOCAL CORTEX: DISABLED`; a dead or silent sidecar reads `LOCAL CORTEX: OFFLINE (degraded)`.
+
+If Laya is enabled and the status line is not what you expect, the usual cause is the
+host rather than your install: the ONNX runtime Laya relies on ships a glibc-linked Linux
+arm64 build, so Laya cannot serve on a musl host (Alpine, postmarketOS). Everything else
+keeps working, exactly as if Laya were switched off.
+
 ## Autostart on Windows
 
 Install:
@@ -287,6 +453,7 @@ cogitator/
   icon.svg
   test_e2e.py
   tests/frontend/      (jsdom e2e suites: phase0-8, incl. shared appcore helpers)
+  localmodels/         (optional LOCAL CORTEX sidecar + its own README.md)
   PLAN.md / REPORT.md / gatelog.md / codereview.md   (dev tracking docs)
   README.txt
 ```

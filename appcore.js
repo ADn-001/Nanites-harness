@@ -753,7 +753,23 @@
      *    receive an API key.
      */
     localModels: {
-      /* The settings block (plan §4). Kept byte-comparable with DEF_SETTINGS.localModels. */
+      /* The settings block (plan §4). Kept byte-comparable with DEF_SETTINGS.localModels.
+
+         THRESHOLDS ARE MEASURED, NOT GUESSED (Phase 15, real untuned base model, 14 real
+         daemon calls on the stock weights). `tools/tune_thresholds.py` over the resulting
+         ledger reported, for the `/select` dispatcher: acceptance 2/6 = 33%, and a
+         precision of only 66.7% anywhere between t=0.25 and t=0.35. The model's confidence
+         does NOT track correctness on the untuned weights -- it answered `list_dir` when
+         `read_file` was right at conf 0.96, and proposed a MUTATING `write_file` from a
+         prose question that mentioned no tool at all. Lowering the bar below 0.40 therefore
+         buys recall bought with mutating proposals, so `dispatcher.minConfidence` and
+         `needle.minConfidence` STAY at 0.75. That is fail-closed on purpose: with stock
+         weights the dispatcher rarely fires, and a friend who enables LOCAL CORTEX on an
+         untuned model gets a safe, quiet no-op rather than confidently wrong rites. Re-tune
+         only against a tuned checkpoint, and re-read the gatelog Phase 15 findings first.
+
+         The blank-argument guard (_cortexHasBlankRequired) is what makes a low threshold
+         survivable at all -- it is load-bearing, not defensive noise. Do not remove it. */
       DEFAULTS: {
         enabled: false,
         needle: { enabled: false, minConfidence: 0.75, confirmBand: [0.5, 0.75], timeoutMs: 800 },
@@ -886,7 +902,8 @@
     sanitizeReply: function (reply, allowedTools, deps) {
       var out = {
         calls: [], source: 'original', confidence: null, accepted: false,
-        trace_id: '', degraded: false, changed: [], unrepairable: [], reason: ''
+        trace_id: '', degraded: false, changed: [], unrepairable: [], reason: '',
+        early: ''      /* PHASE 15: '' | 'used' | 'expired' — what happened to the early probe */
       };
       try {
         out.trace_id = CogCore._cortexTraceId(deps);
@@ -970,9 +987,39 @@
         return out;
       }
 
-      /* ---- STAGE 2: exactly one bounded, gated Needle probe ---- */
+      /* ---- PHASE 15 — the turn ALREADY spent its one repair probe, mid-stream ----
+         The accumulated deltas already held a call that plain code cannot repair, so
+         `cortexStreamDetect` started a fire-and-forget `/repair` while the reply was still
+         arriving. The budget is ONE probe per turn, so this stage must NOT ask again: it
+         folds the early answer into the very same verdict, through the very same Phase 7
+         gate, and every unusable shape (expired, degraded, empty, invalid, below threshold)
+         degrades to a pass-through exactly as it would have without the early probe. */
+      /* Read the thresholds BEFORE the early-probe fold below. `var` hoists the declaration but
+         not the assignment, so a `minConf` read above its assignment is `undefined` here and
+         `conf >= undefined` is false — which silently downgraded every early repair to
+         below_threshold/passed_through. */
       var minConf = (typeof nd.minConfidence === 'number' && isFinite(nd.minConfidence)) ? nd.minConfidence : 0.75;
       var ms = (typeof nd.timeoutMs === 'number' && isFinite(nd.timeoutMs) && nd.timeoutMs > 0) ? nd.timeoutMs : 800;
+
+      var early = (deps.earlyRepair && typeof deps.earlyRepair === 'object') ? deps.earlyRepair : null;
+      if (early) {
+        if (early.expired) {
+          out.calls = detCalls.slice();
+          out.source = detCalls.length ? 'deterministic' : 'original';
+          out.accepted = detCalls.length > 0;
+          out.degraded = true;
+          out.reason = 'timeout';
+          out.early = 'expired';
+          /* The settle step normally ledgered this already; posting again would count one
+             probe twice in the operator's ledger. */
+          if (!early.ledgered) CogCore._cortexPostOutcome(deps, client, out.trace_id, 'timeout');
+          return out;
+        }
+        out.early = 'used';
+        return CogCore._cortexApplyRepair(early.value || null, out, detCalls, allowedTools, minConf, deps, client);
+      }
+
+      /* ---- STAGE 2: exactly one bounded, gated Needle probe ---- */
       var payload = CogCore._cortexRepairPayload(reply, allowedTools, out.unrepairable, out.trace_id);
 
       var probe;
@@ -1579,6 +1626,325 @@
       for (var k = 0; k < proposals.length; k++) if (proposals[k].autoRun) { anyAuto = true; break; }
       CogCore._cortexPostOutcome(deps, client, out.trace_id, anyAuto ? 'accepted' : 'passed_through');
       return out;
+    },
+
+    /* ================= PHASE 15 — INCREMENTAL (STREAMING) DETECTION =================
+     * `cortexStreamDetect(acc, deps)` — the CHEAP half of Phase 15, run against the deltas
+     * that have ACCUMULATED SO FAR, never against a finished reply.
+     *
+     * WHY this exists. `sanitizeReply` only runs when the stream is over, so a malformed call
+     * costs the operator the whole round-trip: read the whole reply, THEN ask the local model
+     * what the broken call meant. By then the answer is too late to save any latency. The
+     * cheap deterministic checks (name reconciliation + a JSON-prefix scan) can tell that a
+     * call is already broken from the first delta that carries a name, so the ONE repair probe
+     * this turn is allowed can be in flight while the rest of the reply is still streaming.
+     *
+     * The hard constraints, all of which the caller owns and this function only enables:
+     *  - it NEVER awaits, and returns a PLAIN OBJECT (never a promise), so `pumpSSE` cannot be
+     *    delayed by it even by accident;
+     *  - it never buffers the stream: it reads the accumulator it is handed and nothing else;
+     *  - `alreadyProbed` is the caller's per-turn latch. At most one probe per turn is a
+     *    property of the CALLER (index.html), not of this function — it only honours the latch
+     *    it is given, so the cheap stage stays first and one broken call cannot spend two
+     *    model calls;
+     *  - the started probe is fire-and-forget and comes back as `probe`, a promise that
+     *    ALWAYS resolves (never rejects) so the caller can attach whatever late/timeout
+     *    bookkeeping it likes without risking an unhandled rejection;
+     *  - it only STARTS a probe. It never applies, gates or dispatches anything: the result is
+     *    consumed at the turn's `finalizeToolCalls`/`sanitizeReply` point, where the unchanged
+     *    Phase 7 validator is still the gate.
+     *
+     *   acc  = the accumulator the stream pump has built: {toolCalls:[{id,name,args}], ...}
+     *   deps = { allowedTools, client, settings, alreadyProbed?, traceId? }
+     *
+     *   { ok, degraded, reason, trace_id, sawCall, suspects:[{name,args,reason}],
+     *     probeStarted:boolean, probe:null|Promise, payload:null|object }
+     *
+     * `reason` is one of: 'off' (not opted in / no client / already spent this turn's latch),
+     * 'already_probed', 'clean' (every call so far is well-formed), 'still_streaming' (a call
+     * is half-arrived but nothing is broken YET), 'error', or 'suspect'.
+     */
+    cortexStreamDetect: function (acc, deps) {
+      var out = {
+        ok: true, degraded: false, reason: '', trace_id: '',
+        sawCall: false, suspects: [], probeStarted: false, probe: null, payload: null
+      };
+      try {
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        out.trace_id = CogCore._cortexTraceId(deps);
+        var lm = CogCore._cortexLmSettings(deps.settings);
+        var san = lm.sanitizer || {}, nd = lm.needle || {};
+        var mode = (san.mode === undefined || san.mode === null) ? 'auto' : String(san.mode);
+        var client = (deps.client && typeof deps.client.repair === 'function') ? deps.client : null;
+
+        /* Rule 1 — the hard opt-in gate. Anything off means ZERO requests, not a cheap probe.
+           The deterministic stage is not negotiable: a caller that turned it off has said the
+           plain-code pass is the only pass. */
+        if (lm.enabled === false || san.enabled === false || nd.enabled === false ||
+            san.deterministicPass === false || mode === 'off' || !client) {
+          out.reason = 'off';
+          return out;
+        }
+        /* Rule 2 — the per-turn latch. One repair probe per turn, not per delta and not per
+           tool call; the CALLER owns the latch so it also covers the end-of-stream path. */
+        if (deps.alreadyProbed === true) {
+          out.reason = 'already_probed';
+          return out;
+        }
+
+        var slots = (acc && Array.isArray(acc.toolCalls)) ? acc.toolCalls : [];
+        if (!slots.length) { out.reason = 'clean'; return out; }
+        out.sawCall = true;
+        var names = CogCore._toolSpec(deps.allowedTools).names;
+
+        var waiting = false;
+        for (var i = 0; i < slots.length; i++) {
+          var slot = slots[i];
+          if (!slot || typeof slot !== 'object') continue;
+          if (!slot.name) { waiting = true; continue; }   /* the name has not arrived yet */
+
+          /* A name that reconciles to nothing allowed, or to two equally-close names, is
+             broken the moment it lands — no later delta can repair it. */
+          var nr = CogCore._cortexReconcileName(slot.name, names);
+          if (nr.reason) {
+            out.suspects.push({ id: String(slot.id || ''), name: String(slot.name), args: slot.args, reason: nr.reason });
+            continue;
+          }
+
+          /* Arguments: the deterministic parser first (fences, trailing commas, truncation,
+             double-encoding). Only what plain code CANNOT fix is a candidate, and of that only
+             what no future delta can fix — a merely half-arrived object is still_streaming. */
+          var pa = CogCore._cortexParseArgs(slot.args);
+          if (pa.ok) continue;
+          var state = CogCore._cortexJsonPrefix(slot.args);
+          if (state !== 'malformed') { waiting = true; continue; }
+          out.suspects.push({ id: String(slot.id || ''), name: String(slot.name), args: slot.args, reason: 'malformed arguments: ' + pa.reason });
+        }
+
+        if (!out.suspects.length) {
+          out.reason = waiting ? 'still_streaming' : 'clean';
+          return out;
+        }
+
+        out.payload = CogCore._cortexRepairPayload(null, deps.allowedTools, out.suspects, out.trace_id);
+        var probe;
+        try { probe = client.repair(out.payload); }
+        catch (e) { probe = Promise.reject(e); }
+        /* Never let a hostile transport turn the fire-and-forget probe into an unhandled
+           rejection in the caller's turn. */
+        out.probe = Promise.resolve(probe).then(function (v) { return v; }, function (e) {
+          return { ok: false, degraded: true, error: String((e && e.message) || e) };
+        });
+        out.probeStarted = true;
+        out.reason = 'suspect';
+        return out;
+      } catch (e) {
+        out.ok = false; out.degraded = true; out.reason = 'error';
+        out.suspects = []; out.probeStarted = false; out.probe = null; out.payload = null;
+        return out;
+      }
+    },
+
+    /**
+     * Classify a partially-arrived arguments text: can MORE deltas still complete it?
+     *   'complete'   — a whole JSON value; nothing more is coming and nothing is broken.
+     *   'partial'    — still extendable (`{"path":"mai`): wait for the next delta.
+     *   'malformed'  — appending more characters can NEVER make this valid JSON (a missing
+     *                  colon, single quotes, an extra closer, a literal that is not `true`):
+     *                  the deterministic pass will not fix it and neither will more stream.
+     * A single forward scan — no second copy of the text, no allocation beyond the result, and
+     * it never throws (an unreadable text is `malformed`, which is the fail-safe direction: the
+     * end-of-stream path is unchanged either way).
+     */
+    _cortexJsonPrefix: function (text) {
+      try {
+        var s = String(text === null || text === undefined ? '' : text);
+        var n = s.length, i = 0, k, c, r;
+
+        var ws = function () {
+          while (i < n) { c = s.charAt(i); if (c === ' ' || c === '\t' || c === '\n' || c === '\r') i++; else break; }
+        };
+        var lit = function (w) {
+          for (k = 0; k < w.length; k++) {
+            if (i >= n) return 0;                     /* ran out mid-literal: still partial */
+            if (s.charAt(i) !== w.charAt(k)) return -1;
+            i++;
+          }
+          return 1;
+        };
+        var str = function () {
+          i++;                                        /* the opening quote */
+          while (i < n) {
+            c = s.charAt(i);
+            if (c === '\\') { if (i + 1 >= n) { i = n; return 0; } i += 2; continue; }
+            if (c === '"') { i++; return 1; }
+            /* A raw newline inside a JSON string is never legal and no later delta can
+               close it, so this is as terminal as a missing colon. */
+            if (c === '\n' || c === '\r') return -1;
+            i++;
+          }
+          return 0;
+        };
+        var num = function () {
+          var st = i;
+          if (s.charAt(i) === '-') i++;
+          while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+          if (i < n && s.charAt(i) === '.') { i++; while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++; }
+          if (i < n && (s.charAt(i) === 'e' || s.charAt(i) === 'E')) {
+            i++;
+            if (s.charAt(i) === '+' || s.charAt(i) === '-') i++;
+            while (i < n && s.charAt(i) >= '0' && s.charAt(i) <= '9') i++;
+          }
+          if (i > st) return 1;
+          return (i >= n) ? 0 : -1;
+        };
+        var value = function () {
+          ws();
+          if (i >= n) return 0;
+          c = s.charAt(i);
+          if (c === '{') return object();
+          if (c === '[') return array();
+          if (c === '"') return str();
+          if (c === 't') return lit('true');
+          if (c === 'f') return lit('false');
+          if (c === 'n') return lit('null');
+          if (c === '-' || (c >= '0' && c <= '9')) return num();
+          return -1;
+        };
+        var object = function () {
+          i++; ws();
+          if (i >= n) return 0;
+          if (s.charAt(i) === '}') { i++; return 1; }
+          for (;;) {
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) !== '"') return -1;       /* a key must be a quoted string */
+            r = str(); if (r !== 1) return r;
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) !== ':') return -1;       /* the classic missing colon */
+            i++;
+            r = value(); if (r !== 1) return r;
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) === ',') { i++; continue; }
+            if (s.charAt(i) === '}') { i++; return 1; }
+            return -1;
+          }
+        };
+        var array = function () {
+          i++; ws();
+          if (i >= n) return 0;
+          if (s.charAt(i) === ']') { i++; return 1; }
+          for (;;) {
+            r = value(); if (r !== 1) return r;
+            ws();
+            if (i >= n) return 0;
+            if (s.charAt(i) === ',') { i++; continue; }
+            if (s.charAt(i) === ']') { i++; return 1; }
+            return -1;
+          }
+        };
+
+        r = value();
+        if (r === 0) return 'partial';
+        if (r < 0) return 'malformed';
+        ws();
+        return (i < n) ? 'malformed' : 'complete';    /* trailing junk: an extra `}` etc. */
+      } catch (e) { return 'malformed'; }
+    },
+
+    /**
+     * `_cortexStreamSettle(turn, deps)` — consume the turn's ONE early probe at the moment the
+     * turn decides (the `finalizeToolCalls`/`sanitizeReply` point). The caller owns `turn`:
+     *
+     *   turn = { probe, trace_id, settled:false, value:null, decided:false,
+     *            discarded:false, ledgered:false }
+     *
+     * Returns `{present:false}` as a PLAIN OBJECT when the turn never spent a probe (so a
+     * no-cortex turn is byte-identical and synchronous), otherwise
+     * `{present:true, expired, value, trace_id, ledgered}`.
+     *
+     * The rules this encodes, in the order they matter:
+     *  - an already-settled probe is handed over SYNCHRONOUSLY — the common case costs no
+     *    await at all, which is what keeps the streaming path free of extra microtask turns;
+     *  - a probe still in flight is awaited through the EXISTING `_cortexRace`, bounded by
+     *    `needle.timeoutMs`, so a hanging sidecar can never hang a turn;
+     *  - `alreadyDecided:true` (the caller already moved on) takes NOTHING out of a straggler
+     *    and ledgers it via `_cortexStreamLate`: too late to matter, and never 'accepted';
+     *  - a probe is ledgered AT MOST ONCE. The expiry posts `timeout` here and marks the turn,
+     *    so the value landing afterwards is a discard, not a second line in the operator's
+     *    ledger.
+     */
+    _cortexStreamSettle: function (turn, deps) {
+      try {
+        if (!turn || !turn.probe) return { present: false };
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        var traceId = String(turn.trace_id || CogCore._cortexTraceId(deps));
+        var client = (deps.client && typeof deps.client.repair === 'function') ? deps.client : null;
+
+        /* The turn already decided without this probe: whatever lands now is discarded. */
+        if (deps.alreadyDecided === true) {
+          turn.decided = true;
+          turn.discarded = true;
+          CogCore._cortexStreamLate(turn, deps);
+          return { present: true, expired: true, value: null, trace_id: traceId };
+        }
+
+        turn.decided = true;
+        if (turn.settled === true) {
+          turn.discarded = true;      /* consumed: a re-read must be a no-op, not a second ledger */
+          return { present: true, expired: false, value: turn.value, trace_id: traceId, ledgered: false };
+        }
+
+        var nd = CogCore._cortexLmSettings(deps.settings).needle || {};
+        var ms = (typeof nd.timeoutMs === 'number' && isFinite(nd.timeoutMs) && nd.timeoutMs > 0) ? nd.timeoutMs : 800;
+        var p = turn.probe;
+
+        /* Watch the arrival the moment we start waiting: if it lands AFTER the race expired the
+           turn is already discarded, and that straggler is ledgered (once) as a non-accepting
+           outcome instead of vanishing silently. */
+        if (p && typeof p.then === 'function') {
+          p.then(function (v) {
+            turn.settled = true; turn.value = v;
+            if (turn.discarded) CogCore._cortexStreamLate(turn, deps);
+          }, function () {
+            turn.settled = true;
+            if (turn.discarded) CogCore._cortexStreamLate(turn, deps);
+          });
+        }
+
+        return CogCore._cortexRace(p, ms, deps.timeout).then(function (r) {
+          turn.discarded = true;
+          if (r && r.expired) {
+            turn.ledgered = true;
+            CogCore._cortexPostOutcome(deps, client, traceId, 'timeout');
+            return { present: true, expired: true, value: null, trace_id: traceId, ledgered: true };
+          }
+          var v = r ? r.value : null;
+          turn.settled = true; turn.value = v; turn.ledgered = true;
+          return { present: true, expired: false, value: v, trace_id: traceId, ledgered: true };
+        });
+      } catch (e) { return { present: false }; }
+    },
+
+    /**
+     * Ledger a probe result the turn could not use. Fire-and-forget, at most ONE line per
+     * probe, and the action word is taken from the EXISTING vocabulary rather than invented:
+     * `passed_through` is exactly what happened — the turn decided on the original reply and
+     * this answer changed nothing. Never `accepted`: nothing from a discarded result is ever
+     * dispatched. Never throws: the ledger is a nicety, not a gate.
+     */
+    _cortexStreamLate: function (turn, deps) {
+      try {
+        if (!turn || turn.ledgered === true) return false;
+        turn.ledgered = true;
+        var client = (deps && deps.client && typeof deps.client.outcome === 'function') ? deps.client : null;
+        if (!client) return false;
+        var p = client.outcome({ trace_id: String(turn.trace_id || ''), action: 'passed_through' });
+        if (p && typeof p.then === 'function') p.then(function () {}, function () {});
+        return true;
+      } catch (e) { return false; }
     },
 
     /**

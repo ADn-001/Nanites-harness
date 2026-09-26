@@ -437,6 +437,10 @@ passes the Phase 7 validator.
 ---
 
 ### Phase 15 — Streaming-incremental detection, ledger-driven tuning, close-out  (size M/L)
+**Status: DONE** (2026-09-26) — thresholds measured and deliberately LEFT UNCHANGED; see the
+gatelog Phase 15 findings for the evidence (dispatcher acceptance 2/6, precision 66.7% at
+t=0.25-0.35, and a mutating proposal from a prose question at stock weights). The
+deterministic pass fixes 60/60 repairable corpus cases with 0 false repairs.
 **Goal:** Detection runs on accumulated deltas instead of end-of-stream, thresholds are justified
 by measured ledger data, and the work is documented, share-ready and PR'd.
 

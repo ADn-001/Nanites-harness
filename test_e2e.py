@@ -1184,5 +1184,689 @@ try:
 finally:
     shutil.rmtree(sel_dir, ignore_errors=True)
 
+# ---------------- PHASE 15 workstream A: tools/tune_thresholds.py ----------------
+# The tool is a REPORTER, never a validator: it reads the ledger and the JSON the
+# deterministic-rate script emits and prints only what the ledger can actually PROVE.
+# Every expected number below is computed BY HAND in the comment beside it, so a drift
+# in the tool is a FAIL rather than a silent redefinition of the metric.
+TUNE_DIR = tempfile.mkdtemp(prefix='cogtune-')
+TUNE_TOOL = os.path.join(BASE, 'tools', 'tune_thresholds.py')
+TUNE_MJS = os.path.join(BASE, 'tools', 'corpus_deterministic_rate.mjs')
+TUNE_CORPUS = os.path.join(BASE, 'tests', 'fixtures', 'toolcall-corpus', 'cases.json')
+# The repo top level, snapshotted BEFORE the tool ever runs, so "the tool writes nothing"
+# can be asserted against the whole tree and not just the temp dir.
+BASE_BEFORE = sorted(os.listdir(BASE))
+with open(TUNE_CORPUS, encoding='utf-8') as _f:
+    TUNE_CASES = len(json.load(_f)['cases'])
+
+
+def tune_line(op, tid, cands, out, conf, lat, **extra):
+    """One ledger record in the REAL shape local_models_daemon.py writes (op records carry
+    `op` + request.candidates as NAMES; outcome lines carry `action` and NO `op`)."""
+    rec = {'trace_id': tid, 'model': 'laya' if op == 'decide' else 'needle', 'op': op,
+           'input_redacted': True,
+           'request': {'candidates': cands} if op != 'decide' else {'state': {'seen': 1}},
+           'output': out, 'confidence': conf, 'latency_ms': lat,
+           'degraded': False, 'action': None}
+    rec.update(extra)
+    return rec
+
+
+def tune_outcome(tid, action):
+    return {'trace_id': tid, 'action': action, 'note': 'phase15 fixture'}
+
+
+def tune_call(name):
+    return [{'name': name, 'arguments': {'path': 'a.py'}}]
+
+
+# 7 repair + 2 select + 1 decide records, and 8 outcome lines on 7 of those trace_ids.
+# The needle threshold in force for every repair/select record is 0.75 (the shipped
+# DEF_SETTINGS.localModels.needle.minConfidence), and 0.70 for the laya decide record.
+TUNE_RECORDS = [
+    # r1 accepted, name inside the candidate set, conf 0.9 >= 0.75, output non-empty: CLEAN.
+    tune_line('repair', 'tr_r1', ['read_file', 'grep'], tune_call('read_file'), 0.9, 10),
+    # r2 accepted, emitted write_file but the candidate set was only [read_file]: FALSE
+    # (name_outside_candidates) - a rite the request never offered.
+    tune_line('repair', 'tr_r2', ['read_file'], tune_call('write_file'), 0.8, 20),
+    # r3 rejected: a rejected repair is never a false repair, whatever it emitted. Its
+    # 0.8 is above 0.75, so it is also a clean positive in the sweep.
+    tune_line('repair', 'tr_r3', ['grep'], tune_call('grep'), 0.8, 30),
+    # r4 accepted_by_operator with an EMPTY output: FALSE (empty_output).
+    tune_line('repair', 'tr_r4', ['read_file'], [], 0.95, 40),
+    # r5 accepted with NO confidence at all: FALSE (no_confidence - a repair nobody can
+    # grade, and the gate would have refused it).
+    tune_line('repair', 'tr_r5', ['read_file'], tune_call('read_file'), None, 50),
+    # r6 has a confidence but NO outcome line: unobservable ground truth, excluded from
+    # every rate. A 0.99 here must NOT be allowed to flatter the acceptance rate.
+    tune_line('repair', 'tr_r6', ['read_file'], tune_call('read_file'), 0.99, 60),
+    # r7 accepted at conf 0.6, BELOW the 0.75 in force: FALSE (low_confidence - the gate
+    # and the ledger disagree about the same call), and a genuine false negative at t=.75.
+    tune_line('repair', 'tr_r7', ['read_file'], tune_call('read_file'), 0.6, 70),
+    # s1 accepted cleanly; s2 was ignored by the operator, so it is not a false repair
+    # even though it emitted a name outside its candidate set.
+    tune_line('select', 'tr_s1', ['read_file', 'list_dir'], tune_call('read_file'), 0.75, 15),
+    tune_line('select', 'tr_s2', ['read_file'], tune_call('grep'), 0.6, 25),
+    # d1 never produced an outcome at all: there is nothing to accept and nothing to
+    # sweep - that must read as "no data", never as 0.0.
+    tune_line('decide', 'tr_d1', None, {'answers': {'a': {'noul': 0.7}}}, 0.7, 8),
+    tune_outcome('tr_r1', 'accepted'),
+    tune_outcome('tr_r2', 'accepted'),
+    tune_outcome('tr_r3', 'rejected'),
+    tune_outcome('tr_r4', 'accepted_by_operator'),
+    tune_outcome('tr_r5', 'accepted'),
+    tune_outcome('tr_r7', 'accepted'),
+    tune_outcome('tr_s1', 'accepted'),
+    tune_outcome('tr_s2', 'ignored_by_operator'),
+]
+TUNE_TOTAL_LINES = 18           # 10 op records + 8 outcome lines
+TUNE_REPAIR_RECORDS = 7
+TUNE_REPAIR_OUTCOMED = 6        # r6 never produced an outcome
+TUNE_REPAIR_ACCEPTED = 5        # r1, r2, r4, r5, r7  -> 5/6 = 83.3%
+TUNE_REPAIR_FALSE = 4           # r2 name, r4 empty output, r5 no conf, r7 low conf
+TUNE_REPAIR_CONF_N = 6          # every repair but r5 carries a numeric confidence
+TUNE_REPAIR_LAT = [10, 20, 30, 40, 50, 60, 70]   # n=7: p50 -> rank 4 -> 40; p95/p99 -> rank 7 -> 70
+TUNE_SWEEP_N = 5                # numeric confidence AND an outcome: r1,r2,r3,r4,r7 (r6 unscored)
+
+
+def tune_write(name, records, extra_lines=()):
+    path = os.path.join(TUNE_DIR, name)
+    with open(path, 'w', encoding='utf-8') as f:
+        for rec in list(records) + list(extra_lines):
+            f.write(rec if isinstance(rec, str) else json.dumps(rec))
+            f.write('\n')
+    return path
+
+
+def tune_run(args, cwd=None, env=None):
+    """Run the tool. Never raises into the suite: a non-zero exit is a value to assert on."""
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    return subprocess.run([sys.executable, TUNE_TOOL] + [str(a) for a in args],
+                          capture_output=True, text=True, timeout=120,
+                          cwd=cwd or TUNE_DIR, env=e)
+
+
+def tune_json(path, args=(), **kw):
+    r = tune_run(['--ledger', path, '--json'] + list(args), **kw)
+    if r.returncode != 0 or not r.stdout.strip():
+        return r, None
+    try:
+        return r, json.loads(r.stdout)
+    except Exception:
+        return r, None
+
+
+def tune_rows(j, op):
+    return {(row['threshold']): row for row in (j.get(op) or {}).get('per_threshold') or []}
+
+
+try:
+    # ---- the CLI exists ----
+    def tune_help():
+        r = tune_run(['--help'], cwd=BASE)
+        return (r.returncode == 0
+                and all(flag in r.stdout for flag in
+                        ('--ledger', '--corpus', '--deterministic', '--json', '--thresholds')))
+    lm_probe('localmodels (phase15): tune_thresholds.py --help works and documents every flag',
+             tune_help)
+
+    # ---- the arithmetic, pinned by hand ----
+    def tune_arithmetic():
+        path = tune_write('a.jsonl', TUNE_RECORDS)
+        r, j = tune_json(path)
+        if j is None:
+            print('   no JSON: rc=%s stderr=%s' % (r.returncode, r.stderr[-400:]))
+            return False
+        led = j.get('ledger') or {}
+        # "records read" counts every well-formed record line - the 10 op records AND the
+        # 8 outcome lines, because the outcome lines are records too. Per-op record counts
+        # live under each op key.
+        if led.get('total_lines') != TUNE_TOTAL_LINES or led.get('records') != 18 \
+                or led.get('skipped') != 0 or led.get('exists') is not True:
+            print('   ledger accounting wrong: %r' % led)
+            return False
+        rp = j.get('repair') or {}
+        if rp.get('records') != TUNE_REPAIR_RECORDS:
+            print('   repair.records %r != %r' % (rp.get('records'), TUNE_REPAIR_RECORDS))
+            return False
+        if (rp.get('outcomes') or {}).get('accepted') != 4 \
+                or (rp.get('outcomes') or {}).get('accepted_by_operator') != 1 \
+                or (rp.get('outcomes') or {}).get('rejected') != 1:
+            print('   repair.outcomes wrong: %r' % rp.get('outcomes'))
+            return False
+        # The FOLDED tally matches the daemon's own /health counters: 4 accepted +
+        # 1 accepted_by_operator -> accepted:5.
+        if (rp.get('outcomes_folded') or {}).get('accepted') != TUNE_REPAIR_ACCEPTED:
+            print('   repair.outcomes_folded wrong: %r' % rp.get('outcomes_folded'))
+            return False
+        acc = rp.get('acceptance') or {}
+        # 5 accepted (accepted + accepted_by_operator) over the 6 repairs that produced an
+        # outcome at all -> 83.3%. r6 never produced one, so it is NOT in the denominator:
+        # a proposal nobody ever answered for is not evidence of acceptance.
+        if acc.get('accepted') != TUNE_REPAIR_ACCEPTED or acc.get('denominator') != TUNE_REPAIR_OUTCOMED \
+                or abs((acc.get('rate') or 0) - (5.0 / 6.0)) > 1e-6:
+            print('   repair acceptance wrong: %r' % acc)
+            return False
+        if (rp.get('unobservable_ground_truth') or 0) != 1:
+            print('   repair.unobservable_ground_truth %r != 1'
+                  % rp.get('unobservable_ground_truth'))
+            return False
+        fr = rp.get('false_repair') or {}
+        # 4 of the 5 accepted repairs are provably defective, one for each reason the
+        # definition allows: r2 name outside candidates, r4 empty output, r5 no
+        # confidence, r7 confidence 0.6 below the 0.75 in force.
+        if fr.get('count') != TUNE_REPAIR_FALSE or fr.get('denominator') != 5 \
+                or abs((fr.get('rate') or 0) - 0.8) > 1e-9:
+            print('   false repair wrong: %r' % fr)
+            return False
+        if (fr.get('by_reason') or {}) != {'name_outside_candidates': 1, 'empty_output': 1,
+                                            'no_confidence': 1, 'low_confidence': 1}:
+            print('   false_repair.by_reason wrong: %r' % fr.get('by_reason'))
+            return False
+        lat = rp.get('latency_ms') or {}
+        if lat.get('n') != 7 or lat.get('p50') != 40 or lat.get('p95') != 70 or lat.get('p99') != 70:
+            print('   repair percentiles wrong: %r' % lat)
+            return False
+        if rp.get('confidence_n') != TUNE_REPAIR_CONF_N:
+            print('   repair.confidence_n %r != %r' % (rp.get('confidence_n'), TUNE_REPAIR_CONF_N))
+            return False
+        rows = tune_rows(j, 'repair')
+        # t=0.75 (the value we SHIP): predicted r1(.9) r2(.8) r3(.8) r4(.95); r7(.6) and
+        # the unscored r6 are below it. r1/r2/r4 were accepted, r3 was rejected, r7 was
+        # accepted -> tp=3 fp=1 fn=1 tn=0 -> precision 0.750, recall 0.750.
+        row = rows.get(0.75) or {}
+        if (row.get('tp'), row.get('fp'), row.get('fn')) != (3, 1, 1) \
+                or abs((row.get('precision') or 0) - 0.75) > 1e-9 \
+                or abs((row.get('recall') or 0) - 0.75) > 1e-9:
+            print('   sweep row 0.75 wrong: %r' % row)
+            return False
+        # t=0.85: predicted r1(.9) r4(.95) only -> tp=2 fp=0 fn=2 (r2 .8 and r7 .6 were
+        # both accepted) -> precision 1.000, recall 0.500.
+        row = rows.get(0.85) or {}
+        if (row.get('tp'), row.get('fp'), row.get('fn')) != (2, 0, 2) \
+                or abs((row.get('precision') or 0) - 1.0) > 1e-9 \
+                or abs((row.get('recall') or 0) - 0.5) > 1e-9:
+            print('   sweep row 0.85 wrong: %r' % row)
+            return False
+        if row.get('n') != TUNE_SWEEP_N:
+            print('   sweep row scored %r records, expected %r' % (row.get('n'), TUNE_SWEEP_N))
+            return False
+        sel = j.get('select') or {}
+        sacc = sel.get('acceptance') or {}
+        # s1 accepted, s2 ignored -> 1/2. Neither is a false repair: s2 was REJECTED, and
+        # a rejected proposal cannot have done harm.
+        if (sel.get('records') != 2 or sacc.get('accepted') != 1 or sacc.get('denominator') != 2
+                or (sel.get('latency_ms') or {}).get('p50') != 15
+                or ((sel.get('false_repair') or {}).get('count') or 0) != 0):
+            print('   select wrong: %r' % sel)
+            return False
+        dec = j.get('decide') or {}
+        # d1 never produced an outcome, so there is nothing to accept: no data, not 0.0.
+        if (dec.get('acceptance') or {}).get('rate') is not None \
+                or (dec.get('acceptance') or {}).get('denominator') != 0:
+            print('   decide acceptance should be no-data: %r' % dec.get('acceptance'))
+            return False
+        if (dec.get('latency_ms') or {}).get('p50') != 8:
+            print('   decide percentiles wrong: %r' % dec.get('latency_ms'))
+            return False
+        return True
+    lm_probe('localmodels (phase15): the hand-computed acceptance rate, false-repair count, '
+             'per-threshold tp/fp/fn and p50/p95/p99 all match the synthetic ledger',
+             tune_arithmetic)
+
+    # ---- a zero denominator is null, never a division and never 0.0 ----
+    def tune_zero_denominator():
+        path = tune_write('a.jsonl', TUNE_RECORDS)
+        r, j = tune_json(path, ['--thresholds', '0.96,0.75'])
+        if j is None:
+            return False
+        row = (tune_rows(j, 'repair') or {}).get(0.96) or {}
+        # Nothing scores >= 0.96 among the five scored records -> precision has a 0
+        # denominator. It must be null, NOT 0.0 (which would read as "measured, and bad")
+        # and not a crash. All four accepted records with a numeric confidence are missed.
+        if row.get('tp') != 0 or row.get('fp') != 0 or row.get('fn') != 4:
+            print('   t=0.96 counts wrong: %r' % row)
+            return False
+        if row.get('precision') is not None:
+            print('   precision should be null on a zero denominator, got %r' % row.get('precision'))
+            return False
+        if abs((row.get('recall') or 0)) > 1e-9:
+            print('   recall 0/4 should be 0.0: %r' % row.get('recall'))
+            return False
+        # decide has no outcome at all, so EVERY row of its sweep is undefined.
+        drow = (tune_rows(j, 'decide') or {}).get(0.75) or {}
+        if drow.get('precision') is not None or drow.get('recall') is not None:
+            print('   decide sweep row should be all-null: %r' % drow)
+            return False
+        r2 = tune_run(['--ledger', path, '--thresholds', '0.96'])
+        if r2.returncode != 0 or 'Traceback' in r2.stderr:
+            return False
+        return ('n/a' in r2.stdout)
+    lm_probe('localmodels (phase15): a zero denominator prints/returns null ("n/a"), never a '
+             'divide and never a 0.0 that reads like a measurement', tune_zero_denominator)
+
+    # ---- a missing ledger is an honest no-data, not a traceback and not a rate ----
+    def tune_missing():
+        missing = os.path.join(TUNE_DIR, 'not-here.jsonl')
+        r = tune_run(['--ledger', missing], cwd=BASE)
+        if r.returncode != 0 or 'Traceback' in r.stderr:
+            print('   rc=%s stderr=%s' % (r.returncode, r.stderr[-400:]))
+            return False
+        if 'no data' not in r.stdout.lower():
+            print('   a missing ledger did not say "no data":\n%s' % r.stdout)
+            return False
+        # A rate computed from zero records must not be printed AT ALL: no percentage.
+        if '%' in r.stdout:
+            print('   a missing ledger printed a percentage anyway:\n%s' % r.stdout)
+            return False
+        r2, j = tune_json(missing, cwd=BASE)
+        if j is None:
+            return False
+        return ((j.get('ledger') or {}).get('exists') is False
+                and (j.get('ledger') or {}).get('records') == 0
+                and ((j.get('repair') or {}).get('acceptance') or {}).get('rate') is None
+                and ((j.get('repair') or {}).get('latency_ms') or {}).get('p50') is None)
+    lm_probe('localmodels (phase15): a MISSING ledger exits 0, says "no data" and prints no '
+             'rate at all', tune_missing)
+
+    # ---- an all-malformed ledger is the same honest no-data ----
+    def tune_all_malformed():
+        # Five lines, none of which is a JSON OBJECT: prose, a truncated record, a JSON
+        # array, a JSON string and a bare number. All five must be skipped, never fatal.
+        path = tune_write('junk.jsonl', ['not json at all', '{"op":"repair",',
+                                         '[1,2,3]', '"a string"', '42'])
+        r = tune_run(['--ledger', path], cwd=BASE)
+        if r.returncode != 0 or 'Traceback' in r.stderr or 'no data' not in r.stdout.lower():
+            print('   rc=%s stdout=%s' % (r.returncode, r.stdout[-500:]))
+            return False
+        if '%' in r.stdout:
+            print('   an all-malformed ledger printed a percentage:\n%s' % r.stdout)
+            return False
+        r2, j = tune_json(path, cwd=BASE)
+        if j is None:
+            return False
+        return ((j.get('ledger') or {}).get('records') == 0
+                and (j.get('ledger') or {}).get('skipped') == 5
+                and ((j.get('repair') or {}).get('false_repair') or {}).get('rate') is None)
+    lm_probe('localmodels (phase15): an all-malformed ledger is the same clean "no data" '
+             'report, never a traceback and never a fabricated 0.0', tune_all_malformed)
+
+    # ---- the .mjs runs on plain node and reports the corpus it was given ----
+    def tune_mjs():
+        try:
+            r = subprocess.run(['node', TUNE_MJS], capture_output=True, text=True,
+                               timeout=120, cwd=BASE)
+        except FileNotFoundError:
+            print('   node not on PATH - skipping the corpus rate check')
+            return True
+        except subprocess.TimeoutExpired:
+            print('   node timed out on the corpus')
+            return False
+        if r.returncode != 0:
+            print('   rc=%s stderr=%s' % (r.returncode, r.stderr[-400:]))
+            return False
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        if len(lines) != 1:
+            print('   expected ONE json line on stdout, got %d' % len(lines))
+            return False
+        try:
+            j = json.loads(lines[0])
+        except Exception as e:
+            print('   stdout is not json: %s' % e)
+            return False
+        if j.get('total') != TUNE_CASES:
+            print('   total %r != the %d cases in cases.json' % (j.get('total'), TUNE_CASES))
+            return False
+        rate = j.get('rate')
+        if not isinstance(rate, (int, float)) or not 0.0 <= rate <= 1.0:
+            print('   rate %r is not a real rate' % rate)
+            return False
+        cats = j.get('by_category')
+        if not isinstance(cats, dict) or not cats or 'narration-recovery' not in cats:
+            print('   by_category missing/empty: %r' % cats)
+            return False
+        for name, row in cats.items():
+            if (not isinstance(row, dict) or row.get('total', 0) < 1
+                    or not isinstance(row.get('fixed'), int)):
+                print('   by_category[%r] malformed: %r' % (name, row))
+                return False
+        if not isinstance(j.get('fixed'), int) or not isinstance(j.get('unchanged_correct'), int):
+            print('   fixed/unchanged_correct must be integers: %r' % j)
+            return False
+        if 'false_repairs' in j and j['false_repairs'] != 0:
+            print('   the deterministic pass reported false repairs: %r' % j['false_repairs'])
+            return False
+        print('   corpus rate => %r' % lines[0][:400])
+        return True
+    lm_probe('localmodels (phase15): tools/corpus_deterministic_rate.mjs runs on plain node, '
+             'exits 0 and emits one parseable JSON line covering all %d cases' % TUNE_CASES,
+             tune_mjs)
+
+    # ---- malformed lines are SKIPPED, and skipping changes nothing else ----
+    def tune_malformed_tolerance():
+        clean = tune_write('clean.jsonl', TUNE_RECORDS)
+        _, jc = tune_json(clean)
+        dirty = tune_write('dirty.jsonl', TUNE_RECORDS,
+                           extra_lines=['', '   ', 'not json at all', '{"op":"repair",',
+                                        '[1,2,3]', '"a string"', '42', 'null', '{}',
+                                        json.dumps({'op': 'repair', 'confidence': 'high'})])
+        _, jd = tune_json(dirty)
+        if jc is None or jd is None:
+            print('   clean=%s dirty=%s' % (jc is not None, jd is not None))
+            return False
+        # The good records must produce BYTE-IDENTICAL metrics; only the line counters move.
+        for key in ('records', 'outcomes', 'outcomes_folded', 'accepted',
+                    'outcomes_recorded', 'unobservable_ground_truth', 'degraded',
+                    'confidence_n', 'acceptance', 'false_repair', 'latency_ms',
+                    'per_threshold'):
+            if (jc['repair'].get(key) != jd['repair'].get(key)
+                    or jc['select'].get(key) != jd['select'].get(key)
+                    or jc['decide'].get(key) != jd['decide'].get(key)):
+                print('   a malformed line moved repair.%s: %r -> %r'
+                      % (key, jc['repair'].get(key), jd['repair'].get(key)))
+                return False
+        # 9 junk lines, one of which ('{}') is a valid but contentless record.
+        ld, lc = jd['ledger'], jc['ledger']
+        if ld['total_lines'] != lc['total_lines'] + 10 or ld['records'] != lc['records'] + 2:
+            print('   line accounting wrong: %r vs %r' % (ld, lc))
+            return False
+        if ld['skipped'] != lc['skipped'] + 8:
+            print('   skipped count wrong: %r' % ld)
+            return False
+        # And a non-numeric confidence must not be counted as one.
+        return True
+    lm_probe('localmodels (phase15): blank / garbage / truncated / non-object lines are '
+             'SKIPPED and the good records still produce byte-identical metrics',
+             tune_malformed_tolerance)
+
+    # ---- a name outside the recorded candidate set is called out as a false repair ----
+    def tune_false_repair_named():
+        # One accepted repair whose emitted name is NOT in the candidate set the same
+        # request recorded, and one clean accepted repair. The tool must count 1 of 2 and
+        # name the reason, and must print both counts - a bare "50%" hides n=2.
+        path = tune_write('cand.jsonl', [
+            tune_line('repair', 'tr_c1', ['read_file'], tune_call('write_file'), 0.9, 5),
+            tune_line('repair', 'tr_c2', ['read_file', 'grep'], tune_call('read_file'), 0.9, 6),
+            tune_outcome('tr_c1', 'accepted'),
+            tune_outcome('tr_c2', 'accepted'),
+        ])
+        r, j = tune_json(path)
+        if j is None:
+            return False
+        fr = (j.get('repair') or {}).get('false_repair') or {}
+        if fr.get('count') != 1 or fr.get('denominator') != 2 \
+                or (fr.get('by_reason') or {}).get('name_outside_candidates') != 1:
+            print('   name_outside_candidates not detected: %r' % fr)
+            return False
+        # A record with NO recorded candidate set is unobservable, not a pass.
+        path2 = tune_write('nocand.jsonl', [
+            tune_line('repair', 'tr_n1', None, tune_call('read_file'), 0.9, 5),
+            tune_outcome('tr_n1', 'accepted'),
+        ])
+        _, j2 = tune_json(path2)
+        fr2 = ((j2 or {}).get('repair') or {}).get('false_repair') or {}
+        if fr2.get('candidates_unobservable') != 1:
+            print('   a record with no candidate set should be reported unobservable: %r' % fr2)
+            return False
+        # The human report must say which rite escaped the candidate set.
+        h = tune_run(['--ledger', path])
+        return (h.returncode == 0 and 'name_outside_candidates' in h.stdout
+                and '1/2' in h.stdout)
+    lm_probe('localmodels (phase15): a repair whose rite name falls OUTSIDE the recorded '
+             'candidate set is counted as a false repair and named in the report',
+             tune_false_repair_named)
+
+    # ---- the --json contract the integrator scripts against ----
+    def tune_json_contract():
+        path = tune_write('a.jsonl', TUNE_RECORDS)
+        det = os.path.join(TUNE_DIR, 'det.json')
+        r = subprocess.run(['node', TUNE_MJS], capture_output=True, text=True, timeout=120,
+                           cwd=BASE)
+        if r.returncode == 0 and r.stdout.strip():
+            with open(det, 'w', encoding='utf-8') as f:
+                f.write(r.stdout)
+        r2, j = tune_json(path, ['--deterministic', det] if os.path.isfile(det) else [])
+        if j is None:
+            return False
+        if set(j) != {'ledger', 'corpus', 'deterministic', 'per_threshold',
+                      'repair', 'select', 'decide'}:
+            print('   top-level keys: %r' % sorted(j))
+            return False
+        for op in ('repair', 'select', 'decide'):
+            block = j[op]
+            for key in ('records', 'outcomes', 'confidence_n', 'acceptance', 'false_repair',
+                        'latency_ms', 'per_threshold'):
+                if key not in block:
+                    print('   %s is missing the stable key %r' % (op, key))
+                    return False
+            lat = block['latency_ms']
+            if set(lat) < {'p50', 'p95', 'p99', 'n'}:
+                print('   %s.latency_ms keys: %r' % (op, sorted(lat)))
+                return False
+            for row in block['per_threshold']:
+                for key in ('threshold', 'tp', 'fp', 'fn', 'precision', 'recall'):
+                    if key not in row:
+                        print('   %s.per_threshold row missing %r: %r' % (op, key, row))
+                        return False
+                for key in ('precision', 'recall'):
+                    v = row[key]
+                    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                        print('   %s.%s must be a number or null, got %r' % (op, key, v))
+                        return False
+        # No NaN/Infinity anywhere: those are not valid JSON and would silently survive
+        # json.loads() in a consumer while meaning nothing.
+        raw = tune_run(['--ledger', path, '--json']).stdout
+        if 'NaN' in raw or 'Infinity' in raw:
+            print('   the JSON contains NaN/Infinity')
+            return False
+        # --thresholds must REPLACE the grid, not extend it.
+        _, j3 = tune_json(path, ['--thresholds', '0.3,0.9'])
+        grid = [(row['threshold']) for row in j3['repair']['per_threshold']]
+        if grid != [0.3, 0.9]:
+            print('   --thresholds grid wrong: %r' % grid)
+            return False
+        # ... and the DEFAULT grid must always contain the two shipped values.
+        _, j4 = tune_json(path)
+        default_grid_thresholds = j4['per_threshold']
+        for shipped in (0.75, 0.70):
+            if shipped not in default_grid_thresholds:
+                print('   the default grid is missing the shipped %r' % shipped)
+                return False
+        if len(default_grid_thresholds) != 19:
+            print('   the default grid is %d points, expected 19 (0.05..0.95)'
+                  % len(default_grid_thresholds))
+            return False
+        # A malformed --thresholds entry is a loud error, not a silently shorter grid.
+        bad = tune_run(['--ledger', path, '--thresholds', '0.5,oops'])
+        return (bad.returncode != 0 and 'oops' in (bad.stderr + bad.stdout))
+    lm_probe('localmodels (phase15): --json carries every stable key with null (never NaN) '
+             'where unobservable, and --thresholds replaces the grid while the default keeps '
+             'the shipped 0.75/0.70', tune_json_contract)
+
+    # ---- the deterministic section is fed in, never invented ----
+    def tune_deterministic_section():
+        path = tune_write('a.jsonl', TUNE_RECORDS)
+        # (a) not supplied: the DETERMINISTIC section says "no data" and prints no rate.
+        # Scope the check to that section only. A bare `'%' in r.stdout` is a false
+        # positive: a real ledger legitimately prints acceptance / sweep percentages
+        # elsewhere in the same report, which has nothing to do with this section.
+        r = tune_run(['--ledger', path])
+        det_block = r.stdout.split('-- deterministic-pass fix rate --', 1)[-1].split('--', 1)[0]
+        if 'no data' not in det_block.lower() or '%' in det_block:
+            print('   an unsupplied deterministic section printed a rate:\n%s'
+                  % det_block[:600])
+            return False
+        # (b) supplied with the real .mjs output: the rate comes through verbatim.
+        det = os.path.join(TUNE_DIR, 'det.json')
+        try:
+            mjs = subprocess.run(['node', TUNE_MJS], capture_output=True, text=True,
+                                 timeout=120, cwd=BASE)
+        except FileNotFoundError:
+            print('   node not on PATH - skipping the deterministic feed-in check')
+            return True
+        if mjs.returncode != 0:
+            return False
+        with open(det, 'w', encoding='utf-8') as f:
+            f.write(mjs.stdout)
+        r2, j = tune_json(path, ['--deterministic', det])
+        src = json.loads(mjs.stdout)
+        if j is None or (j.get('deterministic') or {}).get('rate') != src['rate'] \
+                or (j.get('deterministic') or {}).get('total') != TUNE_CASES:
+            print('   the supplied rate did not come through: %r' % (j or {}).get('deterministic'))
+            return False
+        h = tune_run(['--ledger', path, '--deterministic', det])
+        # (c) an unreadable --deterministic file is no data, not a crash and not 0.0.
+        bad = tune_run(['--ledger', path, '--deterministic',
+                        os.path.join(TUNE_DIR, 'no-such-det.json')])
+        _, j3 = tune_json(path, ['--deterministic', os.path.join(TUNE_DIR, 'nope.json')])
+        bad_block = bad.stdout.split('-- deterministic-pass fix rate --', 1)[-1].split('--', 1)[0]
+        return (h.returncode == 0 and '%' in h.stdout
+                and bad.returncode == 0 and 'no data' in bad_block.lower()
+                and (j3.get('deterministic') or {}).get('rate') is None)
+    lm_probe('localmodels (phase15): the deterministic section reports "not supplied" '
+             'plainly, feeds a supplied rate through verbatim, and turns an unreadable '
+             '--deterministic file into no data', tune_deterministic_section)
+
+    # ---- $LEDGER_PATH resolution, exactly ledger.default_path() precedence ----
+    def tune_ledger_path_env():
+        path = tune_write('env.jsonl', TUNE_RECORDS)
+        # With the env var set and no --ledger, the tool must read THAT file.
+        rr = tune_run(['--json'], cwd=BASE, env={'LEDGER_PATH': path})
+        if rr.returncode != 0:
+            print('   rc=%s stderr=%s' % (rr.returncode, rr.stderr[-300:]))
+            return False
+        try:
+            jj = json.loads(rr.stdout)
+        except Exception as e:
+            print('   stdout not json: %s' % e)
+            return False
+        if (jj.get('ledger') or {}).get('path') != path \
+                or (jj.get('repair') or {}).get('records') != TUNE_REPAIR_RECORDS:
+            print('   $LEDGER_PATH was not honoured: %r' % (jj.get('ledger') or {}).get('path'))
+            return False
+        # An explicit --ledger must WIN over the env var.
+        other = tune_write('other.jsonl', TUNE_RECORDS[:1])
+        rr2 = tune_run(['--ledger', other, '--json'], cwd=BASE, env={'LEDGER_PATH': path})
+        if (json.loads(rr2.stdout).get('ledger') or {}).get('path') != other:
+            print('   --ledger did not override $LEDGER_PATH')
+            return False
+        # With neither, the default is the repo-relative path ledger.default_path() uses -
+        # and it may well not exist, which must be a clean no-data, not a crash.
+        rr3 = tune_run(['--json'], cwd=BASE, env={'LEDGER_PATH': ''})
+        if rr3.returncode != 0 or 'Traceback' in rr3.stderr:
+            print('   the default path did not degrade cleanly: %r' % rr3.stderr[-300:])
+            return False
+        jd = json.loads(rr3.stdout)
+        return (jd['ledger']['path'] == 'var/local-models.jsonl'
+                or jd['ledger']['path'].endswith(os.path.join('var', 'local-models.jsonl')))
+    lm_probe('localmodels (phase15): the default ledger path follows ledger.default_path() '
+             'precedence ($LEDGER_PATH, then var/local-models.jsonl) and --ledger overrides it',
+             tune_ledger_path_env)
+
+    # ---- the tool is a READER: running it must not create a single file ----
+    def tune_writes_nothing():
+        path = tune_write('a.jsonl', TUNE_RECORDS)
+        det = os.path.join(TUNE_DIR, 'det.json')
+        before = sorted(os.listdir(TUNE_DIR))
+        before_stat = os.stat(path)
+        r = tune_run(['--ledger', path, '--corpus', TUNE_CORPUS], cwd=TUNE_DIR)
+        r2 = tune_run(['--ledger', path, '--json'], cwd=TUNE_DIR)
+        after = sorted(os.listdir(TUNE_DIR))
+        if before != after:
+            print('   the tool created %r' % (set(after) - set(before)))
+            return False
+        # The ledger must be untouched, not even re-sorted or re-flushed.
+        after_stat = os.stat(path)
+        if (before_stat.st_size, before_stat.st_mtime) != (after_stat.st_size, after_stat.st_mtime):
+            print('   the tool modified the ledger it was asked to read')
+            return False
+        if sorted(os.listdir(BASE)) != BASE_BEFORE:
+            print('   the tool created %r in the repo'
+                  % (set(os.listdir(BASE)) - set(BASE_BEFORE)))
+            return False
+        # A missing ledger must not be CREATED either - that is the classic way a "reader"
+        # silently becomes a second writer.
+        gone = os.path.join(TUNE_DIR, 'gone.jsonl')
+        tune_run(['--ledger', gone], cwd=TUNE_DIR)
+        # NOTE: do NOT assert `det.json` is absent from TUNE_DIR. An EARLIER phase-15 case
+        # writes that file there on purpose, so it is present in `before` too; asserting its
+        # absence tested a shared-fixture assumption, not the tool. "This test's runs created
+        # nothing" is exactly the `before != after` check above.
+        return r.returncode == 0 and r2.returncode == 0 and not os.path.exists(gone)
+    lm_probe('localmodels (phase15): running the tool writes NO file anywhere - not in the '
+             'temp dir, not in the repo, and it never creates the ledger it was asked to read',
+             tune_writes_nothing)
+
+    # ---- a real daemon's ledger, read back through the tool ----
+    def tune_real_daemon_ledger():
+        # The strongest check available: boot the real --no-needle daemon, POST a /repair
+        # and a /select so the daemon appends REAL records in the REAL shape, then read
+        # them with the tool. The synthetic fixture cannot catch a field-name drift
+        # between this tool and local_models_daemon.py; this can.
+        d = tempfile.mkdtemp(prefix='cogtunedaemon-')
+        led = os.path.join(d, 'real.jsonl')
+        port = 18973
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+             '--port', str(port), '--ledger', led, '--no-needle', '--no-laya'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
+        try:
+            time.sleep(1.2)
+            req(port, '/repair', {'suspect': {'name': 'read-file', 'args': '{"path":"a.py"}'},
+                                  'candidates': SEL_TOOLS, 'trace_id': 'tr_real_repair'})
+            req(port, '/select', {'input': 'read main.py', 'candidates': SEL_TOOLS,
+                                  'trace_id': 'tr_real_select'})
+            # A real operator ACCEPT on the repair, and IGNORE on the select.
+            req(port, '/ledger', {'trace_id': 'tr_real_repair', 'action': 'accepted',
+                                  'note': 'phase15 e2e'})
+            req(port, '/ledger', {'trace_id': 'tr_real_select', 'action': 'ignored_by_operator'})
+            rr, j = tune_json(led, cwd=BASE)
+            if j is None:
+                print('   the daemon ledger did not parse: rc=%s' % rr.returncode)
+                return False
+            if (j.get('ledger') or {}).get('records') != 4:
+                print('   expected 4 real records, got %r' % (j.get('ledger') or {}))
+                return False
+            rp = j.get('repair') or {}
+            # A --no-needle repair degrades: the output is {degraded:...} with no call, so
+            # an ACCEPTED degraded repair is exactly the empty_output false repair.
+            if (rp.get('outcomes_folded') or {}).get('accepted') != 1 \
+                    or (rp.get('acceptance') or {}).get('denominator') != 1:
+                print('   real repair acceptance wrong: %r / %r'
+                      % (rp.get('outcomes_folded'), rp.get('acceptance')))
+                return False
+            fr = rp.get('false_repair') or {}
+            if fr.get('count') != 1 or (fr.get('by_reason') or {}).get('empty_output') != 1:
+                print('   a real accepted degraded repair was not flagged: %r' % fr)
+                return False
+            if rp.get('degraded') != 1:
+                print('   degraded not counted from a real record: %r' % rp.get('degraded'))
+                return False
+            # The ignored select is NOT a false repair: nothing was acted on.
+            if ((j.get('select') or {}).get('false_repair') or {}).get('count') != 0:
+                print('   an ignored proposal was counted as a false repair')
+                return False
+            # r5-style: a real degraded record has confidence None, so confidence_n is 0
+            # and every sweep row must be null rather than a fabricated 0.
+            if rp.get('confidence_n') != 0 or rp['per_threshold'][0]['precision'] is not None:
+                print('   a real null-confidence record produced a measurable rate')
+                return False
+            h = tune_run(['--ledger', led], cwd=BASE)
+            return h.returncode == 0 and 'Traceback' not in h.stderr
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            shutil.rmtree(d, ignore_errors=True)
+    lm_probe('localmodels (phase15): a REAL --no-needle daemon ledger (repair + select + a '
+             'real accepted/ignored outcome join) reads back with the right acceptance, '
+             'false-repair and degraded counts', tune_real_daemon_ledger)
+finally:
+    shutil.rmtree(TUNE_DIR, ignore_errors=True)
+
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)

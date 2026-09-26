@@ -977,8 +977,10 @@ one big-model request and no dispatch, `disabled` ⇒ no `/select` at all; full 
   lowered threshold must keep.
 
 ## Phase 15 — Streaming-incremental detection, ledger-driven tuning, close-out
-Status: not started
-Test suite: `tests/frontend/phase15_incremental.test.js` + `tools/tune_thresholds.py` report
+Status: **DONE**
+Test suite: `tests/frontend/phase15_incremental.test.js` (39 checks) + 11
+`localmodels (phase15):` cases in `test_e2e.py` + `tools/tune_thresholds.py` /
+`tools/corpus_deterministic_rate.mjs`
 
 Deliverable: incremental cheap detection on accumulated deltas (at most one fire-and-forget repair
 probe per turn, never awaited inside `pumpSSE`, never buffering the stream); threshold tuning from
@@ -991,7 +993,93 @@ both models loaded; thresholds recorded with their ledger evidence; `git status`
 machine-specific changes; PR opened against `main`.
 
 ### Findings
-(empty — fill in during this phase's Test/Debug Sprint)
+- **GATE: Satisfied, with ONE criterion blocked by the HOST (Laya live leg), same as Phase 13.**
+  `node tests/frontend/run.js` → `FRONTEND SUITE: ALL GREEN`; `python3 test_e2e.py` → `0
+  FAILURES` (11 new `localmodels (phase15):` cases). Live suites: `COG_LIVE_MODELS=1 python3 -m
+  unittest discover tests/live` → exit 0; **Needle live leg is genuinely GREEN against the real
+  untuned model** (`test_repair_cases_contract`, `test_canonical_names_when_repaired`,
+  `test_no_match_prompt_yields_no_calls`). The Laya leg still cannot serve on this musl host
+  (`onnxruntime-node` prebuild is glibc-only: `__getauxval: symbol not found`) and only skips
+  under the documented `COG_LIVE_LAYA_ALLOW_UNSERVABLE=1`. **That leg remains UNVERIFIED
+  against a real Laya model** — re-run it on a glibc host and record the numbers here.
+  PR #2 updated (not re-opened).
+- **THE PRIOR RUN LEFT THE TREE BROKEN, AND IT IS THE PHASE'S OWN MUTATION PROBE.** Workstream
+  B's spec required 3 deliberate mutations as proof the suite was real; mutation (2) — "await
+  the probe inside the stream pump" — was left IN the tree. `cortexStreamTick` is a **non-async**
+  function, so `await det.probe` inside it is a page-level **SyntaxError** in the inline script,
+  which took down **all 15 frontend suites** (`npm test` reported `15 FAILING FILE(S)`; the
+  phase-8/9 failures looked like unrelated regressions — they were one bad line). Fixed by
+  restoring the fire-and-forget stash. **LESSON FOR EVERY FUTURE PHASE: a mutation probe is a
+  temporary edit, not a deliverable — revert it and re-run the FULL suite before you commit.**
+  If the whole suite goes red at once after a change that should have been additive, suspect a
+  page-level SyntaxError in `index.html` first, not fifteen separate regressions.
+- **THRESHOLDS: MEASURED, AND THE MEASUREMENT OVERTURNED THE PHASE 14 HYPOTHESIS.** Phase 14
+  recorded that `dispatcher.minConfidence` 0.75 is "UNREACHABLE by the untuned model" and that
+  Phase 15 should lower it. **Do not lower it.** 14 real daemon calls on the stock weights
+  (8 `/repair`, 6 `/select`, each in a FRESH daemon — see the trap below) give, via
+  `tools/tune_thresholds.py`: dispatcher **acceptance 2/6 = 33%**, and precision of only
+  **66.7% across t=0.25–0.35**, reaching 100% precision only at t≥0.40 where recall collapses
+  to 50%. `needle.minConfidence` and `dispatcher.minConfidence` therefore **STAY at 0.75**; the
+  defaults are unchanged and now carry a comment recording the evidence.
+- **THE REASON IS A SAFETY FACT, NOT A TUNING NICETY: the untuned model's confidence does NOT
+  track correctness.** It answered `read_file` when `list_dir` was the right rite **at
+  confidence 0.96**, and — the serious one — it proposed a **MUTATING `write_file` from a pure
+  prose question that named no tool at all**. Lowering the bar would buy recall with mutating
+  proposals. The current fail-closed default means a friend who enables LOCAL CORTEX on stock
+  weights gets a quiet no-op instead of confidently wrong rites. **Re-tune only against a tuned
+  `.cact` checkpoint, never the base weights.**
+- **THE DETERMINISTIC PASS IS THE REAL FIXER; THE MODEL IS THE FALLBACK.** `node
+  tools/corpus_deterministic_rate.mjs` over the 89-case golden corpus: **60 of 60 repairable
+  cases fixed = 100%**, 26 unchanged-correct, **0 false repairs**, 0 ambiguous guesses, 15
+  unrepairable (ambiguous-name, unknown-name, garbage) correctly refused. That is the number
+  that matters, and it is why Phase 15's incremental detection deliberately does **not** spend a
+  model probe on anything the cheap stage would have fixed anyway.
+- **FOUR TRAPS, each of which silently produced a plausible-looking WRONG measurement** (all
+  cost real time; none raised an error):
+  1. **The daemon must be launched with the sidecar venv python, not `sys.executable`.** With
+     the system python the daemon is HEALTHY (`/health` ok, weights "present", `degraded: []`)
+     and repairs **nothing** — indistinguishable from a model failure.
+  2. **The route contract is `{suspect, candidates}` / `{input, candidates}`**, NOT
+     `{text, tools}`. A wrong key yields `calls: []` with no error and no degraded flag.
+  3. **`/select` answers with the SAME envelope as `/repair`** — `calls` + a top-level
+     `confidence`. There is **no `proposals` key on the wire**; the frontend derives the cards.
+  4. **The model's `_active` conversation is sticky PER PROCESS** (the Phase 12 finding, now
+     confirmed to corrupt calibration data, not just no-match probes). Probing 8 cases through
+     ONE daemon made 6 of 8 answers collapse onto the first case's rite — a fabricated band.
+     **Every calibration probe needs its own daemon**, or the numbers are fiction.
+  Plus a self-inflicted one: a **duplicate `trace_id` across probes** makes the ledger outcome
+  join ambiguous and inflated 6 records into 36 counted outcomes. Use a unique `trace_id` per
+  probe.
+- **`cortexSettle` MUST be awaited.** `_cortexStreamSettle` returns a PROMISE whenever it must
+  wait on an in-flight probe and a plain object otherwise. An earlier revision read `.present`
+  off the returned value **synchronously** — the promise has no `present`, so every early probe
+  looked absent and the turn spent a **SECOND** `/repair` at the end-of-stream stage. `await`
+  handles both shapes. This is pinned by the suite ("the end-of-stream stage asks NOTHING again").
+- **The one-probe-per-turn latch is shared, not per-stage.** The latch lives on the turn holder
+  so the SAME budget covers the early probe and the end-of-stream stage; a turn spends at most
+  one `/repair` whichever path gets there first (pinned: many broken deltas across many calls
+  still cost exactly one). A late result is **discarded but still ledgered**, using the EXISTING
+  action vocabulary — no new action words were invented in this phase either.
+- **Incremental detection reads PARTIAL deltas and never blocks the stream** — pinned
+  end-to-end: the probe fires before `[DONE]`, and the pump delivers the first content delta
+  while the probe is still in flight. A hanging `/repair` does not hang the turn (bounded wait
+  ledgered as the existing `timeout` action, original call passes through).
+- **`localModels.enabled:false` ⇒ ZERO requests to :8932 through a whole turn**, transcript
+  identical to a cortex-off run — the "off means off" guarantee survives the new seam.
+- **The tuning tool refuses to fabricate.** Missing / empty / all-malformed ledger ⇒ exit 0 with
+  an explicit `no data` and **no rate printed as if measured**; unobservable values are `null`,
+  never `NaN` and never a bare `0`. It is a **reader** of the ledger, never a writer, and writes
+  no file anywhere (pinned). Stable JSON keys: `ledger, deterministic, repair, select, decide,
+  per_threshold`; per op `records, outcomes, confidence_n, acceptance, false_repair, latency_ms
+  {p50,p95,p99,n}, per_threshold[{threshold,tp,fp,fn,precision,recall}]`.
+- **README.txt gained a LOCAL CORTEX section** (what it is, off-by-default, install per
+  platform, settings table, "never in the critical path", privacy, safety, `/health` check).
+  Doc gaps found and **deliberately not fixed here** (a later docs pass, not a code change):
+  `localmodels/README.md` does not document `/select` or the `--needle-select-timeout-ms` flag
+  added in Phase 14, omits `dispatcher.*` entirely, and its `/health` example lacks the
+  `ledger.counts` object. Also: **`needle.confirmBand` ships in DEFAULTS but no code reads
+  it** — the plan called for a confirmation band and nothing implements it. Left as reserved;
+  do not document it as working behaviour.
 
 ## Notes
 
@@ -1096,3 +1184,19 @@ machine-specific changes; PR opened against `main`.
      `needle` import lazy, which the musl host requires.
   8. PR #2 for this branch already exists (opened by the operator) — Phase 15 must comment on
      it, not open a second one.
+- 2026-09-26 (Phase 15 session, cron): Phase 15 done and committed. **STATE CORRECTION:** the
+  previous run exited mid-phase with `gatelog.md` still reading `Status: not started` and
+  **Phase 15's work uncommitted AND the tree broken** (its mutation probe left in place — see
+  that phase's findings). The gatelog was accurate only in the sense that the phase was not
+  finished. This session re-verified from the tests, not the gatelog, exactly as the skill
+  requires.
+- **2026-09-26, Phase 15 — ALL PHASES 10-15 ARE NOW DONE.** The Local Cortex work is complete
+  on `feat/local-cortex-needle-laya`; PR #2 carries it and the operator merges. The two
+  deliberately-UNVERIFIED items, both host-bound and both already recorded above, are the only
+  things left in this workstream: (a) the **Laya live leg** needs a glibc host
+  (`onnxruntime-node` prebuild is glibc-only), and (b) the **manual UI pass** with both models
+  loaded — there is no human in the cron loop, so it was not performed and is NOT claimed.
+  A future phase may re-tune thresholds ONLY against a tuned checkpoint, never the base weights.
+- **Not started, still available:** the open `codereview.md` items and `PLAN.md` phases 0-9
+  (listed above). Do not let a cron session read them as "the next phase" — they are outside
+  the Phase 10-15 plan.

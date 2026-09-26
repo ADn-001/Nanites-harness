@@ -783,6 +783,63 @@ function mergeToolDelta(acc,t){
   acc.toolCalls=acc.toolCalls.filter(Boolean);
 }
 function newAcc(){return{content:'',thinking:'',toolCalls:[],_fallback:0};}
+/* PHASE 15 — INCREMENTAL DETECTION wiring.
+   `cortexTurn` is the ONE per-turn holder the stream pump and the end-of-stream stage share.
+   It is deliberately a module-level singleton rather than a pump argument: `pumpSSE` is called
+   from three places (callOpenAI, callOllamaNative, readSSE) and threading a mutable per-turn
+   object through all of them would change their signatures for no benefit.
+
+   It is ALWAYS null unless the current agent turn opted in, so a turn with the cortex absent
+   behaves exactly as it did before this phase: `cortexStreamTick` returns immediately, no
+   request is made, and `cortexSettle` yields `{present:false}`. */
+let cortexTurn=null;
+function cortexTurnBegin(client,settings){
+  /* One holder per turn, carrying the "already spent" latch. The latch lives here (not in
+     the seam) so the SAME probe budget covers both the early probe and the end-of-stream
+     stage — one model call per turn, whichever path spends it. */
+  cortexTurn={client:client,settings:settings,probe:null,settled:false,decided:false,
+    discarded:false,value:null,ledgered:false,trace_id:'',probed:false};
+  return cortexTurn;
+}
+function cortexTurnEnd(){cortexTurn=null;}
+/* Called from the stream pumps after deltas are merged. Returns nothing and awaits nothing:
+   a probe it starts is fire-and-forget, so visible tokens are never delayed by local
+   inference. Never throws — a detector fault must not break streaming. */
+function cortexStreamTick(acc){
+  try{
+    const t=cortexTurn;
+    if(!t||t.probed||!acc||!Array.isArray(acc.toolCalls)||!acc.toolCalls.length)return;
+    if(!CogCore||!CogCore.cortexStreamDetect)return;
+    const det=CogCore.cortexStreamDetect(acc,{allowedTools:TOOL_SCHEMAS,client:t.client,
+      settings:t.settings,alreadyProbed:t.probed,traceId:t.trace_id});
+    if(det&&det.probeStarted&&det.probe){
+      /* Fire-and-forget by contract: the promise is STASHED, never awaited here. Awaiting it
+         would make every visible token wait on a local model, and an `await` in this
+         non-async function is a page-level SyntaxError that takes the whole app down. */
+      t.probed=true;t.probe=det.probe;t.trace_id=det.trace_id||t.trace_id;
+    }
+  }catch(e){}
+}
+/* Consumed once, at the turn's decision point, immediately before the end-of-stream
+   `sanitizeReply` call. Returns a PLAIN `{present:false}` when there was no early probe, so
+   the no-cortex path stays byte-identical.
+
+   This is ASYNC on purpose: `_cortexStreamSettle` returns a PROMISE whenever it actually has
+   to wait for an in-flight probe, and a plain object on the no-wait paths. Awaiting handles
+   both. Reading `.present` off the returned value synchronously is the bug that shipped
+   first: the promise has no `present`, so every early probe looked absent and the turn spent
+   a SECOND `/repair` at the end-of-stream stage. */
+async function cortexSettle(turn,alreadyDecided){
+  try{
+    const t=turn||cortexTurn;
+    if(!t||!t.probe)return{present:false};
+    const r=await CogCore._cortexStreamSettle(t,{client:t.client,settings:t.settings,
+      alreadyDecided:!!alreadyDecided});
+    /* Hand `sanitizeReply` exactly the shape it folds. */
+    return(r&&r.present)?{present:true,trace_id:r.trace_id,value:r.value||null,expired:!!r.expired,
+      ledgered:!!r.ledgered}:{present:false};
+  }catch(e){return{present:false};}
+}
 function processStreamObject(j,acc){
   if(j.error){throw new Error(j.error.message||String(j.error));}
   if(j.type==='chat.end'&&j.result){
@@ -812,6 +869,9 @@ async function pumpSSE(body,acc,onDelta){
       if(!data||data==='[DONE]')continue;
       let j;try{j=JSON.parse(data);}catch(e){continue;}
       processStreamObject(j,acc);
+      /* PHASE 15 — cheap incremental detection on the ACCUMULATED deltas. Fire-and-forget:
+         it never awaits, so `onDelta` still fires on exactly the same schedule as before. */
+      cortexStreamTick(acc);
       onDelta&&onDelta(acc);
     }
   }
@@ -873,6 +933,8 @@ async function callOllamaNative(messages,options,nonStream,signal){
     const parts=buf.split('\n');buf=parts.pop()||'';
     for(const line of parts){if(!line.trim())continue;let j;try{j=JSON.parse(line);}catch(e){continue;}
       processOllamaObject(j,acc);
+      /* PHASE 15 — same cheap tick on the native Ollama line-delimited stream. */
+      cortexStreamTick(acc);
       const c=active();const m=c?.messages[c.messages.length-1];
       if(m){m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=acc.toolCalls;refreshLast();}
     }
@@ -1140,17 +1202,6 @@ async function runAgentLoop(c,m,sig){
       if(dr&&dr.note)dispatchNote=dr.note;
       if(sig.aborted)throw new DOMException('Aborted','AbortError');
     }
-    const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
-    m.content=acc.content;m.thinking=acc.thinking;
-    const finalized=finalizeToolCalls(acc,m.ts||Date.now());
-    /* PHASE 12 — LOCAL CORTEX repair pass. Stage 1 is the Phase 11 deterministic salvage
-       (unchanged): fences, trailing commas, string / double-encoded / truncated arguments,
-       near-miss tool names, narrated calls — FORMAT only, never an invented argument value.
-       Stage 2 may offer what plain code cannot resolve to the local Needle sidecar, bounded
-       and confidence-gated. Local inference is NEVER in the critical path: with the sidecar
-       down, disabled, unconfigured or slow this is byte-identical to Phase 11 and the ORIGINAL
-       reply passes through untouched. Whatever cannot be resolved still stays in the turn so
-       the Phase 7 validator rejects it explicitly (re-attached below). */
     const lm=normLocalModels(settings.localModels);
     let cortexClient=null;
     try{
@@ -1158,8 +1209,36 @@ async function runAgentLoop(c,m,sig){
          makes ZERO requests to the sidecar port. */
       if(lm.enabled)cortexClient=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch);
     }catch(e){cortexClient=null;}
+    /* PHASE 15 — open the turn's single-probe holder BEFORE the model call, so the stream pump
+       can start the ONE repair probe mid-flight. The latch it carries is shared with the
+       end-of-stream stage below, so a turn spends at most one `/repair` on either path.
+       When the operator has not opted in, `cortexClient` is null and the seam's opt-in gate
+       refuses anyway — the turn then costs zero requests exactly as in Phase 14. */
+    const cTurn=cortexTurnBegin(cortexClient,lm);
+    let acc=null;
+    try{ acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig); }
+    finally{ /* the pump must never keep ticking at the next send's holder */
+      if(cortexTurn===cTurn)cortexTurnEnd(); }
+    m.content=acc.content;m.thinking=acc.thinking;
+    const finalized=finalizeToolCalls(acc,m.ts||Date.now());
+    /* PHASE 15 — consume the turn's ONE early probe HERE, at the decision point, and hand it to
+       `sanitizeReply` as `earlyRepair`. The bounded wait is inside `_cortexStreamSettle`, so a
+       hanging sidecar cannot hang the turn; a result that never arrived in time is an ordinary
+       pass-through, and one that lands after this point is discarded (but still ledgered). */
+    const earlyRepair=await cortexSettle(cTurn,false);
+    /* PHASE 12 — LOCAL CORTEX repair pass. Stage 1 is the Phase 11 deterministic salvage
+       (unchanged): fences, trailing commas, string / double-encoded / truncated arguments,
+       near-miss tool names, narrated calls — FORMAT only, never an invented argument value.
+       Stage 2 may offer what plain code cannot resolve to the local Needle sidecar, bounded
+       and confidence-gated. Local inference is NEVER in the critical path: with the sidecar
+       down, disabled, unconfigured or slow this is byte-identical to Phase 11 and the ORIGINAL
+       reply passes through untouched. Whatever cannot be resolved still stays in the turn so
+       the Phase 7 validator rejects it explicitly (re-attached below).
+       `earlyRepair` is the turn's ONE probe from the Phase 15 mid-stream detection: when it is
+       present this stage asks NOTHING further and folds that answer into the same verdict. */
     let san=null;
-    try{ san=await CogCore.sanitizeReply({toolCalls:finalized,content:acc.content},TOOL_SCHEMAS,{client:cortexClient,settings:lm}); }
+    try{ san=await CogCore.sanitizeReply({toolCalls:finalized,content:acc.content},TOOL_SCHEMAS,
+      {client:cortexClient,settings:lm,earlyRepair:(earlyRepair&&earlyRepair.present!==false)?earlyRepair:null}); }
     catch(e){ san=null; }
     if(!san||!Array.isArray(san.calls))san={calls:finalized,unrepairable:[],source:'deterministic',accepted:true,degraded:false,reason:'',changed:[]};
     m.cortexNote='';m.cortexDegraded=false;m.cortexAnomaly='';m.cortexLayaDegraded=false;
