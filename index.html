@@ -383,6 +383,8 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
       <div class="field chk"><input id="set-lm-sanitizer" type="checkbox" checked><label for="set-lm-sanitizer" style="margin:0">DETERMINISTIC SANITIZER PASS (FREE — NO MODEL, ON BY DEFAULT)</label></div>
       <div class="field chk"><input id="set-lm-dispatcher" type="checkbox"><label for="set-lm-dispatcher" style="margin:0">LOCAL DISPATCHER (CHEAP PRE-ROUTER — OPT-IN)</label></div>
       <div class="field chk"><input id="set-lm-dispatcher-autoread" type="checkbox" checked><label for="set-lm-dispatcher-autoread" style="margin:0">AUTO-RUN READ-ONLY DISPATCHER PROPOSALS</label></div>
+      <div class="field"><label>DISPATCHER MIN CONFIDENCE (0—1, STEP .05)</label><input id="set-lm-dispatcher-conf" type="number" min="0" max="1" step=".05" value="0.75"></div>
+      <div class="field"><label>DISPATCHER TIMEOUT (MS)</label><input id="set-lm-dispatcher-timeout" type="number" min="50" step="50" value="800"></div>
       <div class="field"><label>LOCAL CORTEX SIDECAR PORT (127.0.0.1 ONLY)</label><input id="set-lm-port" type="number" min="1" max="65535" value="8932"></div>
       <div class="field"><label>LOCAL CORTEX LEDGER (APPEND-ONLY JSONL PATH, RELATIVE TO THE REPO)</label><input id="set-lm-ledger" type="text" value="var/local-models.jsonl"></div>
       <div id="lm-status" style="font-size:10px;margin-top:6px;letter-spacing:.15em;color:var(--phos-dim)">LOCAL CORTEX: DISABLED</div>
@@ -433,6 +435,25 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
   </div>
 </div>
 
+<div class="modal" id="cortex-proposal-modal">
+  <div class="modal-box">
+    <h2>&#11041; LOCAL CORTEX PROPOSAL</h2>
+    <div style="font-size:10px;color:var(--phos-dim);letter-spacing:.16em">THE CHEAP LOCAL MODEL SUGGESTS THIS RITE — IT CANNOT RUN IT ALONE</div>
+    <div style="display:flex;align-items:center;gap:10px;margin:8px 0">
+      <span id="cortex-proposal-kind" class="write">MUTATION</span>
+      <span id="cortex-proposal-name" style="letter-spacing:.15em"></span>
+    </div>
+    <div style="font-size:10px;color:var(--phos-dim);letter-spacing:.16em">ARGUMENTS</div>
+    <pre id="cortex-proposal-args"></pre>
+    <div id="cortex-proposal-conf" style="font-size:10.5px;color:var(--phos);letter-spacing:.12em"></div>
+    <div id="cortex-proposal-warning" style="font-size:10.5px;color:var(--amber);letter-spacing:.12em;line-height:1.7"></div>
+    <div class="modal-btns">
+      <button class="tbtn" id="cortex-proposal-ignore" style="color:var(--danger);border-color:rgba(255,59,59,.55)">&#10005; IGNORE — ASK THE BIG MODEL</button>
+      <button class="tbtn" id="cortex-proposal-accept" style="border-color:var(--phos)">&#10003; ACCEPT PROPOSAL</button>
+    </div>
+  </div>
+</div>
+
 <script src="appcore.js"></script>
 <script>
 "use strict";
@@ -446,7 +467,7 @@ const DEF_SETTINGS={endpoint:'',model:'',system:'',backend:'auto',
   needle:{enabled:false,minConfidence:0.75,confirmBand:[0.5,0.75],timeoutMs:800},
   laya:{enabled:false,minConfidence:0.70,timeoutMs:500,preflight:true,anomaly:true},
   sanitizer:{enabled:true,mode:'auto',deterministicPass:true},
-  dispatcher:{enabled:false,autoReadOnly:true},
+  dispatcher:{enabled:false,autoReadOnly:true,timeoutMs:800,minConfidence:0.75},
   port:8932, ledger:'var/local-models.jsonl'}};
 let settings={...DEF_SETTINGS};
 try{Object.assign(settings,JSON.parse(localStorage.getItem(LS_SET)||'{}'));}catch(e){}
@@ -985,6 +1006,88 @@ function isReadRite(name,args={}){
   if(sub==='stash')return rest[0]==='list'||rest[0]==='show';
   return FRONT_GIT_READ.has(sub);
 }
+/* PHASE 14 — LOCAL CORTEX PROPOSAL CARD.
+   The cheap local model can PROPOSE a rite but never authorise one. This modal is the
+   PROPOSAL's gate (a separate, mandatory gate from `approveToolCall`, which remains the
+   EXECUTION gate): every mutating proposal lands here, and only an explicit ACCEPT lets it
+   proceed down the UNCHANGED validator -> approveToolCall -> executeTool route. IGNORE (or
+   dismissing the card) means zero dispatch and the ordinary model call proceeds. */
+let proposalResolve=null;
+function settleCortexProposal(v){const r=proposalResolve;proposalResolve=null;const modal=$('cortex-proposal-modal');if(modal)modal.classList.remove('open');if(r)r(!!v);}
+function approveCortexProposal(p){
+  const args=(p&&typeof p.args==='object')?p.args:(()=>{try{return JSON.parse(p&&p.args)||{};}catch(e){return{};}})();
+  const read=isReadRite((p&&p.name)||'',args);
+  return new Promise(resolve=>{
+    proposalResolve=resolve;
+    const kind=$('cortex-proposal-kind'),name=$('cortex-proposal-name'),argBox=$('cortex-proposal-args'),
+          conf=$('cortex-proposal-conf'),warn=$('cortex-proposal-warning');
+    if(kind){kind.textContent=read?'READ-ONLY':'MUTATION';kind.className=read?'read':'write';}
+    if(name)name.textContent=(p&&p.name)||'unknown rite';
+    if(argBox)argBox.textContent=JSON.stringify(args,null,2);
+    const c=(p&&typeof p.confidence==='number')?Number(p.confidence).toFixed(2):'?';
+    if(conf)conf.textContent='LOCAL CORTEX CONFIDENCE: '+c;
+    if(warn)warn.textContent=read
+      ?'This rite only inspects the bound project. ACCEPT still routes it through the normal validator and authorization.'
+      :'This rite can alter files, git state, or execute a command. The local model has NO authority here — a mutating proposal can only run on your explicit ACCEPT, and it still passes the normal authorization rite.';
+    $('cortex-proposal-modal')?.classList.add('open');
+  });
+}
+/* PHASE 14 — one cheap `/select` per SEND, before the first big-model call, and the routing
+   of whatever comes back. Everything here is a SUGGESTION channel:
+     - autoRun:readOnly proposal ⇒ the UNCHANGED validator -> approveToolCall -> executeTool
+       route, with an operator-visible transcript note;
+     - everything else ⇒ the proposal card, and NOTHING is dispatched without an explicit
+       ACCEPT;
+     - low confidence / empty / invalid / degraded / sidecar down / IGNORE ⇒ NO dispatch and
+       the model call proceeds exactly as it would with the sidecar dead.
+   `iter===0` is load-bearing: the dispatcher must not re-probe on every agent iteration.
+   NOTE on the candidate set: all 6 TOOL_SCHEMAS are offered, and the candidate-subset stage is
+   INTENTIONALLY ABSENT — 6 tools is far below the ~50 a real router would need before
+   subsetting buys anything, and a subset stage would be a new local decision to gate. */
+async function runCortexDispatch(c,m,iter){
+  const lm=normLocalModels(settings.localModels);
+  if(!(settings.agent&&lm.enabled&&lm.dispatcher.enabled&&CogCore.cortexDispatch))return null;
+  let client=null;
+  try{client=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch);}catch(e){client=null;}
+  if(!client)return null;
+  let d=null;
+  try{
+    d=CogCore.cortexDispatch(
+      {utterance:lastUserText(c),tools:TOOL_SCHEMAS},
+      {client,settings:lm,isReadRite,autoApproveRead:settings.autoApproveRead});
+    if(d&&typeof d.then==='function')d=await d;
+  }catch(e){return {dispatch:null,note:''};}
+  const proposals=(d&&Array.isArray(d.proposals))?d.proposals:[];
+  if(!proposals.length)return {dispatch:d,note:''};
+  const auto=[],card=[];
+  for(const p of proposals)(p.autoRun?auto:card).push(p);
+  const autoRan=[];
+  for(const p of auto){
+    const gate=CogCore.validateStructuredOutput([{id:p.id,name:p.name,args:p.args}],TOOL_SCHEMAS);
+    if(!gate.ok||!gate.sanitized.length)continue;   /* the Phase 7 gate is never weakened */
+    for(const tc of gate.sanitized){
+      const result=await executeTool(tc);
+      c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
+      autoRan.push(tc.name);
+    }
+  }
+  for(const p of card){
+    let accepted=false;
+    try{accepted=await approveCortexProposal(p);}catch(e){accepted=false;}
+    if(!accepted)continue;                          /* IGNORE ⇒ zero dispatch, model proceeds */
+    const gate=CogCore.validateStructuredOutput([{id:p.id,name:p.name,args:p.args}],TOOL_SCHEMAS);
+    if(!gate.ok||!gate.sanitized.length)continue;
+    for(const tc of gate.sanitized){
+      const result=await executeTool(tc);
+      c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
+    }
+    save();renderMessages();
+  }
+  /* The loop re-initialises m.cortexNote on every iteration (it belongs to the MODEL's
+     repair/anomaly verdict), so the dispatch note is returned for re-application rather than
+     left on the message here. */
+  return {dispatch:d,note:autoRan.length?('[LOCAL CORTEX: read-only rite proposed — '+autoRan.join(', ')+']'):''};
+}
 let approvalResolve=null;
 function settleApproval(v){const r=approvalResolve;approvalResolve=null;const modal=$('agent-modal');if(modal)modal.classList.remove('open');if(r)r(v);}
 function approveToolCall(tc){
@@ -1017,8 +1120,26 @@ function finalizeToolCalls(acc,msgIndex){
     name:t.name||'',args:t.args||'{}'}));
 }
 async function runAgentLoop(c,m,sig){
+  /* The operator-visible note a LOCAL DISPATCHER auto-run left for this send's message. The
+     loop re-initialises m.cortexNote per iteration for the MODEL's own verdicts, so the
+     dispatch note is re-applied underneath them. */
+  let dispatchNote='';
   for(let iter=0;iter<12;iter++){
     if(sig.aborted)throw new DOMException('Aborted','AbortError');
+    /* PHASE 14 — LOCAL CORTEX DISPATCHER (F3), ONCE per send and BEFORE the first
+       big-model call (iter===0: never re-probe per iteration). A high-confidence read-only
+       proposal auto-runs through the UNCHANGED validator -> approveToolCall -> executeTool
+       route and leaves its note on the message; anything else goes to the proposal card and
+       dispatches NOTHING without an explicit operator ACCEPT. Every other outcome
+       (low confidence / empty / invalid / degraded / sidecar down / IGNORE) is a pure
+       pass-through: the model call below proceeds exactly as it would with the sidecar
+       dead. Bounded by dispatcher.timeoutMs, so local inference is never in the path. */
+    if(iter===0){
+      let dr=null;
+      try{dr=await runCortexDispatch(c,m,iter);}catch(e){dr=null;}
+      if(dr&&dr.note)dispatchNote=dr.note;
+      if(sig.aborted)throw new DOMException('Aborted','AbortError');
+    }
     const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
     m.content=acc.content;m.thinking=acc.thinking;
     const finalized=finalizeToolCalls(acc,m.ts||Date.now());
@@ -1051,6 +1172,8 @@ async function runAgentLoop(c,m,sig){
       m.cortexDegraded=true;
       m.cortexNote='[LOCAL CORTEX: NEEDLE TIMED OUT — ORIGINAL RITE PASSED THROUGH]';
     }
+    /* PHASE 14 — re-apply the dispatcher's auto-run note under the model's own verdicts. */
+    if(dispatchNote)m.cortexNote=(m.cortexNote?(m.cortexNote+' '):'')+dispatchNote;
     m.toolCalls=(san.calls||[]).concat((san.unrepairable||[]).map(u=>({id:u.id,name:u.name,args:u.args})))
       .map((t,ix)=>({id:t.id||('call_san_'+iter+'_'+ix+'_'+Date.now().toString(36)),name:t.name,args:t.args}));
     if(!m.toolCalls.length)m.toolCalls=finalized;
@@ -1389,6 +1512,8 @@ function restoreCortexFields(){
   if($('set-lm-sanitizer'))$('set-lm-sanitizer').checked=!!lm.sanitizer.enabled;
   if($('set-lm-dispatcher'))$('set-lm-dispatcher').checked=!!lm.dispatcher.enabled;
   if($('set-lm-dispatcher-autoread'))$('set-lm-dispatcher-autoread').checked=!!lm.dispatcher.autoReadOnly;
+  if($('set-lm-dispatcher-conf'))$('set-lm-dispatcher-conf').value=lm.dispatcher.minConfidence;
+  if($('set-lm-dispatcher-timeout'))$('set-lm-dispatcher-timeout').value=lm.dispatcher.timeoutMs;
   if($('set-lm-port'))$('set-lm-port').value=lm.port;
   if($('set-lm-ledger'))$('set-lm-ledger').value=lm.ledger;
 }
@@ -1409,6 +1534,8 @@ function writeCortexFields(){
   lm.sanitizer.enabled=!!($('set-lm-sanitizer')&&$('set-lm-sanitizer').checked);
   lm.dispatcher.enabled=!!($('set-lm-dispatcher')&&$('set-lm-dispatcher').checked);
   lm.dispatcher.autoReadOnly=!!($('set-lm-dispatcher-autoread')&&$('set-lm-dispatcher-autoread').checked);
+  lm.dispatcher.minConfidence=numf('set-lm-dispatcher-conf',d.dispatcher.minConfidence);
+  lm.dispatcher.timeoutMs=numi('set-lm-dispatcher-timeout',d.dispatcher.timeoutMs);
   lm.port=numi('set-lm-port',d.port);
   const led=$('set-lm-ledger');
   lm.ledger=(led&&led.value.trim())?led.value.trim():d.ledger;
@@ -1437,6 +1564,13 @@ async function refreshCortexStatus(){
       ' · ledger '+((r.ledger&&r.ledger.path)||lm.ledger||'(unknown)');
     const deg=Array.isArray(r.degraded)?r.degraded.filter(Boolean):[];
     if(deg.length)txt+=' · degraded: '+deg.join('; ');
+    /* PHASE 14 — ledger-driven proposal counters. Tolerate an OLDER daemon that reports no
+       `counts` object at all by simply omitting the suffix; never throw, never guess. */
+    const cnt=(r.ledger&&typeof r.ledger.counts==='object'&&r.ledger.counts)?r.ledger.counts:null;
+    if(cnt){
+      const n=k=>(typeof cnt[k]==='number'&&isFinite(cnt[k]))?Math.round(cnt[k]):0;
+      txt+=' · proposals '+n('proposals')+' · accepted '+n('accepted')+' · ignored '+n('ignored');
+    }
     el.textContent=txt;
   }catch(e){
     const el=$('lm-status');if(el)el.textContent='LOCAL CORTEX: OFFLINE (degraded)';
@@ -1536,7 +1670,14 @@ $('agent-toggle').onclick=()=>{settings.agent=!settings.agent;saveSet();syncAgen
 $('agent-approve').onclick=()=>settleApproval(true);
 $('agent-deny').onclick=()=>settleApproval(false);
 $('agent-modal').onclick=e=>{if(e.target.id==='agent-modal')settleApproval(false);};
+/* PHASE 14 — proposal card: ACCEPT proceeds, IGNORE and dismissing are both "no dispatch,
+   ask the big model". Escape IGNOREs the card WITHOUT aborting the turn (the card is the
+   proposal's gate, not the rite's). */
+$('cortex-proposal-accept').onclick=()=>settleCortexProposal(true);
+$('cortex-proposal-ignore').onclick=()=>settleCortexProposal(false);
+$('cortex-proposal-modal').onclick=e=>{if(e.target.id==='cortex-proposal-modal')settleCortexProposal(false);};
 document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&proposalResolve){e.preventDefault();settleCortexProposal(false);return;}
   if(e.key==='Escape'&&approvalResolve){e.preventDefault();settleApproval(false);if(abortCtl)abortCtl.abort();}
 });
 

@@ -759,7 +759,7 @@
         needle: { enabled: false, minConfidence: 0.75, confirmBand: [0.5, 0.75], timeoutMs: 800 },
         laya: { enabled: false, minConfidence: 0.70, timeoutMs: 500, preflight: true, anomaly: true },
         sanitizer: { enabled: true, mode: 'auto', deterministicPass: true },
-        dispatcher: { enabled: false, autoReadOnly: true },
+        dispatcher: { enabled: false, autoReadOnly: true, timeoutMs: 800, minConfidence: 0.75 },
         port: 8932,
         ledger: 'var/local-models.jsonl'
       },
@@ -1351,6 +1351,233 @@
 
       var action = held.length ? 'rejected' : ((an && an.flagged) ? 'flagged' : 'accepted');
       CogCore._cortexPostOutcome(deps, client, out.trace_id, action);
+      return out;
+    },
+
+    /* ================= PHASE 14 — CHEAP LOCAL DISPATCHER (F3) =================
+     * `cortexDispatch(plan, deps)` — the seam the agent turn calls ONCE per send, BEFORE the
+     * first big-model call, to ask the cheap local sidecar to PROPOSE a rite:
+     *
+     *   "the operator said 'inspect main.py' — which of the 6 allow-listed tools does that
+     *    mean, and with which arguments?"
+     *
+     * The whole point of the phase is to SPEND a large-model call only when the cheap one
+     * could not answer, and to never let the cheap one act on its own:
+     *  - the opt-in gate is HARD: `lm.enabled === false` OR `dispatcher.enabled === false` OR
+     *    no `client.selectTool` means ZERO `/select` requests — not a "cheap" probe. This is
+     *    the phase's hard gate and it must never be "improved" into a probe;
+     *  - a proposal is only ever a SUGGESTION. `readOnly` is decided by the INJECTED
+     *    `deps.isReadRite` callback (index.html ships its already-audited classifier) and
+     *    NEVER by the model's own claim — a proposal that labels `run_command` "readOnly"
+     *    is still mutating;
+     *  - `autoRun` requires readOnly AND both flags (`dispatcher.autoReadOnly` and the
+     *    harness-wide `settings.autoApproveRead`). A mutating proposal can NEVER have
+     *    `autoRun:true` whatever the flags say, so it always reaches the operator's proposal
+     *    card; and the card is the PROPOSAL's gate — `approveToolCall` remains the
+     *    EXECUTION gate, so even an ACCEPTed mutation is authorised the normal way;
+     *  - every proposal is re-gated by the UNCHANGED Phase 7 `validateStructuredOutput`
+     *    before the caller can dispatch it: the local model can neither widen the
+     *    allow-list nor invent a tool name;
+     *  - below/without a confidence, an empty `calls`, a degraded sidecar, a timeout or a
+     *    disabled dispatcher all yield `proposals:[]` and the turn proceeds exactly as it
+     *    would with the sidecar dead;
+     *  - the probe is bounded by `dispatcher.timeoutMs` through the EXISTING `_cortexRace`,
+     *    so local inference is never in the critical path.
+     *
+     *   plan = { utterance:string, tools:[ToolSchema] }
+     *   deps = { client, settings, traceId?, timeout?, isReadRite?, autoApproveRead? }
+     *
+     * Returns a plain object on every non-probing path and a Promise when it actually probes,
+     * so `await cortexDispatch(...)` is always correct and a no-deps caller stays synchronous
+     * and I/O-free (the same sync-or-async contract as `sanitizeReply` / `cortexLayaGates`).
+     *
+     *   {ok, degraded, reason, trace_id, canAutoRun, confidence, latency_ms,
+     *    proposals:[{id, name, args, readOnly, autoRun, confidence}]}
+     *
+     * The `/select` payload contains only `{input, candidates, trace_id}` — never settings,
+     * never an API key, and NO `Authorization` header is ever sent (the client guarantees it).
+     */
+    cortexDispatch: function (plan, deps) {
+      var out = {
+        ok: true, degraded: false, reason: '', trace_id: '',
+        canAutoRun: false, confidence: null, latency_ms: 0, proposals: []
+      };
+      try {
+        deps = (deps && typeof deps === 'object') ? deps : {};
+        out.trace_id = CogCore._cortexTraceId(deps);
+        plan = (plan && typeof plan === 'object') ? plan : {};
+        var lm = CogCore._cortexLmSettings(deps.settings);
+        var disp = lm.dispatcher || {};
+        var client = (deps.client && typeof deps.client.selectTool === 'function') ? deps.client : null;
+
+        /* Rule 1 — the hard opt-in gate. Disabled means NO /select AT ALL. */
+        if (lm.enabled === false || disp.enabled === false || !client) {
+          out.reason = 'off';
+          return out;
+        }
+
+        /* Rule 2 — nothing to route ⇒ no probe (an empty utterance is not a question). */
+        var utterance = String(plan.utterance === undefined || plan.utterance === null ? '' : plan.utterance);
+        if (!utterance.trim()) { out.reason = 'no_input'; return out; }
+
+        var tools = Array.isArray(plan.tools) ? plan.tools : [];
+        var minConf = (typeof disp.minConfidence === 'number' && isFinite(disp.minConfidence)) ? disp.minConfidence : 0.75;
+        var ms = (typeof disp.timeoutMs === 'number' && isFinite(disp.timeoutMs) && disp.timeoutMs > 0) ? disp.timeoutMs : 800;
+        var payload = CogCore._cortexSelectPayload(utterance, tools, out.trace_id);
+
+        var probe;
+        try { probe = client.selectTool(payload); }
+        catch (e) { probe = Promise.reject(e); }
+        if (!probe || typeof probe.then !== 'function') probe = Promise.resolve(probe);
+
+        /* Bounded by OUR OWN timer via the EXISTING Phase 12 race helper. */
+        var raced = CogCore._cortexRace(probe, ms, deps.timeout);
+        return raced.then(function (r) {
+          try {
+            if (r && r.expired) {
+              out.ok = false; out.degraded = true; out.reason = 'timeout';
+              out.proposals = []; out.canAutoRun = false;
+              CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+              return out;
+            }
+            return CogCore._cortexApplySelect(r ? r.value : null, out, tools, minConf, deps, client);
+          } catch (e) {
+            out.ok = false; out.degraded = true; out.reason = 'error';
+            out.proposals = []; out.canAutoRun = false;
+            return out;
+          }
+        });
+      } catch (e) {
+        out.ok = false; out.degraded = true; out.reason = 'error';
+        out.proposals = []; out.canAutoRun = false;
+        return out;
+      }
+    },
+
+    /* ---- Phase 14 internals (pure except for the injected client) ---- */
+
+    /* Build the /select payload: the operator's own words, the compacted candidate schemas
+       (capped like every other cortex payload) and a trace id. NO settings, NO API key. */
+    _cortexSelectPayload: function (utterance, tools, traceId) {
+      var candidates = [];
+      try {
+        var list = Array.isArray(tools) ? tools.slice(0, 10) : [];
+        for (var i = 0; i < list.length; i++) candidates.push(CogCore._cortexCompactTool(list[i]));
+      } catch (e) { candidates = []; }
+      return {
+        input: String(utterance === undefined || utterance === null ? '' : utterance),
+        candidates: candidates,
+        trace_id: traceId
+      };
+    },
+
+    /*
+     * Does this call leave a REQUIRED argument present-but-BLANK?
+     *
+     * Found by the integrator's live probe against the REAL untuned Needle model, which
+     * really does answer `read_file {"path": ""}` at a real calibrated confidence. The
+     * Phase 7 validator checks an argument's presence and TYPE, and "" is a perfectly
+     * valid string, so such a proposal passes the gate — and an auto-run would have
+     * dispatched it to the bridge unattended. A read rite with no path is not a rite.
+     *
+     * This DOWNGRADES the proposal to the operator's card (a loss of auto-execution,
+     * never a discard): the operator still sees the tool, its arguments and its
+     * confidence, and can ACCEPT or IGNORE. Only STRING arguments are trimmed — a
+     * numeric 0, false or [] is a real value, and an absent OPTIONAL argument is fine.
+     * Never throws: an unknown tool or an unreadable schema means "not blank", which
+     * leaves the decision exactly where it was.
+     */
+    _cortexHasBlankRequired: function (name, args, allowedTools) {
+      try {
+        var list = Array.isArray(allowedTools) ? allowedTools : [];
+        var schema = null;
+        for (var i = 0; i < list.length; i++) {
+          var entry = list[i] || {};
+          var fn = (entry.function && typeof entry.function === 'object') ? entry.function : entry;
+          if (fn.name === name) { schema = fn.parameters || null; break; }
+        }
+        if (!schema || typeof schema !== 'object') return false;
+        var required = Array.isArray(schema.required) ? schema.required : [];
+        if (!required.length) return false;
+        var a = (args && typeof args === 'object' && !Array.isArray(args)) ? args : {};
+        for (var r = 0; r < required.length; r++) {
+          var v = a[required[r]];
+          if (typeof v === 'string' && v.trim() === '') return true;
+        }
+        return false;
+      } catch (e) { return false; }
+    },
+
+    /* Score a /select reply. The Phase 7 validator is the gate: a local proposal that fails
+       it is DISCARDED outright (`invalid`) — the cheap model can never widen the allow-list,
+       invent a name or drop a required argument. Confidence is never invented: a missing,
+       null or non-finite value is below threshold. `readOnly`/`autoRun` are decided HERE (in
+       the pure seam) so the decision is unit-testable without a browser. */
+    _cortexApplySelect: function (res, out, allowedTools, minConf, deps, client) {
+      var resCalls = (res && Array.isArray(res.calls)) ? res.calls : [];
+      var conf = (res && typeof res.confidence === 'number' && isFinite(res.confidence)) ? res.confidence : null;
+      var degradedRes = !!(res && (res.ok === false || res.degraded));
+      if (res && typeof res.latency_ms === 'number' && isFinite(res.latency_ms)) out.latency_ms = Math.round(res.latency_ms);
+      out.confidence = conf;
+
+      if (degradedRes) {
+        out.ok = false; out.degraded = true;
+        out.reason = String((res && res.reason) || 'degraded');
+        out.proposals = []; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+
+      /* Reuse the EXACT normaliser the Needle seam uses: it mints ids and speaks the
+         harness's {id,name,args} shape. Never introduce an `arguments` field — every shipped
+         consumer (safeToolArgs, isReadRite, the validator) reads `args`. */
+      var harness = CogCore._cortexNeedleCalls(resCalls, out.trace_id);
+      var gate = CogCore.validateStructuredOutput(harness, allowedTools);
+      var confOk = (conf !== null && conf >= minConf);
+
+      if (resCalls.length === 0) {
+        out.proposals = []; out.reason = 'empty'; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+      if (!gate.ok || gate.sanitized.length === 0) {
+        out.proposals = []; out.reason = 'invalid'; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+      if (!confOk) {
+        out.proposals = []; out.reason = 'below_threshold'; out.canAutoRun = false;
+        CogCore._cortexPostOutcome(deps, client, out.trace_id, 'passed_through');
+        return out;
+      }
+
+      /* Accepted. Now — and only now — decide read-only vs mutating. The classifier is
+         INJECTED; with no classifier supplied nothing is ever read-only, so a caller that
+         forgets to pass one gets the safe (card-everything) behaviour, not auto-execution. */
+      var isRead = (typeof deps.isReadRite === 'function') ? deps.isReadRite : function () { return false; };
+      var lm = CogCore._cortexLmSettings(deps.settings);
+      var disp = lm.dispatcher || {};
+      out.canAutoRun = (disp.autoReadOnly !== false) && (deps.autoApproveRead !== false);
+
+      var proposals = [];
+      for (var i = 0; i < gate.sanitized.length; i++) {
+        var c = gate.sanitized[i];
+        var readOnly = false;
+        try { readOnly = !!isRead(c.name, c.args); } catch (e) { readOnly = false; }
+        proposals.push({
+          id: c.id, name: c.name, args: c.args,
+          readOnly: readOnly,
+          /* A mutating proposal can NEVER auto-run, whatever the flags say. */
+          autoRun: (readOnly && out.canAutoRun &&
+            !CogCore._cortexHasBlankRequired(c.name, c.args, allowedTools)),
+          confidence: conf
+        });
+      }
+      out.proposals = proposals;
+      out.reason = '';
+      var anyAuto = false;
+      for (var k = 0; k < proposals.length; k++) if (proposals[k].autoRun) { anyAuto = true; break; }
+      CogCore._cortexPostOutcome(deps, client, out.trace_id, anyAuto ? 'accepted' : 'passed_through');
       return out;
     },
 

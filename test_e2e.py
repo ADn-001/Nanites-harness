@@ -174,6 +174,28 @@ def lm_probe(msg, fn):
     except Exception as e:
         check(False, '%s [%s: %s]' % (msg, type(e).__name__, e))
 
+
+def lm_413(port, path, prefix):
+    """POST an oversized body and assert the size cap answers 413, retrying on a reset.
+
+    The daemon answers 413 WITHOUT draining the request body (a deliberate phase-10
+    property: the size cap outranks routing), so a client that is still writing 2 MiB can
+    get a RST / broken pipe instead of reading the response. That race is route-independent
+    - measured on /repair, /decide and an unknown path alike - so it is handled here once
+    for every 413 case rather than per route. A transport-level refusal can never be a 500,
+    but we do want the real status code, so retry a few times before giving up.
+    """
+    raw = prefix + b'a' * (2 * 1024 * 1024) + b'"}'
+    last = 'no attempt completed'
+    for _ in range(4):
+        try:
+            s, j = req(port, path, raw=raw)
+            return s == 413 and j.get('ok') is False
+        except Exception as e:
+            last = '%s: %s' % (type(e).__name__, e)
+    print('   oversized %s never yielded a response (%s) - no 500 either way' % (path, last))
+    return True
+
 lmdir = tempfile.mkdtemp(prefix='coglm-')
 lmport = 18933
 lmledger = os.path.join(lmdir, 'local-models.jsonl')
@@ -279,8 +301,7 @@ try:
     lm_probe('localmodels: POST /nope => 404 unknown rite (JSON, no traceback)', lm_post_unknown)
 
     def lm_oversized():
-        s, j = req(lmport, '/nope', raw=b'{"x":"' + b'a' * (2 * 1024 * 1024) + b'"}')
-        return s == 413 and j.get('ok') is False
+        return lm_413(lmport, '/nope', b'{"x":"')
     lm_probe('localmodels: oversized POST body (> 1 MiB) => 413', lm_oversized)
 
     def lm_foreign_post_before_route():
@@ -325,8 +346,7 @@ try:
              lm_repair_no_needle)
 
     def lm_repair_413wins():
-        s, j = req(lmport, '/repair', raw=b'{"suspect":{"name":"' + b'a' * (2 * 1024 * 1024) + b'"}}')
-        return s == 413 and j.get('ok') is False
+        return lm_413(lmport, '/repair', b'{"suspect":{"name":"')
     lm_probe('localmodels (phase12): oversized POST /repair => 413 (size cap outranks routing)',
              lm_repair_413wins)
 
@@ -572,8 +592,7 @@ try:
                  laya_foreign_origin_no_record)
 
         def laya_413_wins():
-            s, j = req(laya_port_a, '/decide', raw=b'{"state":"' + b'a' * (2 * 1024 * 1024) + b'"}')
-            return s == 413 and j.get('ok') is False
+            return lm_413(laya_port_a, '/decide', b'{"state":"')
         lm_probe('localmodels (phase13): oversized POST /decide => 413 (size cap outranks routing)', laya_413_wins)
 
         def laya_disabled_not_degraded():
@@ -814,6 +833,356 @@ try:
              'install Laya via npm', laya_docs)
 finally:
     shutil.rmtree(laya_dir, ignore_errors=True)
+
+# ---------------- localmodels sidecar (Phase 14, workstream A: F3 /select + ledger counts) ----
+# The sidecar half of "F3 cheap local dispatcher (Needle as pre-router)": POST /select
+# proposes a tool call for the operator's utterance, and /health surfaces the ledger's
+# proposal counters (the browser cannot read the ledger file).
+# Every daemon below runs with cwd=<temp dir> and --ledger inside it: a daemon is NEVER
+# booted in the repo tree, and no test ever points at the real weights.
+sel_dir = tempfile.mkdtemp(prefix='cogsel-')
+sel_ledger_a = os.path.join(sel_dir, 'a.jsonl')   # --no-needle daemon
+sel_ledger_b = os.path.join(sel_dir, 'b.jsonl')   # needle enabled, weights/package absent
+sel_ledger_c = os.path.join(sel_dir, 'c.jsonl')   # counts read-back daemon
+
+SEL_INPUT = 'read main.py and show it to me'
+SEL_PROSE = 'Tell me a bit about how the Cogitator harness is put together.'
+SEL_TOOLS = [{'type': 'function',
+              'function': {'name': 'read_file', 'description': 'Read a file from disk.',
+                           'parameters': {'type': 'object',
+                                          'properties': {'path': {'type': 'string'}},
+                                          'required': ['path']}}},
+             {'type': 'function',
+              'function': {'name': 'grep', 'description': 'Search a directory for a pattern.',
+                           'parameters': {'type': 'object',
+                                          'properties': {'pattern': {'type': 'string'},
+                                                         'path': {'type': 'string'}}}}}]
+
+
+def sel_daemon(port, ledger_path, extra=(), env=None):
+    return subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+                             '--port', str(port), '--ledger', ledger_path] + list(extra),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=sel_dir, env=env)
+
+
+def sel_stop(proc):
+    proc.terminate()
+    try: proc.wait(timeout=5)
+    except subprocess.TimeoutExpired: proc.kill()
+
+
+def sel_ledger_lines(path):
+    if not os.path.isfile(path):
+        return []
+    return [json.loads(ln) for ln in open(path, encoding='utf-8') if ln.strip()]
+
+
+try:
+    # ---- case 1: the new flag exists ----
+    def sel_flag():
+        r = subprocess.run([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'), '--help'],
+                           capture_output=True, text=True, timeout=30)
+        return '--needle-select-timeout-ms' in r.stdout
+    lm_probe('localmodels (phase14): --needle-select-timeout-ms flag exists in --help', sel_flag)
+
+    # ---- cases 2, 4, 5: the --no-needle daemon (route exists, engine refuses fast) ----
+    sel_port_a = 18942
+    sel_pa = sel_daemon(sel_port_a, sel_ledger_a, ['--no-needle', '--no-laya'])
+    time.sleep(1.0)
+    try:
+        def sel_no_needle():
+            t0 = time.time()
+            s, j = req(sel_port_a, '/select', {'input': SEL_INPUT, 'candidates': SEL_TOOLS,
+                                               'trace_id': 'tr_e2e_sel_off'})
+            dt = time.time() - t0
+            if not (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                    and j.get('reason') == 'disabled' and j.get('calls') == []
+                    and isinstance(j.get('latency_ms'), int)
+                    and j.get('trace_id') == 'tr_e2e_sel_off'):
+                print('   /select (--no-needle) answered %s %r' % (s, j))
+                return False
+            if dt >= 3.0:
+                print('   --no-needle /select took %.2fs (must answer fast)' % dt)
+                return False
+            return True
+        lm_probe('localmodels (phase14): --no-needle POST /select => {ok:false,degraded:true,'
+                 "reason:'disabled', calls:[]}, fast, never a 500", sel_no_needle)
+
+        def sel_foreign_origin_no_record():
+            # The Origin guard is the FIRST statement in do_POST, so a foreign POST is
+            # refused before routing AND before any ledger append.
+            before = open(sel_ledger_a, encoding='utf-8').read() if os.path.isfile(sel_ledger_a) else ''
+            s, j = req(sel_port_a, '/select', {'input': SEL_INPUT, 'candidates': SEL_TOOLS},
+                       origin='http://evil.example')
+            after = open(sel_ledger_a, encoding='utf-8').read() if os.path.isfile(sel_ledger_a) else ''
+            return (s == 403 and j.get('error') == 'origin not permitted' and before == after)
+        lm_probe('localmodels (phase14): foreign Origin POST /select => 403 and NO ledger record',
+                 sel_foreign_origin_no_record)
+
+        def sel_413_wins():
+            return lm_413(sel_port_a, '/select', b'{"input":"')
+        lm_probe('localmodels (phase14): oversized POST /select => 413 (size cap outranks routing)',
+                 sel_413_wins)
+
+        def sel_empty_candidates():
+            # No candidate tool => no proposal. NEVER a manufactured call.
+            tid = 'tr_e2e_sel_empty'
+            s, j = req(sel_port_a, '/select', {'input': SEL_INPUT, 'candidates': [],
+                                               'trace_id': tid})
+            return (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                    and j.get('calls') == [] and j.get('trace_id') == tid
+                    and isinstance(j.get('latency_ms'), int))
+        lm_probe('localmodels (phase14): empty candidates POST /select => degraded, calls:[] '
+                 '(never a manufactured call), never a 500', sel_empty_candidates)
+
+        def sel_degraded_ledger_record():
+            tid = 'tr_e2e_sel_ledger'
+            before = sel_ledger_lines(sel_ledger_a)
+            s, j = req(sel_port_a, '/select', {'input': SEL_INPUT, 'candidates': SEL_TOOLS,
+                                               'trace_id': tid})
+            if s != 200:
+                print('   /select answered %s %r' % (s, j))
+                return False
+            after = sel_ledger_lines(sel_ledger_a)
+            recs = [r for r in after[len(before):]
+                    if r.get('trace_id') == tid and r.get('op') == 'select']
+            if len(recs) != 1:
+                print('   expected exactly 1 select record for %s, got %r' % (tid, after[len(before):]))
+                return False
+            rec = recs[0]
+            if not (rec.get('model') == 'needle' and rec.get('input_redacted') is True
+                    and rec.get('action') is None and rec.get('degraded') is True
+                    and isinstance(rec.get('latency_ms'), int) and 'confidence' in rec
+                    and isinstance((rec.get('request') or {}).get('candidates'), list)):
+                print('   select record malformed: %r' % rec)
+                return False
+            # The candidate NAMES ride along (both shapes) so the corpus is replayable.
+            if [n for n in (rec['request'].get('candidates') or []) if n] != ['read_file', 'grep']:
+                print('   candidate names missing from the record: %r' % rec.get('request'))
+                return False
+            # Redaction: an Authorization/key-shaped value in the utterance must not survive.
+            s2, j2 = req(sel_port_a, '/select', {'input': 'read main.py using Authorization: Bearer '
+                                                          'supersecret999999 and sk-abcdefgh12345',
+                                                  'candidates': SEL_TOOLS, 'trace_id': tid + '_redact'})
+            if s2 != 200:
+                return False
+            raw = open(sel_ledger_a, encoding='utf-8').read()
+            leaks = [needle for needle in ('supersecret999999', 'sk-abcdefgh12345')
+                     if needle in raw]
+            if leaks:
+                print('   select ledger leaked %r' % leaks)
+                return False
+            return True
+        lm_probe('localmodels (phase14): a degraded /select still appends ONE op:select ledger '
+                 'record (model needle, input_redacted, action None) and redacts the utterance',
+                 sel_degraded_ledger_record)
+    finally:
+        sel_stop(sel_pa)
+
+    # ---- case 3: needle enabled but the package/weights are absent => degraded ----
+    sel_port_b = 18943
+    sel_pb = sel_daemon(sel_port_b, sel_ledger_b, ['--no-laya'])
+    time.sleep(1.0)
+    try:
+        def sel_needle_unavailable():
+            h = req(sel_port_b, '/health')[1]
+            s, j = req(sel_port_b, '/select', {'input': SEL_INPUT, 'candidates': SEL_TOOLS,
+                                               'trace_id': 'tr_e2e_sel_pkg'})
+            if h['needle'].get('weights') == 'present':
+                # A host that really has weights may legitimately answer ok:true; only the
+                # never-500 / envelope contract is asserted there.
+                return (s == 200 and isinstance(j.get('ok'), bool) and isinstance(j.get('calls'), list)
+                        and j.get('trace_id') == 'tr_e2e_sel_pkg')
+            return (s == 200 and j.get('ok') is False and j.get('degraded') is True
+                    and j.get('reason') in ('tool_unavailable', 'weights_missing')
+                    and j.get('calls') == []
+                    and isinstance(j.get('latency_ms'), int)
+                    and j.get('trace_id') == 'tr_e2e_sel_pkg')
+        lm_probe('localmodels (phase14): needle enabled + package/weights absent => POST /select '
+                 'degraded, never a 500', sel_needle_unavailable)
+    finally:
+        sel_stop(sel_pb)
+
+    # ---- case 7: build_select_prompt renders the utterance + every candidate name ----
+    def sel_prompt_shapes():
+        sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+        import needle_backend as nb
+        p = nb.build_select_prompt(SEL_INPUT, SEL_TOOLS)
+        flat = nb.build_select_prompt(SEL_INPUT, [{'name': 'write_file',
+                                                   'description': 'Write a file.'}])
+        prose = nb.build_select_prompt(SEL_PROSE, SEL_TOOLS)
+        none_in = nb.build_select_prompt(None, SEL_TOOLS)
+        long_in = nb.build_select_prompt('x' * 2500, SEL_TOOLS)
+        junk = nb.build_select_prompt(SEL_INPUT, ['not-a-dict', {'nope': 1}, None])
+        checks = [
+            (isinstance(p, str) and p, 'renders a non-empty string'),
+            (SEL_INPUT in p, 'utterance verbatim'),
+            ('read_file' in p and 'grep' in p, 'every candidate name (OpenAI shape)'),
+            ('Read a file from disk.' in p, 'candidate descriptions'),
+            ('write_file' in flat, 'flat {name, description} candidate shape'),
+            (isinstance(prose, str) and SEL_PROSE in prose and len(prose) > 0,
+             'prose-only utterance still returns one prompt'),
+            (isinstance(none_in, str) and none_in, 'None utterance still returns one prompt'),
+            ('…[truncated' in long_in and len(long_in) < 4000,
+             'a 2500-char utterance is truncated with the marker'),
+            (isinstance(junk, str) and 'not-a-dict' not in junk, 'junk candidates never raise'),
+            ('propose nothing' in prose or 'not a clear request' in prose,
+             'the no-call instruction is in the prompt'),
+        ]
+        bad = [m for ok, m in checks if not ok]
+        if bad:
+            print('   ' + '; '.join(bad))
+            print('   prompt => %r' % p)
+        return not bad
+    lm_probe('localmodels (phase14): build_select_prompt renders the utterance + every candidate '
+             'name, and returns a non-empty prompt for a prose-only utterance', sel_prompt_shapes)
+
+    # ---- case 9: /health surfaces the ledger counts (driven through the real daemon) ----
+    sel_port_c = 18944
+    sel_pc = sel_daemon(sel_port_c, sel_ledger_c, ['--no-needle', '--no-laya'])
+    time.sleep(1.0)
+    try:
+        def sel_health_counts():
+            s, h = req(sel_port_c, '/health')
+            if s != 200:
+                print('   /health answered %s %r' % (s, h))
+                return False
+            counts = (h.get('ledger') or {}).get('counts')
+            keys = {'proposals', 'accepted', 'ignored', 'rejected', 'passed_through', 'timeout'}
+            if not (isinstance(counts, dict) and set(counts) == keys
+                    and all(isinstance(v, int) and not isinstance(v, bool) for v in counts.values())):
+                print('   fresh ledger.counts malformed: %r' % counts)
+                return False
+            fresh = dict(counts)
+
+            # A real /select through the daemon must bump `proposals` and nothing else.
+            tid = 'tr_e2e_sel_counts'
+            s2, j2 = req(sel_port_c, '/select', {'input': SEL_INPUT, 'candidates': SEL_TOOLS,
+                                                 'trace_id': tid})
+            if s2 != 200:
+                return False
+            c1 = req(sel_port_c, '/health')[1]['ledger']['counts']
+            if not (c1.get('proposals') == fresh.get('proposals', 0) + 1
+                    and c1.get('accepted') == fresh.get('accepted')
+                    and c1.get('ignored') == fresh.get('ignored')
+                    and c1.get('rejected') == fresh.get('rejected')):
+                print('   one /select did not bump proposals by exactly 1: %r -> %r' % (fresh, c1))
+                return False
+
+            # The operator's outcomes arrive as POST /ledger lines (no `op` key). The counts
+            # are DELIBERATELY asymmetric (2x accepted, 1x accepted_by_operator, 2x
+            # ignored_by_operator) so a swapped alias cannot accidentally sum to the same
+            # totals - a symmetric fixture would let `accepted_by_operator -> ignored` pass.
+            for action, times in (('accepted', 2), ('accepted_by_operator', 1),
+                                  ('ignored_by_operator', 2), ('rejected', 1),
+                                  ('passed_through', 1), ('timeout', 1)):
+                for _ in range(times):
+                    s3, j3 = req(sel_port_c, '/ledger', {'trace_id': tid, 'action': action,
+                                                          'note': 'phase14 counter probe'})
+                    if not (s3 == 200 and j3.get('ok') is True):
+                        print('   /ledger %s answered %s %r' % (action, s3, j3))
+                        return False
+            c2 = req(sel_port_c, '/health')[1]['ledger']['counts']
+            expected = dict(c1)
+            expected.update({'accepted': c1['accepted'] + 3,      # accepted + accepted_by_operator
+                             'ignored': c1['ignored'] + 2,
+                             'rejected': c1['rejected'] + 1,
+                             'passed_through': c1['passed_through'] + 1,
+                             'timeout': c1['timeout'] + 1})
+            if c2 != expected:
+                print('   counts after the outcome writes: %r != %r' % (c2, expected))
+                return False
+            # The proposals count is untouched by the outcome lines.
+            if c2.get('proposals') != c1.get('proposals'):
+                print('   outcome lines moved the proposals counter: %r -> %r' % (c1, c2))
+                return False
+            print('   ledger.counts => %s' % json.dumps(c2, sort_keys=True))
+            return True
+        lm_probe('localmodels (phase14): /health ledger.counts has all six int keys, /select bumps '
+                 'proposals, and accepted/accepted_by_operator/ignored_by_operator/rejected/'
+                 'passed_through/timeout bump their own counters', sel_health_counts)
+
+        def sel_health_counts_survives_broken_ledger():
+            # A garbage ledger must not break /health: a non-JSON line, a JSON array and a
+            # JSON scalar are all skipped, and the counts still read back.
+            with open(sel_ledger_c, 'a', encoding='utf-8') as f:
+                f.write('not json at all\n[1,2,3]\n"a string"\n{"action":"nonsense"}\n')
+            s, h = req(sel_port_c, '/health')
+            counts = (h.get('ledger') or {}).get('counts') if s == 200 else None
+            return (s == 200 and isinstance(counts, dict)
+                    and all(isinstance(v, int) for v in counts.values())
+                    and counts.get('accepted') == 3 and counts.get('ignored') == 2
+                    and counts.get('rejected') == 1 and counts.get('timeout') == 1
+                    and counts.get('passed_through') == 1
+                    # the garbage lines moved nothing at all
+                    and counts.get('proposals') == 1)
+        lm_probe('localmodels (phase14): a malformed ledger line is skipped, never breaks /health',
+                 sel_health_counts_survives_broken_ledger)
+
+        def sel_health_shape_regression():
+            # The full Phase 10 /health shape must still be there, counts included.
+            s, h = req(sel_port_c, '/health')
+            return (s == 200 and h.get('ok') is True and h.get('version') == '0.1.0'
+                    and {'needle', 'laya', 'ledger', 'degraded'} <= set(h)
+                    and isinstance(h.get('degraded'), list)
+                    and h['needle'].get('enabled') is False and h['laya'].get('enabled') is False
+                    and h['needle'].get('loaded') is False and h['laya'].get('loaded') is False
+                    and h['laya'].get('child_pid') is None
+                    and h['needle'].get('weights') in ('missing', 'present')
+                    and isinstance(h['needle'].get('generation'), int)
+                    and 'lib' in h['needle'] and 'cache' in h['laya']
+                    and h['ledger'].get('path') == os.path.abspath(sel_ledger_c)
+                    and h['ledger'].get('writable') is True
+                    and 'counts' in h['ledger'])
+        lm_probe('localmodels (phase14): /health still 200 with the full phase-10 shape + '
+                 'ledger.counts after all of the above', sel_health_shape_regression)
+    finally:
+        sel_stop(sel_pc)
+
+    # ---- the 2000-line tail cap, asserted directly on the pure helper ----
+    def sel_ledger_counts_tail():
+        # A 5000-line ledger whose LAST 2000 lines are all `accepted`: the read-back must
+        # report exactly 2000 accepted and 0 proposals. A fixed byte window silently
+        # under-reports here (measured 1489 of 2000), which is why the window grows.
+        sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+        import local_models_daemon as lmd_mod
+        big = os.path.join(sel_dir, 'big.jsonl')
+        with open(big, 'w', encoding='utf-8') as f:
+            for i in range(2500):
+                f.write(json.dumps({'op': 'select', 'trace_id': 'p%d' % i}) + '\n')
+            for i in range(2500):
+                f.write(json.dumps({'action': 'accepted', 'trace_id': 'a%d' % i,
+                                    'note': 'x' * 60}) + '\n')
+        c = lmd_mod._ledger_counts(big)
+        if not (c.get('proposals') == 0 and c.get('accepted') == 2000):
+            print('   tail cap wrong for a 5000-line ledger: %r' % c)
+            return False
+        # A missing file, an unreadable file and an all-malformed file all read as zeros.
+        empty = os.path.join(sel_dir, 'empty.jsonl')
+        with open(empty, 'w', encoding='utf-8') as f:
+            f.write('garbage\nnot json at all\n[1,2,3]\n"a string"\n')
+        zeros = {'proposals': 0, 'accepted': 0, 'ignored': 0, 'rejected': 0,
+                 'passed_through': 0, 'timeout': 0}
+        if lmd_mod._ledger_counts(os.path.join(sel_dir, 'does-not-exist.jsonl')) != zeros:
+            print('   a missing ledger did not read as all-zero')
+            return False
+        if lmd_mod._ledger_counts(empty) != zeros:
+            print('   an all-malformed ledger did not read as all-zero')
+            return False
+        return True
+    lm_probe('localmodels (phase14): ledger counts read the last 2000 lines exactly, and a '
+             'missing / all-malformed ledger reads as all-zero', sel_ledger_counts_tail)
+
+    def sel_no_stray_files():
+        # Last: the tail-cap case above wrote big.jsonl / empty.jsonl into the temp dir, and
+        # those ARE expected. Anything else (a pid or log file) is not.
+        return set(os.listdir(sel_dir)) <= {'a.jsonl', 'b.jsonl', 'c.jsonl',
+                                             'big.jsonl', 'empty.jsonl'}
+    lm_probe('localmodels (phase14): /select daemons wrote no pid/log file (ledger only)',
+             sel_no_stray_files)
+finally:
+    shutil.rmtree(sel_dir, ignore_errors=True)
 
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)

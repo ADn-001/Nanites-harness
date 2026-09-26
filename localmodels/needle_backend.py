@@ -17,6 +17,12 @@ assistant intended with the ARGUMENT VALUES the assistant already supplied, neve
 invent a value. An empty `function_calls` list from the model is reported as `calls: []`
 ("no repair") - this module never manufactures a call.
 
+`build_select_prompt` (Phase 14) is the pre-router half of the same rule: it shows the model
+the operator's UTTERANCE verbatim plus the candidate tools and asks for the one call the
+operator clearly asked for, grounded in that utterance or in the schema - and for nothing at
+all when the utterance is not a clear tool request. The engine call is identical to a repair
+(the tools are baked in at construction); only the prompt differs.
+
 `confidence: None` (untuned weights without a confidence head) is passed through as None;
 the frontend treats it as below-threshold. It is NOT coerced to 0.0 or 1.0.
 
@@ -267,6 +273,49 @@ def build_repair_prompt(suspect):
         _one(suspect)
 
     lines.append('Emit the corrected call.')
+    return '\n'.join(lines)
+
+
+def build_select_prompt(input_text, candidates):
+    """Propose the ONE tool call the operator clearly asked for - or emit nothing.
+
+    The select prompt is deliberately the same shape as the repair prompt: the utterance
+    is rendered VERBATIM (truncated at 2000 chars with an ellipsis marker so a long paste
+    cannot blow the context) and the tools are listed by name + description. Every tool
+    shape the harness actually sends is accepted - flat {name, description, parameters} and
+    OpenAI-nested {type:'function', function:{...}} - via `_flatten_tools`, the same
+    unwrapper the engine uses, so a tool the model can be called by is a tool it is SHOWN.
+
+    Two hard rules, in the "repairs format, never semantics" spirit of build_repair_prompt:
+      1. arguments must be GROUNDED - taken from the utterance or from the schema. Never
+         invent a value the operator did not give and the schema does not pin.
+      2. an utterance that is not a clear tool request gets NO call. `calls: []` is a
+         complete, correct answer; a manufactured call is not.
+    """
+    if input_text is None:
+        utterance = ''
+    elif isinstance(input_text, str):
+        utterance = input_text
+    else:
+        utterance = str(input_text)
+    if len(utterance) > 2000:
+        utterance = utterance[:2000] + '…[truncated %d]' % (len(utterance) - 2000)
+
+    lines = ['The operator sent one message. Propose the single tool call it clearly asks for.',
+             'Use only argument values that are grounded in the operator\'s message or in the '
+             'tool schema below. Never invent a value.',
+             'If the message is not a clear request for one of these tools, propose nothing.']
+
+    tools = _flatten_tools(candidates)
+    if tools:
+        lines.append('Available tools:')
+        for t in tools:
+            lines.append('- %s: %s' % (t.get('name'), t.get('description') or '(no description)'))
+    else:
+        lines.append('Available tools: none.')
+
+    lines.append('Operator message: ' + utterance)
+    lines.append('Emit the tool call, or nothing.')
     return '\n'.join(lines)
 
 

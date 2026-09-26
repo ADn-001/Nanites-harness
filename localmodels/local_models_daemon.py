@@ -16,8 +16,8 @@ set below so the package's anonymous usage counters never fire - the privacy sta
 ("nothing leaves the machine") holds. The only network use is weight/engine downloads at
 install time (see localmodels/setup.sh).
 
-Routes this phase: GET /health, POST /repair, POST /decide, POST /ledger. The Origin
-guard, CORS headers, POST size cap (413 BEFORE routing), banner and flags copy bridge.py
+Routes this phase: GET /health, POST /repair, POST /select, POST /decide, POST /ledger. The
+Origin guard, CORS headers, POST size cap (413 BEFORE routing), banner and flags copy bridge.py
 exactly.
 
 Laya runs as a spawned Node child (localmodels/laya_child.mjs) speaking NDJSON over stdio,
@@ -31,6 +31,12 @@ answer {ok:false, degraded:true, reason:...} - never a 500, never a hang.
     response {ok, calls:[{name, arguments}], confidence, reasoning, latency_ms,
               trace_id, degraded?, reason?}
     calls: [] means "no repair" - this daemon NEVER manufactures a call.
+
+/select contract (same §4, F3 pre-router): {input, candidates:[ToolSchema<=10]} -> the same
+response envelope, and it obeys the same rule - calls: [] means "no proposal", never a
+manufactured one. It shares _repair_call's bounded, single-worker, never-500 path under its
+own budget (--needle-select-timeout-ms, default 800 ms).
+
 The Needle call runs inside a bounded timeout (--needle-timeout-ms, default 800ms), is
 serialised by the module lock (the package keeps ONE active instance per generation
 process-wide) and NEVER wedges the server: a timeout or a missing model answers
@@ -61,6 +67,7 @@ PORT = 8932
 NEEDLE_ENABLED = True
 LAYA_ENABLED = True
 NEEDLE_TIMEOUT_MS = 800
+NEEDLE_SELECT_TIMEOUT_MS = 800    # bounded budget around ONE /select proposal
 LAYA_TIMEOUT_MS = 500       # bounded timeout around one child request
 LAYA_IDLE_S = 120           # reap the child after N idle seconds (0 disables)
 LAYA_CHILD_PATH = os.path.join(DAEMON_DIR, 'laya_child.mjs')
@@ -71,7 +78,9 @@ ALLOW_FILE_ORIGIN = False
 
 BACKEND = needle_backend.NeedleBackend(generation=NEEDLE_GENERATION)
 # /repair runs the (possibly slow) model call on this single worker so the HTTP handler
-# thread can return a bounded, degraded answer when the engine overruns.
+# thread can return a bounded, degraded answer when the engine overruns. /select shares it:
+# the engine bakes the candidate tools in, so both are the same model call on the same
+# process-global instance, and serialising them keeps that instance single-threaded.
 MODEL_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix='needle')
 
 # The Laya child manager; created in main() when Laya is enabled (None => never spawned).
@@ -321,6 +330,75 @@ def degraded_reasons():
     return reasons
 
 
+# How many ledger lines of each kind the read-back reports, and how many lines deep it reads.
+# The settings panel shows these as the LOCAL CORTEX proposal counters; the browser cannot
+# read the ledger file, so the daemon has to surface them.
+LEDGER_COUNT_KEYS = ('proposals', 'accepted', 'ignored', 'rejected', 'passed_through', 'timeout')
+LEDGER_COUNT_TAIL = 2000
+# The outcome lines written by POST /ledger carry an `action` and NO `op` key; that is how
+# accepted/ignored are counted, and is intentional.
+_LEDGER_ACTIONS = {'accepted': 'accepted', 'accepted_by_operator': 'accepted',
+                   'ignored_by_operator': 'ignored', 'rejected': 'rejected',
+                   'passed_through': 'passed_through', 'timeout': 'timeout'}
+
+
+def _ledger_tail(path):
+    """The last LEDGER_COUNT_TAIL lines of `path`, without reading the whole file.
+
+    A session ledger is append-only and grows without bound, so /health must never read
+    all of it. The window therefore GROWS backwards in chunks until it holds 2000 lines or
+    the start of the file is reached - a fixed byte window would silently under-report
+    whenever the lines are long (measured: a 64 KiB window held only 1489 of 2000 lines
+    and reported 1489 instead of 2000). Bounded by the chunked read, never unbounded.
+    Returns [] for a missing/unreadable file; never raises.
+    """
+    try:
+        with open(path, 'rb') as f:
+            size = f.seek(0, os.SEEK_END)
+            window = 65536
+            start = max(0, size - window)
+            while True:
+                f.seek(start)
+                data = f.read(size - start)
+                lines = data.decode('utf-8', 'replace').splitlines()
+                if len(lines) > LEDGER_COUNT_TAIL or start == 0:
+                    # Drop the first line when the window started mid-line.
+                    return lines[-LEDGER_COUNT_TAIL:]
+                window *= 2
+                start = max(0, size - window)
+    except Exception:
+        return []
+
+
+def _ledger_counts(path):
+    """Proposal/outcome counters read back out of the ledger. NEVER raises.
+
+    `proposals` counts the lines the daemon wrote for a /select proposal (`op:'select'`);
+    every OTHER line is counted by its `action` field. A missing file, an unreadable file
+    or a ledger of nothing but malformed lines all read as all-zero - a broken ledger must
+    never break /health.
+    """
+    counts = dict.fromkeys(LEDGER_COUNT_KEYS, 0)
+    for line in _ledger_tail(path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue                      # not JSON: skip, never fail the probe
+        if not isinstance(rec, dict):
+            continue                      # a JSON array/scalar is not a record
+        if rec.get('op') == 'select':
+            counts['proposals'] += 1
+            continue                      # a proposal line has no outcome of its own
+        key = _LEDGER_ACTIONS.get(rec.get('action'))
+        if key:
+            counts[key] += 1
+        # Any other / missing action is deliberately ignored.
+    return counts
+
+
 def health_obj():
     laya_loaded = bool(LAYA.loaded) if LAYA is not None else False
     laya_pid = LAYA.pid if LAYA is not None else None
@@ -341,7 +419,8 @@ def health_obj():
             'child_pid': laya_pid if (LAYA_ENABLED and laya_pid) else None,
             'cache': laya_cache_path(),
         },
-        'ledger': {'path': os.path.abspath(LEDGER_PATH), 'writable': ledger_writable()},
+        'ledger': {'path': os.path.abspath(LEDGER_PATH), 'writable': ledger_writable(),
+                   'counts': _ledger_counts(LEDGER_PATH)},
         'degraded': degraded_reasons(),
     }
 
@@ -374,6 +453,62 @@ def _repair_call(suspect, candidates, timeout_ms, trace_id):
                 'confidence': None, 'reasoning': ''}
     timeout_s = max(timeout_ms, 1) / 1000.0
     text = needle_backend.build_repair_prompt(suspect)
+    future = MODEL_POOL.submit(BACKEND.repair, text, candidates)
+    try:
+        res = future.result(timeout=timeout_s)
+    except TimeoutError:
+        if getattr(BACKEND, '_tools_key', None) is None:
+            # The engine was still (re)building for this candidate set when the budget
+            # expired - 'needle loading', not a model timeout.
+            reason = 'needle loading'
+        else:
+            reason = 'timeout'
+        return {'ok': False, 'degraded': True, 'reason': reason,
+                'latency_ms': elapsed(), 'trace_id': trace_id, 'calls': [],
+                'confidence': None, 'reasoning': ''}
+    except Exception as e:
+        return {'ok': False, 'degraded': True, 'reason': type(e).__name__,
+                'latency_ms': elapsed(), 'trace_id': trace_id, 'calls': [],
+                'confidence': None, 'reasoning': ''}
+    res['latency_ms'] = elapsed()
+    res['trace_id'] = trace_id
+    if not res.get('ok'):
+        res['degraded'] = True
+        res.setdefault('calls', [])
+        res.setdefault('confidence', None)
+        res.setdefault('reasoning', '')
+    return res
+
+
+def _select_call(input_text, candidates, timeout_ms, trace_id):
+    """Propose one tool call for the operator's utterance, with a BOUNDED timeout.
+
+    Deliberately the same contract as `_repair_call`, because a proposal is a repair that
+    starts from an utterance instead of from a malformed call: the same `NEEDLE_ENABLED`
+    short-circuit, the same empty-`candidates` guard, the same single-worker
+    `MODEL_POOL.submit(...)` + `future.result(timeout=...)`, the same `elapsed()` latency and
+    the same never-raise/never-500 rule. `calls: []` means "no proposal" - this daemon NEVER
+    manufactures a call.
+    """
+    started = time.time()
+
+    def elapsed():
+        return int(round((time.time() - started) * 1000))
+
+    if not NEEDLE_ENABLED:
+        return {'ok': False, 'degraded': True, 'reason': 'disabled',
+                'latency_ms': elapsed(), 'trace_id': trace_id, 'calls': [],
+                'confidence': None, 'reasoning': ''}
+    candidates = candidates if isinstance(candidates, list) else []
+    if not candidates:
+        # No tool to propose: a degraded, empty answer beats a manufactured one.
+        return {'ok': False, 'degraded': True, 'reason': 'tool_unavailable',
+                'latency_ms': elapsed(), 'trace_id': trace_id, 'calls': [],
+                'confidence': None, 'reasoning': ''}
+    timeout_s = max(timeout_ms, 1) / 1000.0
+    text = needle_backend.build_select_prompt(input_text, candidates)
+    # The Needle engine bakes the tools in at construction and answers one prompt with one
+    # envelope, so a proposal is the same model call as a repair - only the prompt differs.
     future = MODEL_POOL.submit(BACKEND.repair, text, candidates)
     try:
         res = future.result(timeout=timeout_s)
@@ -566,6 +701,28 @@ class Handler(BaseHTTPRequestHandler):
                 'action': None,
             }, path=LEDGER_PATH)
             self._json(200, res); return
+        if route == '/select':
+            tid = body.get('trace_id') or _new_trace_id()
+            res = _select_call(body.get('input'), body.get('candidates'),
+                               NEEDLE_SELECT_TIMEOUT_MS, tid)
+            # One ledger record per /select proposal; the operator's ACCEPT/IGNORE arrives
+            # later as a POST /ledger outcome line on the same trace_id. Never raise into
+            # the request path.
+            out = res.get('calls') if res.get('ok') else {'degraded': res.get('reason')}
+            ledger.append_record({
+                'trace_id': tid, 'model': 'needle', 'op': 'select',
+                'input_redacted': True,
+                'request': {'input': body.get('input'),
+                            'candidates': [(c.get('name') or (c.get('function') or {}).get('name'))
+                                           for c in (body.get('candidates') or [])
+                                           if isinstance(c, dict)]},
+                'output': out,
+                'confidence': res.get('confidence'),
+                'latency_ms': res.get('latency_ms'),
+                'degraded': bool(res.get('degraded')),
+                'action': None,
+            }, path=LEDGER_PATH)
+            self._json(200, res); return
         if route == '/decide':
             tid = body.get('trace_id') or _new_trace_id()
             res = _laya_decide(body.get('state'), body.get('questions'), LAYA_TIMEOUT_MS, tid)
@@ -619,7 +776,7 @@ def _shutdown_laya(*_args):
 
 def main():
     global PORT, NEEDLE_ENABLED, LAYA_ENABLED, LEDGER_PATH, LAYA
-    global ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN, NEEDLE_TIMEOUT_MS
+    global ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN, NEEDLE_TIMEOUT_MS, NEEDLE_SELECT_TIMEOUT_MS
     global LAYA_TIMEOUT_MS, LAYA_IDLE_S, LAYA_CHILD_PATH
     ap = argparse.ArgumentParser(description="LOCAL CORTEX sidecar (Needle + Laya)")
     ap.add_argument("--port", type=int, default=8932)
@@ -630,6 +787,9 @@ def main():
     ap.add_argument("--allow-file-origin", action="store_true", help="trust a null Origin (file:// page) — not recommended")
     ap.add_argument("--needle-timeout-ms", type=int, default=800,
                     help="bounded timeout AROUND THE MODEL CALL (default 800 ms); overrun => degraded, never a 500")
+    ap.add_argument("--needle-select-timeout-ms", type=int, default=800,
+                    help="bounded timeout around ONE /select proposal (default 800 ms); "
+                         "overrun => degraded with calls:[], never a 500, never a wedge")
     ap.add_argument("--preload-needle", action="store_true",
                     help="eagerly load the Needle engine in the background at boot (weights must be cached)")
     ap.add_argument("--laya-timeout-ms", type=int, default=500,
@@ -644,6 +804,7 @@ def main():
     NEEDLE_ENABLED = not a.no_needle
     LAYA_ENABLED = not a.no_laya
     NEEDLE_TIMEOUT_MS = a.needle_timeout_ms
+    NEEDLE_SELECT_TIMEOUT_MS = a.needle_select_timeout_ms
     LAYA_TIMEOUT_MS = a.laya_timeout_ms
     LAYA_IDLE_S = a.laya_idle_s
     if a.laya_child:
@@ -679,6 +840,7 @@ def main():
         'present' if weights else 'MISSING',
         ', preloading' if a.preload_needle else '')) if NEEDLE_ENABLED else "disabled"))
     print("   timeout    : %d ms (needle, around the model call)" % NEEDLE_TIMEOUT_MS)
+    print("   select     : %d ms per proposal (F3 pre-router)" % NEEDLE_SELECT_TIMEOUT_MS)
     print("   laya       : %s" % (("enabled (lazy, %s engine)" % ('node + child present' if engine_ok
                                                                  else 'ENGINE MISSING'))
                                   if LAYA_ENABLED else "disabled"))
