@@ -1242,7 +1242,34 @@ machine-specific changes; PR opened against `main`.
   4. Still-unverified, unchanged and NOT now fixable: the **Laya live leg** (needs a glibc host
      — `onnxruntime-node` arm64 prebuild is glibc-only) and the **manual UI pass** with both
      models loaded (no human in the cron loop).
-- **STANDING BLOCKER on this job:** the skill's final self-destruct step still cannot run — a
-  cron session has no `cronjob` tool exposed, so job `2e30153b376e` cannot delete itself. The
-  operator must delete or repoint it by hand. Flagged in the daily report on three consecutive
-  calls (17:35, 18:20, 19:05) and again here; nothing in the repository can fix it.
+- **2026-09-27 01:0x (cron) — TWO CORRECTIONS. The "STANDING BLOCKER" note above was WRONG,
+  and there was unbacked work on disk.**
+  1. **`hermes cron` DOES work from an unattended session.** The four previous calls
+     (17:35, 18:20, 19:05, 00:17) reported that "no `cronjob` tool is exposed" and asked the
+     operator to delete job `2e30153b376e` by hand. That is false: the deferred-tool catalog has
+     no `cronjob` tool, which is what those sessions tested, but the **`hermes cron` CLI is
+     available on PATH** and `hermes cron list` enumerates the job
+     (`2e30153b376e [active]`, `every 40m`, workdir `projects/Nanites-harness`). The correct
+     diagnosis was "the *tool* is absent", not "the capability is absent" — the four flags were
+     a self-inflicted blocker. **Do not re-flag this as a blocker without first running
+     `hermes cron --help`.** Self-destruct was still NOT performed: the operator's per-run prompt
+     explicitly says a fully-complete run must "log a one-line 'nothing to do' entry and stop",
+     and deleting a live scheduled job is the operator's call, not a cron session's. The
+     operator can retire it with `hermes cron remove 2e30153b376e`.
+  2. **A post-merge commit was unpushed — real data loss, now fixed.** Commit `cd76610`
+     ("gatelog: record PR #2 merged") was made *after* the operator merged PR #2 and deleted
+     the remote branch, so `git rev-list --count origin/main..HEAD` was **1**, not 0, and the
+     commit existed on exactly one disk. The remote branch had also been pruned, so
+     `git rev-list origin/feat/local-cortex-needle-laya...HEAD` failed outright with
+     `unknown revision` — which reads like "no remote" and is actually "remote deleted". The
+     skill's no-op runs check `origin/main..HEAD == 0` and would have reported "nothing to do"
+     while holding an unbacked commit, the precise data-loss shape the self-destruct rule
+     exists to prevent. Re-pushed the branch and opened a small PR for the note
+     (`docs: record PR #2 merge + cron self-destruct correction`). **Lesson for any future
+     no-op run: `git rev-list --count origin/main..HEAD` must be 0 AND the worktree clean AND
+     `git merge-base --is-ancestor HEAD origin/main` must succeed. A merged-then-deleted remote
+     branch invalidates the two-dot/three-dot shortcuts.**
+- **Completion audit still has NOT run** (`/home/user/codereview/Nanites-harness/ledger.md`
+  absent). Deliberately not triggered: this cron's operator scope is phases 10-15 and
+  explicitly excludes the `codereview.md` work. Recorded so a future session sees the state
+  rather than inferring it.
