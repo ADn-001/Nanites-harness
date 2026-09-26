@@ -1225,3 +1225,24 @@ machine-specific changes; PR opened against `main`.
     does not exist. Per this run's operator scope it was NOT triggered here (this cron's task is
     phases 10-15 only, and it explicitly excludes the open `codereview.md` items) — recorded so
     the next session sees the state instead of inferring it.
+- **2026-09-26 19:46 (cron) — PR #2 IS MERGED; the Local Cortex workstream is CLOSED.**
+  The operator merged `feat/local-cortex-needle-laya` into `main` at **2026-09-26T14:27:45Z**
+  (merge commit `8379582`). Verified: `git rev-list --count origin/main..HEAD` = **0**,
+  `git merge-base --is-ancestor HEAD origin/main` succeeds, and the full `npm test` is green on
+  this tree (frontend `ALL GREEN` across all 15 suites + `python3 test_e2e.py` `0 FAILURES`).
+  **Consequences for any later session, so this is not re-derived:**
+  1. `Next phase to work on:` stays "All phases complete". There is NO Local Cortex work left,
+     on this branch or `main`. The open `codereview.md` items and `PLAN.md` phases 0-9 remain
+     available but are explicitly out of this cron's scope.
+  2. Do NOT open a new PR for this branch, and do NOT "re-land" anything — the content is
+     already on `main` (`rev-list` 0 is the proof; two-dot diffs against a squash-merged base
+     lie, see the github-push-pr pitfall).
+  3. The `feat/local-cortex-needle-laya` branch can be deleted locally/remotely by the operator;
+     this cron never deletes branches.
+  4. Still-unverified, unchanged and NOT now fixable: the **Laya live leg** (needs a glibc host
+     — `onnxruntime-node` arm64 prebuild is glibc-only) and the **manual UI pass** with both
+     models loaded (no human in the cron loop).
+- **STANDING BLOCKER on this job:** the skill's final self-destruct step still cannot run — a
+  cron session has no `cronjob` tool exposed, so job `2e30153b376e` cannot delete itself. The
+  operator must delete or repoint it by hand. Flagged in the daily report on three consecutive
+  calls (17:35, 18:20, 19:05) and again here; nothing in the repository can fix it.
