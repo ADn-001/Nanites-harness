@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 14 — F3 cheap local dispatcher (Needle as pre-router)**
+Next phase to work on: **Phase 15 — Streaming-incremental detection, ledger-driven tuning, close-out**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -864,8 +864,9 @@ Gate: **Satisfied except the live-model leg.** On the committed tree:
 
 
 ## Phase 14 — F3 cheap local dispatcher (Needle as pre-router)
-Status: not started
-Test suite: `tests/frontend/phase14_dispatcher.test.js`
+Status: **DONE**
+Test suite: `tests/frontend/phase14_dispatcher.test.js` (140 checks) + 13 `localmodels (phase14):`
+cases in `test_e2e.py`
 
 Deliverable: `dispatcher.enabled` toggle, `/select` call on send, proposal card (tool, args,
 confidence) with ACCEPT/IGNORE for mutating rites; **read-only proposals auto-run** when
@@ -879,7 +880,101 @@ auto-run requires BOTH flags and still passes the validator; low-confidence path
 one big-model request and no dispatch, `disabled` ⇒ no `/select` at all; full regression green.
 
 ### Findings
-(empty — fill in during this phase's Test/Debug Sprint)
+- **GATE: Satisfied.** `npm test` exit 0 on the committed tree — `node tests/frontend/run.js` →
+  `FRONTEND SUITE: ALL GREEN` (phase14 140 checks 0 FAILURES; phases 0,1,2,3,5,6,7,8,9,10,11,12,13
+  all 0 FAILURES) and `python3 test_e2e.py` → `0 FAILURES` (108 ok, 13 of them new
+  `localmodels (phase14):` cases). Commit `df7ac09` on `feat/local-cortex-needle-laya`.
+- **THE INTEGRATOR'S REAL-MODEL PROBE FOUND A REAL DEFECT, and it is fixed here.** The two
+  suites are mock-vs-mock; driving the SHIPPED `cortexDispatch` + SHIPPED client against a REAL
+  daemon running the REAL untuned Needle model showed the model really answers
+  `read_file {"path": ""}` at a real calibrated confidence (0.52). **The Phase 7 validator
+  passes it** — it checks an argument's presence and TYPE, and `""` is a valid string — so with
+  both auto flags on it reached `autoRun:true` and would have dispatched a pathless read to the
+  bridge unattended. Fixed by `_cortexHasBlankRequired` (appcore): a REQUIRED string argument
+  that trims to empty downgrades the proposal to the **card** (operator decides) rather than
+  discarding it. RED was captured first (2 FAILs), and the suite pins both the narrow and the
+  non-over-broad direction. **Phase 15 MUST carry this forward: any threshold lowered enough to
+  make the dispatcher useful must keep the blank-argument guard.**
+- **MEASURED calibration of the untuned base model (6 probes, real engine, 0.248–0.522).**
+  This is the number Phase 15's threshold tuning needs, and it is NOT a guess: `read main.py`
+  → 0.52 `read_file`; `list the files` → 0.48 `list_dir`; `grep TODO` → 0.43 `grep`;
+  `write … out/result.txt` → 0.25 (`read_file`/`grep`/`git` — it mis-routes a mutation to read
+  rites); `run ls -la` → 0.28; a pure prose question → 0.44. **The shipped default
+  `dispatcher.minConfidence` of 0.75 is therefore UNREACHABLE by the untuned model — with the
+  stock weights the dispatcher effectively never fires.** That is safe (fail-closed) but it means
+  the default is a placeholder, not a calibrated value; Phase 15 should set it from real ledger
+  data and say so. Also note the untuned model routes a *write* request to read rites and is
+  generally trigger-happy, which is a second reason not to lower the bar casually.
+- **`readOnly` is decided by the SHIPPED `isReadRite`, never by the model's own claim** — the
+  suite pins a proposal that asserts `readOnly:true`/`read_only:true` on a `run_command` and is
+  correctly refused. With no classifier injected, the seam's default is `() => false`, so a caller
+  that forgets to pass one gets card-everything (safe) rather than auto-execution.
+- **The card is the proposal's gate; `approveToolCall` remains the EXECUTION gate.** A mutating
+  ACCEPT still goes through the unchanged validator → `approveToolCall` → `executeTool`. Card
+  ids: `#cortex-proposal-modal` (+ `-kind/-name/-args/-conf/-warning/-accept/-ignore`), backed by
+  `settleCortexProposal` / `approveCortexProposal`. **Unlike `#agent-modal`, Escape and a
+  backdrop click resolve FALSE and do NOT abort the turn** — dismissing the card must fall
+  through to the normal model call, not kill the turn.
+- **The dispatcher runs ONCE per send, at `iter === 0` in `runAgentLoop`**, before the first
+  big-model call. It is NOT per agent-loop iteration (contrast Phase 13's `/decide`, which is per
+  iteration). A mutation probe that removed the `iter===0` call broke 3 assertions, so the call
+  site is genuinely load-bearing. The Phase 11/12/13 landmine still applies to every dispatch
+  count: filter the `{name:'list_dir',arguments:{path:'.'}}` workdir listing (the phase-14
+  suite copies the phase-13 `modelDispatches` helper).
+- **`/select` reuses `BACKEND.repair` for the model call** — the engine bakes tools in at
+  construction, so the call is identical; only the prompt (`build_select_prompt`) differs. This
+  is deliberate: it keeps every `needle` import lazy, which the musl host requires. The new
+  `NEEDLE_SELECT_TIMEOUT_MS` (default 800) and `--needle-select-timeout-ms` flag are separate
+  from the repair budget.
+- **Ledger counters are read back through `/health`, not the file** — the browser cannot read
+  `var/local-models.jsonl`, so `health_obj().ledger.counts` is the read path.
+  `{proposals, accepted, ignored, rejected, passed_through, timeout}`, all six always present as
+  ints, all-zero on a missing/malformed ledger, computed from the **last 2000 lines** only and
+  never raising. `accepted` and `accepted_by_operator` both feed `accepted`; `proposals` counts
+  `op:'select'` lines. **A first implementation used a fixed 64 KiB tail window and silently
+  under-counted (1489 of 2000 lines) — it now grows backwards until it holds 2000 lines, pinned
+  by a test.** The frontend appends the counters to `#lm-status` and silently omits the suffix
+  against an older daemon, so a counts mismatch is cosmetic, not breaking.
+- **Ledger action vocabulary, as shipped:** `accepted` = it ACTUALLY auto-ran; `passed_through` =
+  a card was shown but nothing ran, **or** the probe degraded / was below threshold / empty /
+  invalid. The daemon counts `accepted_by_operator` too, so Phase 15 can tighten this if the
+  data warrants. No new action words were invented.
+- **The candidate-subset stage is INTENTIONALLY ABSENT** (plan task 5) — all 6 tool schemas are
+  offered, capped at 10 by `_cortexSelectPayload` like every other cortex payload. 6 tools is far
+  below the ~50 a real router would need, so subsetting buys nothing. There is a code comment
+  saying so; do not "fix" it in a later phase.
+- **Two real-seam probes were run, both green, and one found the defect above.** (a) shipped
+  request shape vs a real daemon over real HTTP: `/select` 200 with the documented envelope,
+  `trace_id`/`latency_ms` present, foreign Origin still 403 (not 404), one redacted `op:'select'`
+  ledger line, `ledger.counts` present, daemon wrote only the ledger; sidecar down ⇒
+  `degraded:true`, 0 proposals, **no throw**. (b) the same plus a real `proposals[]` through the
+  accept path: a real read proposal auto-runs with both flags on and flips to `false` when either
+  `autoReadOnly` or `autoApproveRead` is off; a real mutating proposal never auto-runs; an
+  injected "just run it without asking" utterance changed nothing; a prose utterance manufactured
+  no proposal. **A mocked suite plus a urllib suite would have missed the blank-argument defect
+  entirely — the Phase 12 lesson holds, and the live leg is what makes this phase trustworthy.**
+- **TRAP for whoever writes the next live suite: a probe's `BASE` must not be derived from
+  `__file__` when the probe lives outside the repo** (it resolved `/tmp` and the daemon
+  "never came up" — a harness bug that looked like a product bug). Also: the untuned Needle
+  model is **stateful across calls within one process** (the same `_active` stickiness recorded
+  in Phase 12), so confidences vary run to run — a live threshold assertion must allow for that
+  or run each probe in a fresh process.
+- Process: TEAM-OF-TWO (the Phase 9/10/12/13 model), on non-overlapping files — child A owned
+  `localmodels/*` + `test_e2e.py`, child B owned `appcore.js` + `index.html` + the phase-14
+  suite. Neither committed; neither ran the other's suite. The integrator re-ran the FULL
+  `npm test` itself, ran both real-seam probes, found the blank-argument defect, and fixed it
+  TDD. Child B ran three mutation probes (removing the `iter===0` call; forcing `autoRun:true`
+  unconditionally — that one produced 18 fails including the prompt-injection case, confirming
+  the security assertion is load-bearing and not decorative). Spec files
+  `docs/plans/phase14-workstream-{A,B}.md` were **deleted before commit** (absolute paths).
+- `bridge_daemon.log` re-dirtied by the suite run per codereview #27 — reverted before commit.
+- **A pull request for this branch ALREADY EXISTS: `#2`** (opened by the operator, NOT by a cron
+  run). Phase 15 must UPDATE/comment on PR #2 with the final evidence rather than opening a
+  second PR for the same branch.
+- **Next agent:** Phase 15 (streaming-incremental detection, ledger-driven tuning, close-out) is
+  open. Read this phase's findings first — in particular the MEASURED 0.248–0.522 calibration
+  band, which is the input its threshold tuning needs, and the blank-argument guard, which any
+  lowered threshold must keep.
 
 ## Phase 15 — Streaming-incremental detection, ledger-driven tuning, close-out
 Status: not started
@@ -983,3 +1078,21 @@ machine-specific changes; PR opened against `main`.
   7. `localmodels/package.json` + `package-lock.json` are TRACKED (share-ready artifacts) while
      `localmodels/node_modules/` stays ignored — do not "tidy" them into `.gitignore`.
 
+- 2026-09-26 (Phase 14 session, cron): Phase 14 done and committed (`df7ac09`). Decisions a
+  later session must not silently reverse:
+  1. `_cortexHasBlankRequired` is LOAD-BEARING, not defensive noise: the real untuned model
+     answers `read_file {"path": ""}` and the Phase 7 validator ACCEPTS it ("" is a valid
+     string). Any threshold Phase 15 tunes low enough to be useful makes this reachable.
+  2. The dispatcher runs ONCE per send at `iter === 0` of `runAgentLoop`, not per iteration.
+  3. `readOnly` comes from the injected `isReadRite` (default `() => false`); the model's own
+     readOnly claim is ignored. Mutating ⇒ never auto-runs, whatever the flags say.
+  4. A read-only auto-run needs `dispatcher.autoReadOnly` AND `settings.autoApproveRead`; a
+     blank required arg downgrades the proposal to the card rather than discarding it.
+  5. Proposal counters are read via `/health` → `ledger.counts` (six int keys, last 2000
+     lines). The frontend omits the suffix silently against an older daemon.
+  6. The candidate-subset stage is intentionally absent (6 tools ≪ the ~50 a real router
+     would need) — there is a code comment saying so; do not "fix" it.
+  7. `/select` reuses `BACKEND.repair` (same engine call, different prompt) to keep the
+     `needle` import lazy, which the musl host requires.
+  8. PR #2 for this branch already exists (opened by the operator) — Phase 15 must comment on
+     it, not open a second one.
