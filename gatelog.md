@@ -854,6 +854,11 @@ Gate: **Satisfied except the live-model leg.** On the committed tree:
   `package-lock.json` are tracked on purpose (share-ready artifacts) and `localmodels/node_modules/`
   stays git-ignored.
 - `bridge_daemon.log` re-dirtied by the suite run per codereview #27 — reverted before commit.
+- **A pull request for this branch ALREADY EXISTS: `#2` "Local Cortex: phases 5-12, the
+  Laya/Needle tool-call middleware" (OPEN since 2026-09-26T00:59Z, opened by the operator, NOT by
+  this cron run).** Phase 15 must therefore UPDATE/comment on PR #2 with the final evidence rather
+  than opening a second PR for the same branch — the plan's wording ("open the single PR") predates
+  this PR existing. This phase deliberately did not touch it (no PR before Phase 15).
 - Not fixed here (out of scope, for the Phase 15 share-readiness pass): `codereview.md` line 59
   still carries an absolute personal path (`/home/user/.config/autostart/...`).
 
