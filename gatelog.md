@@ -1225,3 +1225,51 @@ machine-specific changes; PR opened against `main`.
     does not exist. Per this run's operator scope it was NOT triggered here (this cron's task is
     phases 10-15 only, and it explicitly excludes the open `codereview.md` items) — recorded so
     the next session sees the state instead of inferring it.
+- **2026-09-26 19:46 (cron) — PR #2 IS MERGED; the Local Cortex workstream is CLOSED.**
+  The operator merged `feat/local-cortex-needle-laya` into `main` at **2026-09-26T14:27:45Z**
+  (merge commit `8379582`). Verified: `git rev-list --count origin/main..HEAD` = **0**,
+  `git merge-base --is-ancestor HEAD origin/main` succeeds, and the full `npm test` is green on
+  this tree (frontend `ALL GREEN` across all 15 suites + `python3 test_e2e.py` `0 FAILURES`).
+  **Consequences for any later session, so this is not re-derived:**
+  1. `Next phase to work on:` stays "All phases complete". There is NO Local Cortex work left,
+     on this branch or `main`. The open `codereview.md` items and `PLAN.md` phases 0-9 remain
+     available but are explicitly out of this cron's scope.
+  2. Do NOT open a new PR for this branch, and do NOT "re-land" anything — the content is
+     already on `main` (`rev-list` 0 is the proof; two-dot diffs against a squash-merged base
+     lie, see the github-push-pr pitfall).
+  3. The `feat/local-cortex-needle-laya` branch can be deleted locally/remotely by the operator;
+     this cron never deletes branches.
+  4. Still-unverified, unchanged and NOT now fixable: the **Laya live leg** (needs a glibc host
+     — `onnxruntime-node` arm64 prebuild is glibc-only) and the **manual UI pass** with both
+     models loaded (no human in the cron loop).
+- **2026-09-27 01:0x (cron) — TWO CORRECTIONS. The "STANDING BLOCKER" note above was WRONG,
+  and there was unbacked work on disk.**
+  1. **`hermes cron` DOES work from an unattended session.** The four previous calls
+     (17:35, 18:20, 19:05, 00:17) reported that "no `cronjob` tool is exposed" and asked the
+     operator to delete job `2e30153b376e` by hand. That is false: the deferred-tool catalog has
+     no `cronjob` tool — which is what those sessions tested — but the **`hermes cron` CLI is
+     available on PATH** and `hermes cron list` enumerates the job
+     (`2e30153b376e [active]`, `every 40m`, workdir = this repo). The correct
+     diagnosis was "the *tool* is absent", not "the capability is absent" — the four flags were
+     a self-inflicted blocker. **Do not re-flag this as a blocker without first running
+     `hermes cron --help`.** Self-destruct was still NOT performed: the operator's per-run prompt
+     explicitly says a fully-complete run must "log a one-line 'nothing to do' entry and stop",
+     and deleting a live scheduled job is the operator's call, not a cron session's. The
+     operator can retire it with `hermes cron remove 2e30153b376e`.
+  2. **A post-merge commit was unpushed — real data loss, now fixed.** Commit `cd76610`
+     ("gatelog: record PR #2 merged") was made *after* the operator merged PR #2 and deleted
+     the remote branch, so `git rev-list --count origin/main..HEAD` was **1**, not 0, and the
+     commit existed on exactly one disk. The remote branch had also been pruned, so
+     `git rev-list origin/feat/local-cortex-needle-laya...HEAD` failed outright with
+     `unknown revision` — which reads like "no remote" and is actually "remote deleted". The
+     skill's no-op runs check `origin/main..HEAD == 0` and would have reported "nothing to do"
+     while holding an unbacked commit, the precise data-loss shape the self-destruct rule
+     exists to prevent. Re-pushed the branch and opened a small PR for the note
+     (`docs: record PR #2 merge + cron self-destruct correction`). **Lesson for any future
+     no-op run: `git rev-list --count origin/main..HEAD` must be 0 AND the worktree clean AND
+     `git merge-base --is-ancestor HEAD origin/main` must succeed. A merged-then-deleted remote
+     branch invalidates the two-dot/three-dot shortcuts.**
+- **Completion audit still has NOT run** (`codereview/Nanites-harness/ledger.md` under the
+  agent home does not exist). Deliberately not triggered: this cron's operator scope is
+  phases 10-15 and explicitly excludes the `codereview.md` work. Recorded so a future session
+  sees the state rather than inferring it.
