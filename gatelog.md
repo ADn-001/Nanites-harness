@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **All phases complete** (0-15). Nothing left to work on in this plan.
+Next phase to work on: **Phase 16 — Bridge jail: git flag audit, grep symlinks, one git policy**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1081,8 +1081,247 @@ machine-specific changes; PR opened against `main`.
   it** — the plan called for a confirmation band and nothing implements it. Left as reserved;
   do not document it as working behaviour.
 
+# ===== AUDIT REMEDIATION — phases 16-24 (planned 2026-10-01 by nightly-support) =====
+
+Source: the 2026-09-30 `codebase-audit` ledger (`/home/user/codereview/Nanites-harness/`
+`sibling of projects/`), 28 entries the operator approved (`approved: true`, `status: new`),
+grouped into 9 tickets under `tickets/`. **Phases 10-15 are DONE and are not reopened** — this
+block is appended work, and phase numbering continues from 15 without renumbering anything.
+
+Every phase below follows this project's standing discipline, which is unchanged from phases
+1-15 and is not restated per phase: **implement → write the phase's own e2e suite → capture a
+RED run first → debug until green → only then mark done and fill in `### Findings`.** One phase
+per session/cron call. The regression gate is always `npm test` (frontend `ALL GREEN` **and**
+`python3 test_e2e.py` `0 FAILURES`) plus every earlier phase's suite.
+
+Phase order is by highest severity in the phase, so the phases that can lose data or execute
+outside the jail land before the diagnostics and docs work. Tickets are referenced by ID only
+(deliberately: absolute personal paths must never enter a tracked file — see the share-readiness
+rule and finding CR-Nanites-harness-0027).
+
+---
+
+## Phase 16 — Bridge jail: git flag audit, grep symlinks, one git policy
+Status: **not started**
+Ticket: `TICKET-2026-10-01-bridge-jail-git-policy` (CR-Nanites-harness-0001 critical, 0002 high, 0009 medium)
+
+Deliverable: `bridge.py` `_git_flag_audit` extended to EVERY `GIT_READ` subcommand (reject
+`--output`, `--exec-path`, `--output-indicator-new`; refuse `format-patch`/`archive` entirely),
+`t_grep` given the same per-file `jail()` check `t_read_file` already has plus explicit
+symlinked-dirname pruning, and the git read-only policy reduced to a single source the frontend
+consumes (so `isReadRite` cannot disagree with the bridge — 0009 is the structural cause of
+0001).
+Gate: `test_e2e.py` gains cases asserting `git log/diff/show/blame --output=<tmp>` is refused and
+writes no file outside `ROOT`, `format-patch` is refused, and a symlinked FILE is not matched by
+`grep` while `read_file`/`list_dir` still refuse it; a new frontend case drives the **real**
+`isReadRite` (never the phase-14 stub) and asserts false for `--output`/`--exec-path`/
+`format-patch`. Done = every existing suite still green AND a read subcommand with a file-writing
+flag cannot reach the bridge at all, in either layer.
+
+### Findings
+
+---
+
+## Phase 17 — Agent turn: bind its own message, well-formed tool protocol, teardown on every exit
+Status: **not started**
+Ticket: `TICKET-2026-10-01-agent-turn-stream-integrity` (CR-Nanites-harness-0011 critical, 0012 critical, 0015 high, 0013 high, 0014 high)
+
+Deliverable: the SSE pump and `refreshLast` bind the message they were handed instead of
+re-deriving `active().messages[length-1]` (0011); dispatcher results are pushed so the first
+request is protocol-legal — either a synthesised assistant `tool_calls` precedes each `tool`
+message, or the pre-router result is injected as a plain observation (0012);
+`mergeToolDelta` compacts once, at hand-off, not inside the delta loop (0015); `halt()` settles
+**every** resolver including `proposalResolve` (0013); and the stream teardown moves into a
+`finally` so nothing thrown inside the `catch` can leave `generating` stuck (0014), with
+`clearActive`/`deleteChat`/wipe guarded by `if(generating)return;`.
+Gate: new frontend suite asserts (a) deltas land on the message the turn created even when a tool
+message is appended mid-stream, (b) every `tool` message in every outbound request is preceded by
+an assistant declaring that `tool_call_id` — `tool_call_id` currently has 0 occurrences across
+`tests/frontend`, which is exactly why both bugs shipped, (c) STOP from every modal state clears
+`generating` and restores the send button, (d) a `finally` survives a throwing `catch`, and (e)
+`mergeToolDelta` fed two index-less fragments — and index 1 before index 0 — yields ONE coherent
+call each. Count `modelDispatches` (bridge bodies minus the workdir-listing signature), never raw
+bridge POSTs — the Phase 11 landmine still applies. Done = no path leaves the app permanently
+busy, and no outbound request can be rejected by a strict OpenAI-compatible server.
+
+### Findings
+
+---
+
+## Phase 18 — Sidecar: RLock the model lock, bound the pool, fence child teardown by generation
+Status: **not started**
+Ticket: `TICKET-2026-10-01-sidecar-concurrency-deadlock` (CR-Nanites-harness-0010 critical, 0019 high, 0020 high)
+
+Deliverable: `localmodels/needle_backend.py` `_LOCK` becomes `threading.RLock()` (0010);
+`MODEL_POOL` gains a queue bound plus `future.cancel()` on the timeout path so a stale work item
+cannot occupy the single worker forever (0019); `_read_stdout`'s teardown carries the child's
+identity (a monotonically increasing generation id) and `_fail_pending` is a no-op unless the
+dying child is still the registered current one (0020).
+Gate: a `test_e2e.py` case sets `NEEDLE_WEIGHTS` to an existing file, calls `/repair` and asserts
+it RETURNS rather than hanging — **with a timeout, so the deadlock fails instead of stalling the
+suite**; a saturation case asserts the (N+1)th concurrent call is refused rather than queued; a
+deterministic case registers a pending request against a NEW child, fires the OLD child's teardown,
+and asserts the pending request survives. `NEEDLE_WEIGHTS` has 0 occurrences in the suite today,
+which is precisely why a guaranteed deadlock shipped green. Done = the documented tuned-weights
+configuration serves a first `/repair` and a child reap cannot fail the live child's work.
+
+### Findings
+
+---
+
+## Phase 19 — Daemon auth: per-install token on privileged routes, provenance-checked atomic start
+Status: **not started**
+Ticket: `TICKET-2026-10-01-daemon-auth-and-lifecycle` (CR-Nanites-harness-0017 high, 0016 high, 0023 medium, 0024 medium)
+
+Deliverable: a per-install token generated at daemon start, required in a header on every
+privileged route across all three servers, with the Host header pinned to a loopback name as a
+second check; "absent Origin" stops meaning "allowed" (0017). `_cors` stops emitting
+`Access-Control-Allow-Origin: *` on refusals. `start_bridge()` re-writes `bridge.py` from
+`read_bridge_source()` (or verifies its marker/hash and refuses on mismatch) so an agent cannot
+get its own code executed by a more privileged process (0016); `_lock` is taken in
+`start_bridge`/`stop_bridge` so the rebind atomicity its comment claims is real (0023);
+`write_bridge` writes tmp + `os.replace` with `BRIDGE_MARKER` on line 1 (0024).
+Gate: `test_e2e.py` keeps its existing Origin matrix (that work is genuinely good — do not
+weaken it) and ADDS the untested half: a privileged route with no token is refused even from
+`localhost`, a foreign `Host` is refused, a tampered planted `bridge.py` is not spawned, and a
+`/set_workdir` racing a `/start` cannot end up bound to one directory while serving another.
+**This phase changes the behaviour the Phase 9 gate log deliberately left open** ("a request with
+no Origin header is still allowed") — that note becomes stale and must be updated in this phase's
+findings, not silently contradicted. Probe the daemon only on a COPY in a temp dir with spare
+ports; never in-place in the repo (it writes its pid/log next to itself, finding 0008). Done = no
+local unauthenticated client reaches a privileged route, and the daemon never spawns a file it did
+not write.
+
+### Findings
+
+---
+
+## Phase 20 — Compaction: never discard the transcript on an empty summary, never stringify array content
+Status: **not started**
+Ticket: `TICKET-2026-10-01-compaction-data-loss` (CR-Nanites-harness-0003 high, 0026 medium)
+
+Deliverable: `compactChat` bails BEFORE touching `c.messages` when the summary call returns empty,
+and reports that plainly instead of silently slicing (0003); the compression history and
+`refreshLast` both route through `CogCore.contentText()` so attachment arrays are summarised as
+text rather than `[object Object]` (0026).
+Gate: a new suite pins the empty-summary case first (messages and `c.summary` both untouched,
+and the operator is told), plus the array-content case (the prompt contains the attachment's text)
+and the `refreshLast` render matching `msgHTML`'s guarded output. `compactChat` is currently called
+by NO test — the only match in `tests/frontend` is a comment — so this is the first suite for the
+whole rite; keep it that way. Remember the budget walk and the dangling-tool-result boundary are
+part of the same function. Done = no automatic rite (`maybeAutoCompact` fires at 85% of the
+context limit with no operator action) can lose the front of a conversation.
+
+### Findings
+
+---
+
+## Phase 21 — Service worker: an offline load cannot serve HTML as the app bundle
+Status: **not started**
+Ticket: `TICKET-2026-10-01-sw-offline-and-cache` (CR-Nanites-harness-0018 high, 0007 medium)
+
+Deliverable: `./appcore.js` added to `SHELL`, and the navigation fallback restricted to
+`e.request.mode === 'navigate'` / `destination === 'document'` so a script request can never be
+answered with the HTML document (0018); `CACHE` derived from a version constant the app assets also
+carry, so one bump invalidates the cache atomically instead of relying on a human remembering one
+line (0007).
+Gate: static assertions only — jsdom has no ServiceWorker/container APIs, so the achievable guards
+are "every same-origin script referenced by `index.html` appears in `SHELL`" and "the `CACHE`
+string changed when any SHELL asset changed". Offline support currently makes the app STRICTLY
+WORSE than no offline support (a white screen, no message); the mode guard is what makes the
+failure honest, so do not ship only the `SHELL` addition. Done = a failed script fetch surfaces
+as an honest error, never as a parse-failure death.
+
+### Findings
+
+---
+
+## Phase 22 — Sidecar request path and ledger: contain malformed input, bound growth, actually redact
+Status: **not started**
+Ticket: `TICKET-2026-10-01-sidecar-request-and-ledger-integrity` (CR-Nanites-harness-0021, 0022, 0025, 0006, 0004)
+
+Deliverable: the `n <= 0 or n > MAX` body form used in all three servers, the `int()` parse
+wrapped to return 400, and a byte cap during the read — a lying length is the whole attack, so
+declared length alone is not a bound (0021); candidate name extraction normalised to accept both
+the nested and flattened `function` shapes, with the ledger append in its own `try/except` so
+telemetry can never affect the response path (0022); `action` validated server-side against
+`_LEDGER_ACTIONS` so the daemon and `tools/tune_thresholds.py` cannot disagree (0006); size-based
+rotation in `append_record` with the size surfaced in `/health` (0006); `_ledger_tail` bounded by
+BYTES as well as lines, seeking backward from EOF (0025); the configured provider key actually
+passed to the redaction call, or the docstring corrected to stop asserting a rule no code path
+provides (0004).
+Gate: `test_e2e.py` asserts a negative and a non-numeric `Content-Length` are refused rather than
+read or dropped, a candidate with `{"function":"read_file"}` gets a clean response, an action
+outside the vocabulary is refused, an injected unknown action word does NOT land in the measured
+acceptance rate, rotation bounds the file, and a ~10-fat-record ledger does not defeat the
+`/health` read bound. **Order matters: this phase must land AFTER Phase 19**, which moves the same
+servers' request handling and already touches `bridge.py`/`bridge_daemon.py` body parsing — two
+agents must not edit those lines. Done = no malformed request hangs, drops or 500s a handler, and
+the acceptance rate Phase 15's tuning rests on cannot be silently depressed.
+
+### Findings
+
+---
+
+## Phase 23 — Report a stream timeout as a timeout, and send the auth header the LM Studio probe omits
+Status: **not started**
+Ticket: `TICKET-2026-10-01-frontend-probe-and-timeout-diagnostics` (CR-Nanites-harness-0005 medium, 0029 medium)
+
+Deliverable: `stream()`'s catch distinguishes the two abort causes (`TimeoutError` vs the
+operator's own `abortCtl`), reports a timeout as a timeout, and does NOT fire the LM Studio
+soul-load retry on one — that retry is a second 120 s model load on top of a turn that already ran
+180 s (0005); the agent loop's budget becomes per-iteration while the operator's `abortCtl` stays
+the loop-wide kill switch (0005); `fetchLMSLoaded()` passes `authHeaders()` like all five sibling
+probes (0029).
+Gate: a new frontend suite must first INJECT a fake `AbortSignal`/timer — jsdom here DOES supply
+`AbortSignal.timeout` via Node 24, so the Phase 5 gatelog's claim that it does not is wrong and
+must not be relied on; delete the static and assert the defensive path still resolves. Assert the
+timeout message is not `VERIFY ENDPOINT LINK`, that no retry fires on a timeout, that an operator
+abort still reads as a halt, and that every probe hitting `/api/v0/models` carries the header.
+Stubbing an endpoint without inspecting request headers cannot catch 0029 — every frontend fetch in
+this project is tested for "does it get a 200" and not for "does it send the right headers". Done =
+the operator is sent to debug the component that is actually wrong.
+
+### Findings
+
+---
+
+## Phase 24 — Docs: tell the truth about completion status, and make a fresh clone work
+Status: **not started**
+Ticket: `TICKET-2026-10-01-docs-status-and-onboarding` (CR-Nanites-harness-0027 medium, 0028 medium)
+
+Deliverable: the plan document's line 3 corrected to DONE with its date and phases 10-14 given
+explicit status lines, `PLAN.md`'s self-contradictory Phase 5 header fixed against its own
+checkboxes, and the stale file-size tables regenerated or deleted (0027); `README.txt` install flow
+gains `git clone` and `npm install` as numbered steps, becomes platform-neutral, and uses `python3`
+consistently with `package.json` (0028).
+Gate: a cheap CI assertion that every gatelog phase marked DONE has a plan file whose status line
+agrees — the rot here is invisible precisely because nothing reads these files. Prefer GENERATING
+the status line and file inventory from `gatelog.md` and `wc -l` over hand-maintaining them across
+another 9 phases. This is the LAST phase on purpose: it documents work the earlier phases change.
+Done = a context-free session reading the plan header does not redo finished work or start a
+Phase 25 that does not exist.
+
+### Findings
+
+---
+
 ## Notes
 
+- **2026-10-01 (nightly-support, hand-started session): phases 16-24 appended; the 2026-09-26
+  "all phases complete" state was real and is deliberately NOT reopened.** A prior run of this
+  pass wrote all 9 tickets (dated 2026-10-01) and then died before its Step 4 and Step 5 — so the
+  tickets were on disk with the ledger still entirely `status: new` and **no phase planned for any
+  of them**. That is exactly the "correct files, zero progress, reports success" failure the skill
+  warns about, and the plan-complete flag was doing its job in the meantime. This run verified the
+  tickets cover all 28 approved+new findings exactly once (0008, 0030, 0031 are `approved: false`
+  and correctly excluded), then wrote phases 16-24 and marked the ledger `ticketed`. No cron was
+  created: the shared `dev-sprint-auto` + `queue-enqueuer-auto` pair owns scheduling.
+- The 9 tickets group the 28 approved findings by subsystem, not one-per-finding. `Phase 16..24`
+  map 1:1 onto those tickets; the ordering is by highest severity, and Phase 22 is sequenced after
+  Phase 19 on purpose because both edit the servers' body-parsing lines.
+- `REPO PATH` (unchanged): phases 10-15 live on `main` via merged PR #2; the checkout is still on
+  `feat/local-cortex-needle-laya`. The merge is not to be undone and no new PR is opened for it.
 - **Repo path (2026-09-26, no-op cron call).** The cron job's prompt still names
   `/home/user/Nanites-harness`, which **no longer exists**. The checkout lives at
   `/home/user/projects/Nanites-harness` (the `projects/` layout the dev-sprint skill mandates).
