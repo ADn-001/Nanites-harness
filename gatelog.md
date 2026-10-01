@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 16 — Bridge jail: git flag audit, grep symlinks, one git policy**
+Next phase to work on: **Phase 17 — Agent turn: bind its own message, well-formed tool protocol, teardown on every exit**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1102,8 +1102,11 @@ rule and finding CR-Nanites-harness-0027).
 ---
 
 ## Phase 16 — Bridge jail: git flag audit, grep symlinks, one git policy
-Status: **not started**
+Status: **DONE**
 Ticket: `TICKET-2026-10-01-bridge-jail-git-policy` (CR-Nanites-harness-0001 critical, 0002 high, 0009 medium)
+Supersedes: the plan below as written — the independent review found a **fourth** escape the
+  deliverable did not name (`git diff --no-index`), and it is closed here. Read the findings
+  before reusing the plan's flag list.
 
 Deliverable: `bridge.py` `_git_flag_audit` extended to EVERY `GIT_READ` subcommand (reject
 `--output`, `--exec-path`, `--output-indicator-new`; refuse `format-patch`/`archive` entirely),
@@ -1119,6 +1122,114 @@ writes no file outside `ROOT`, `format-patch` is refused, and a symlinked FILE i
 flag cannot reach the bridge at all, in either layer.
 
 ### Findings
+
+**Gate evidence.** `npm test` green end to end: `node tests/frontend/run.js` → `FRONTEND SUITE:
+ALL GREEN` (16 files, incl. the new `phase16_git_policy.test.js`), and `python3 test_e2e.py` →
+`0 FAILURES`. Mutation harness `tools/mutate_phase16.py`: 16 mutations, **14 caught, 0 real
+escapes, 2 documented equivalents** (M6 and M9 — findings 5 and 6). Re-run it after touching
+`bridge.py` or `isReadRite`; it is the only thing here that proves the new tests have teeth.
+
+1. **The ticket's flag list was INCOMPLETE, and the review caught it. Do not reuse it.**
+   The deliverable named `--output`, `--exec-path`, `--output-indicator-new` and the
+   `format-patch`/`archive` refusals. None of those is a *read* escape, so all three
+   subcommand-refusals were redundant where they were written — `format-patch` and `archive`
+   are not in `GIT_READ`, so the fall-through error already refused them. The independent
+   review found the escape that was actually reachable and unfixed:
+   **`git diff --no-index /etc/passwd /dev/null` reads any file on the box.** `--no-index`
+   makes diff compare two arbitrary paths instead of repo contents; it was permitted by the
+   bridge AND classified a read rite by the frontend, so with `autoApproveRead` defaulting
+   true it auto-ran with no operator prompt. Confirmed end-to-end by direct probe before the
+   fix (the bridge returned the contents of `/etc/passwd`; `isReadRite` returned `true`), and
+   re-probed after: refused in both layers. **It is now in `GIT_JAIL_FLAGS`.** Lesson for any
+   future "which flags can escape the jail" list: enumerate by *what the flag can reach* (a
+   path outside ROOT), not by *which subcommand is known to be dangerous today*.
+
+2. **`GIT_JAIL_FLAGS`, not `GIT_OUTPUT_FLAGS` — the name was wrong and hid the read side.**
+   The first version of this fix called the tuple `GIT_OUTPUT_FLAGS` and described it as "the
+   file-writing flags". `--no-index` is a *read* escape, so the name actively steered the
+   search away from it. Renamed, with the reasoning in the docstring. If you add a flag here,
+   ask "can this reach a path outside ROOT", not "does this write".
+
+3. **Deny-list, not allow-list, for the log/diff/show family — a considered choice, not
+   laziness.** CR-0001 suggested inverting to an allow-list of flags per read subcommand. It is
+   right for `branch`/`tag`/`stash` (already implemented that way) and wrong for the rest:
+   `log`/`diff`/`show` carry a large legitimate surface (`--oneline`, `-n`, `--since`,
+   `--author`, `-p`, `--stat`, `--no-color`, paths, revision ranges) and an allow-list that
+   omits one breaks ordinary use. **A security fix that breaks the tool gets worked around**,
+   which is worse than the bug. The per-subcommand allow-lists stay for the three that had
+   them; the out-of-jail flags are denied uniformly.
+
+4. **Check ORDER is load-bearing, and the "obviously right" order was wrong.** My first version
+   ran the generic flag check before the subcommand check, with a comment claiming that
+   ordering was a correctness property. It is not — both checks are independently sufficient,
+   so either order is *safe* — but the generic message then shadowed the specific one, and
+   `git archive --output=x` stopped naming `archive` in its refusal. The assertion that caught
+   this (`the file-writing refusal NAMES the subcommand`) was **RED while the rest of the
+   suite was green**, so a per-assertion grep over a filtered run would have missed it.
+   Most-specific-first is now the order, and mutation M4b pins it. **Lesson: a green summary
+   line is not evidence that every assertion ran — read the failure lines, not just the
+   total.** (I hit exactly this: a `head -10` on a grep hid the failure and I reported the
+   suite green. It was not.)
+
+5. **M9 is a DOCUMENTED EQUIVALENT mutation, not a test gap — proved, not assumed.** Dropping
+   the explicit `FRONT_GIT_REFUSED_WRITE.has(sub)` check leaves the suite green. That is
+   *correct*, and the reason is set disjointness: every member of `FRONT_GIT_REFUSED_WRITE` is
+   absent from `FRONT_GIT_READ` and is not one of the special-cased `branch`/`tag`/`stash`, so
+   `isReadRite` reaches `return FRONT_GIT_READ.has(sub)` and gets `false` anyway. No input
+   distinguishes the two guards, so no test could catch it. The layer is still pinned two
+   other ways: M9b (emptying the table IS caught) and the suite's explicit non-overlap
+   assertion, which is what would fire if a subcommand ever landed in both tables. **Do not
+   "fix" this by deleting the check** — it is defence in depth, and it becomes load-bearing
+   the day the sets intersect.
+
+6. **`t_grep` now jails every file it opens, and `os.walk` is called with `followlinks=False`
+   EXPLICITLY.** `os.walk`'s default already is `False`, so no behavioural test can tell the
+   kwarg from the default — the suite asserts the call *structurally* instead, and M6b
+   (flipping it to `True`) is caught. **M6 (deleting the `islink` prune) is a documented
+   equivalent**: while `followlinks=False` holds, no input distinguishes the prune from the
+   kwarg, so it is kept as the guard against a future edit flipping that kwarg rather than
+   pinned by a test. The per-file check is a `realpath`
+   containment test, **skipped not raised**, so one escaping symlink does not fail the whole
+   grep. The realpath-then-open TOCTOU window remains open (a full fix needs
+   `O_NOFOLLOW`/`openat`), and hardlinks inside ROOT are indistinguishable by path — both are
+   limitations `t_read_file` already has, so this is not a regression. Flagged, not fixed.
+
+7. **The frontend policy is GENERATED, not copied — and the generator is checked in the
+   suite.** `tools/gen_git_policy.py` imports `bridge.py` and emits the `FRONT_GIT_*` block
+   between two markers in `index.html`; `test_e2e.py` runs it with `--check` and fails if the
+   committed block has drifted, plus asserts the emitted block really carries the bridge's
+   subcommands and flags. Guard verified to have teeth by planting `format-patch` into the
+   generated `FRONT_GIT_READ`: `--check` exited 1 *and* the frontend suite went red. **After
+   editing any `GIT_*` table in `bridge.py`, run `python3 tools/gen_git_policy.py --write`.**
+   M11 covers the drift case.
+
+8. **The frontend tokenizer KEEPS quotes, so the flag check must strip them.** `parts` comes
+   from a regex that preserves `"..."`, so `"--output=/tmp/x"` matched neither the exact nor
+   the `flag=` prefix test and was reported a READ while the bridge (`shlex.split`) refused the
+   same call. The bridge was the backstop so there was no write, **but the two layers
+   disagreed on classification** — the operator would be shown a read the bridge then refuses.
+   `isReadRite` now maps `parts` through a quote-strip before any comparison; M7b pins it.
+   **This is the general shape of 0009: the layers must agree on the DECISION, not merely
+   reach the same outcome by different routes.**
+
+9. **A top-level `const` in a classic script is NOT a window property.** The phase-16 frontend
+   suite reads `FRONT_GIT_READ` via `win.eval(...)`, not `win.FRONT_GIT_READ` — the latter is
+   `undefined`, which would have made every single-source assertion **vacuously skip** and
+   report green. The suite asserts the lookup succeeded (non-null, correct shape) before
+   trusting it, so the guard cannot pass by finding nothing. Same class of bug as finding 10.
+
+10. **`bridge_daemon.log` is a TRACKED file that every test run dirties.** It appeared as an
+    unstaged modification after each suite run. It was clean at session start, so it is
+    restored (`git checkout -- bridge_daemon.log`) before committing and **must not be swept
+    into a phase commit**. A tracked runtime log is itself a finding — CR-Nanites-harness-0008
+    records that it leaks a personal absolute path. The durable fix is to untrack and
+    gitignore it, which is out of scope here and left to whoever owns 0008.
+
+11. **Run the independent review BEFORE committing, not after.** The `--no-index` escape existed
+    in the very code this phase was written to fix, was reachable, and appeared in neither the
+    ticket nor the plan. It was found by a reviewer reading the diff. Both of its load-bearing
+    claims verified true on direct probe — one a real security hole, one a real red suite that
+    contradicted a run I had just watched report green. The review is not a formality here.
 
 ---
 

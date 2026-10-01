@@ -35,6 +35,33 @@ GIT_READ  = {"status","diff","log","show","branch","ls-files","ls-tree",
              "rev-parse","stash","blame","describe","tag","shortlog","count-objects"}
 GIT_WRITE = {"add","commit","restore","checkout","switch","reset","merge",
              "rebase","rm","mv","clean","fetch","pull","push","cherry-pick"}
+#: Subcommands that are *not* in GIT_READ but still write files, so they are refused
+#: by name rather than falling through to the generic "not permitted" error. Listing
+#: them makes the refusal legible in the log AND stops a future edit that adds one of
+#: them to GIT_READ from silently reopening the hole (CR-Nanites-harness-0001).
+GIT_REFUSED_WRITE = {"format-patch", "archive", "bundle", "fast-export", "worktree"}
+#: **Flags that take a filesystem path OUTSIDE the repo, denied on EVERY subcommand.**
+#:
+#: `--output=<file>` redirects stdout to an arbitrary path, so `git log --output=/tmp/x`
+#: wrote outside ROOT where `jail()` never sees it (CR-Nanites-harness-0001, critical).
+#:
+#: `--no-index` is the same class of escape on the READ side and was found by this phase's
+#: independent review: it makes `diff` compare two ARBITRARY paths instead of repo
+#: contents, so `git diff --no-index /etc/passwd /dev/null` returns the contents of a file
+#: outside ROOT. It was permitted here AND classified a read rite by the frontend, so it
+#: auto-ran with no operator prompt. Denying the flag is what closes it in both layers.
+#:
+#: **Why a deny-list and not the allow-list 0001 also suggested.** Inverting to "allow-list
+#: the flags each read subcommand may take" is the stronger shape and is right for
+#: branch/tag/stash, which this module already does for them. It is not usable for the
+#: log/diff/show family: those carry a large and legitimate surface (`--oneline`, `-n`,
+#: `--since`, `--author`, `-p`, `--stat`, `--no-color`, path arguments, revision ranges),
+#: and an allow-list that omitted one would break ordinary use — a security fix that breaks
+#: the tool gets worked around, which is strictly worse than the bug. So the enumerated
+#: per-subcommand allow-lists stay for the three subcommands that had them, and the
+#: out-of-jail flags are denied uniformly, which is the whole of the escape surface.
+GIT_JAIL_FLAGS = ("--output", "--output-indicator-new", "--exec-path", "--no-index")
+
 
 ROOT = os.path.abspath(os.getcwd())
 ALLOW_EXEC = False
@@ -69,10 +96,34 @@ def _blocked_git_global_options(args):
     )
     return any(a in blocked_exact or a.startswith(blocked_prefixes) for a in args)
 
+def _git_jail_flags(args):
+    """Reject flags that take a path outside the repo, on ANY subcommand.
+
+    Matched on `flag` or `flag=` prefix so both `--output=/tmp/x` and a bare
+    `--output /tmp/x` are caught (CR-Nanites-harness-0001, and the `--no-index`
+    read escape found by this phase's review).
+    """
+    for a in args:
+        for flag in GIT_JAIL_FLAGS:
+            if a == flag or a.startswith(flag + "="):
+                return flag
+    return None
+
 def _git_flag_audit(args):
     """Return the safe read-only subcommand, or raise."""
     sub = args[0]
     rest = args[1:]
+    # **Most specific refusal first.** `git archive --output=x` trips BOTH checks, and the
+    # subcommand is the more specific of the two — evaluating the flag first made the
+    # generic message shadow it, so the refusal stopped naming what it refused. Both
+    # orderings are safe (each check is independently sufficient); this one is legible.
+    if sub in GIT_REFUSED_WRITE:
+        raise PermissionError("git %s writes files and is never permitted in the bridge" % sub)
+    bad = _git_jail_flags(args)
+    if bad:
+        raise PermissionError("git flag %r reaches outside the project jail and is never "
+                              "permitted (it would read or write a file the bridge does "
+                              "not own)" % bad)
     if sub in ("branch", "tag", "stash"):
         safe_branch = {"-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose",
                        "--list", "--show-current", "--no-color", "--porcelain"}
@@ -157,11 +208,24 @@ def t_grep(a):
     except re.error as e:
         raise ValueError("invalid regex: %s" % e)
     hits, skipped = [], 0
-    for dirpath, dirnames, filenames in os.walk(p):
+    for dirpath, dirnames, filenames in os.walk(p, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+        # A symlinked DIRECTORY is pruned EXPLICITLY rather than relied upon as an
+        # `os.walk(followlinks=False)` implementation detail (CR-Nanites-harness-0002).
+        # The default happens to be False today; a future edit that flipped the kwarg
+        # would otherwise turn grep into a full-tree walk out of the jail, silently.
+        dirnames[:] = [d for d in dirnames
+                       if not os.path.islink(os.path.join(dirpath, d))]
         for fn in filenames:
             fp = os.path.join(dirpath, fn)
             try:
+                # **Per-file jail check.** The directory argument was jailed once at the
+                # top, which does nothing for the files found inside it: a symlinked FILE
+                # pointing outside ROOT was opened and its contents returned. `jail()`
+                # realpaths, so this refuses the symlink exactly as `t_read_file` does.
+                # Skipped rather than raised — one bad file must not fail the whole grep.
+                if os.path.realpath(fp) != ROOT and not os.path.realpath(fp).startswith(ROOT + os.sep):
+                    skipped += 1; continue
                 if os.path.getsize(fp) > MAX_GREP_FILE:
                     skipped += 1; continue
                 with open(fp, "rb") as f:
