@@ -18,7 +18,10 @@ import re
 import subprocess
 import sys
 
-BASE = "/home/user/projects/Nanites-harness"
+# Derived from this file's location, never a hard-coded absolute path: this repo is
+# shared, and a personal home path in a tracked file is both a leak and wrong on every
+# other machine (the convention gen_git_policy.py already follows).
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JS = ["node", "tests/frontend/phase17_agent_turn.test.js"]
 MARKER = "PHASE 17: agent-turn stream integrity"
 

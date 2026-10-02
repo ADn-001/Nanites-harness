@@ -2005,5 +2005,806 @@ try:
 finally:
     shutil.rmtree(TUNE_DIR, ignore_errors=True)
 
+# ============================ PHASE 18 =====================================
+# Sidecar concurrency: the model lock must be reentrant, the model pool must be
+# BOUNDED (a stale work item cannot occupy the single worker forever), and a
+# DYING child's teardown must not fail the LIVE child's pending requests.
+#
+# CR-0010 (critical): `_LOCK` was a plain Lock and `_build` re-acquires it while
+# `repair` already holds it, so every tuned-weights /repair deadlocked forever.
+# `NEEDLE_WEIGHTS` had 0 occurrences in the whole suite, which is precisely why a
+# guaranteed deadlock shipped green.
+# CR-0019 (high): MODEL_POOL had an unbounded queue and the timeout path never
+# called future.cancel(), so a stale item held the single worker indefinitely.
+# CR-0020 (high): `_read_stdout`'s finally ran `_fail_pending` unconditionally, so
+# an OLD child's EOF failed the NEW child's in-flight request.
+sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+
+
+def _stub_needle_module():
+    """Install a minimal `needle` module so the backend's model path is reachable.
+
+    needle is not installed on this machine, and `_build` returns 'tool_unavailable'
+    BEFORE it ever takes the lock when the import fails - so without a stub the
+    deadlock is unreachable and the test would pass vacuously. The stub records its
+    construction so the RLock test can prove `build()` actually ran.
+    """
+    import types
+    if 'needle' in sys.modules:
+        return sys.modules['needle']
+    stub = types.ModuleType('needle')
+    # NB: a plain list built OUTSIDE the class body. `stub.__x` written inside a class
+    # body is name-mangled to `stub._Agent__x` and raises AttributeError.
+    built = []
+    stub.built = built
+
+    class _Agent:
+        def __init__(self, **kw):
+            self.kw = kw
+            built.append(kw)
+
+        def complete(self, text, max_new_tokens=384):
+            return {'function_calls': [], 'confidence': None, 'reasoning': '',
+                    'success': True}
+
+    stub.Needle = _Agent
+    sys.modules['needle'] = stub
+    return stub
+
+
+def p18_weights_file():
+    f = tempfile.NamedTemporaryFile(prefix='p18-weights-', suffix='.bin', delete=False)
+    f.write(b'\x00' * 16)
+    f.close()
+    return f.name
+
+
+def p18_repair_with_weights(timeout_s=8.0):
+    """CR-0010: /repair with NEEDLE_WEIGHTS set to a REAL file must RETURN.
+
+    The timeout is the assertion: a deadlock must FAIL rather than stall the suite.
+    """
+    w = p18_weights_file()
+    _stub_needle_module()
+    import needle_backend as nb
+
+    old_w = os.environ.get('NEEDLE_WEIGHTS')
+    os.environ['NEEDLE_WEIGHTS'] = w
+    try:
+        b = nb.NeedleBackend()
+        res = {}
+
+        def go():
+            try:
+                res['r'] = b.repair('repair this call',
+                                    [{'name': 'read_file', 'description': 'Read a file.',
+                                      'parameters': {}}])
+            except BaseException as e:            # a raised error is a failure too
+                res['exc'] = '%s: %s' % (type(e).__name__, e)
+
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout_s)
+        if t.is_alive():
+            print('   DEADLOCK: repair() with tuned weights never returned in %ss '
+                  '(CR-0010: _LOCK is not reentrant)' % timeout_s)
+            return False
+        if 'exc' in res:
+            print('   repair() raised %s' % res['exc'])
+            return False
+        r = res.get('r') or {}
+        if not r.get('ok'):
+            print('   repair() returned a degraded answer: %r' % (r,))
+            return False
+        return True
+    finally:
+        if old_w is None:
+            os.environ.pop('NEEDLE_WEIGHTS', None)
+        else:
+            os.environ['NEEDLE_WEIGHTS'] = old_w
+        try:
+            os.unlink(w)
+        except OSError:
+            pass
+
+
+def p18_lock_is_reentrant():
+    """CR-0010, structural half: the module lock must admit the same thread twice.
+
+    Asserted against the RULE (a plain Lock cannot be re-entered) rather than the
+    spelling, so swapping Lock for any non-reentrant primitive still fails.
+    """
+    import needle_backend as nb
+    acquired_inner = []
+
+    def outer():
+        nb._LOCK.acquire()
+        try:
+            # Same thread, second acquire. A plain Lock parks here forever.
+            got = nb._LOCK.acquire(timeout=2.0)
+            acquired_inner.append(got)
+            if got:
+                nb._LOCK.release()
+        finally:
+            nb._LOCK.release()
+
+    t = threading.Thread(target=outer, daemon=True)
+    t.start()
+    t.join(6.0)
+    if t.is_alive():
+        print('   DEADLOCK: _LOCK is not reentrant (repair->_build would hang forever)')
+        return False
+    if not acquired_inner or not acquired_inner[0]:
+        print('   _LOCK could not be re-acquired by the thread that already holds it')
+        return False
+    return True
+
+
+def p18_pool_is_bounded():
+    """CR-0019: MODEL_POOL must have a queue bound AND cancel on the timeout path.
+
+    Both halves are load-bearing and both are asserted, because either alone leaves
+    the failure: an unbounded queue grows forever, and an uncancelled stale item
+    occupies the single worker even when the queue itself is bounded.
+
+    The cancel half is asserted PER CALL SITE, not as "the file mentions .cancel()".
+    A whole-file substring scan passes as soon as ONE of the two timeout paths is
+    fixed - which is exactly the half-done fix that leaves /select starving /repair,
+    since they share the one worker. Parsed per function, so fixing one and forgetting
+    the other is a red, not a green.
+    """
+    import ast
+    import local_models_daemon as lmd
+    path = os.path.join(BASE, 'localmodels', 'local_models_daemon.py')
+    src = open(path, encoding='utf-8').read()
+
+    problems = []
+    bound = getattr(lmd, 'MODEL_POOL_MAX_QUEUE', None)
+    if not isinstance(bound, int) or bound < 1:
+        problems.append('no finite MODEL_POOL_MAX_QUEUE (got %r)' % (bound,))
+
+    tree = ast.parse(src)
+    funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    for fname in ('_repair_call', '_select_call'):
+        fn = funcs.get(fname)
+        if fn is None:
+            problems.append('%s not found' % fname)
+            continue
+        calls = {n.func.attr for n in ast.walk(fn)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        if 'cancel' not in calls:
+            problems.append('%s never cancels its work item on the timeout path' % fname)
+        if 'submit_model_call' not in {n.func.id for n in ast.walk(fn)
+                                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}:
+            problems.append('%s bypasses the bounded admission (submit_model_call)' % fname)
+    if problems:
+        print('   ' + '; '.join(problems))
+        return False
+    return True
+
+
+def p18_pool_refuses_over_saturation():
+    """CR-0019, behavioural half: the (N+1)th concurrent call is REFUSED, not queued.
+
+    Saturates the single worker, then submits past the bound and asserts the daemon
+    answers degraded/busy instead of accepting unbounded work.
+    """
+    import local_models_daemon as lmd
+    bound = getattr(lmd, 'MODEL_POOL_MAX_QUEUE', None)
+    if not isinstance(bound, int) or bound < 1:
+        print('   no finite MODEL_POOL_MAX_QUEUE to saturate against (got %r)' % (bound,))
+        return False
+    # A PRIVATE pool, not the global MODEL_POOL: saturating the real one would leave
+    # work queued behind `gate`, and a later in-process case using _repair_call could
+    # transiently see a spurious 'engine busy' that has nothing to do with itself.
+    pool = lmd._BoundedModelPool(max_workers=1, max_queue=bound,
+                                 thread_name_prefix='p18-probe')
+    gate = threading.Event()
+    try:
+        # occupy the single worker
+        pool.submit(lambda: gate.wait(30))
+        time.sleep(0.3)
+        refusals = []
+        for i in range(bound + 3):
+            try:
+                pool.submit(lambda: 'never runs')
+                refusals.append(False)
+            except Exception:
+                refusals.append(True)
+        gate.set()
+    finally:
+        pool.shutdown(wait=False)
+    # At least one submission past the bound must have been refused rather than queued.
+    if not any(refusals):
+        print('   all %d submissions past the bound were accepted - the queue is unbounded'
+              % (bound + 3))
+        return False
+    return True
+
+
+def p18_stale_child_teardown_spares_live_child():
+    """CR-0020: a DYING child's teardown must not fail the LIVE child's pending work.
+
+    Deterministic and process-free, but it drives the REAL `_spawn_locked` (with a
+    fake Popen) rather than hand-setting the counter. That matters: a generation that
+    never increments - `self._generation = 1` instead of `+= 1` - makes every child
+    look current forever, and a fixture that assigns the counter itself would sail
+    straight past it. So the two spawns here are the assertion that it is MONOTONIC.
+    """
+    import local_models_daemon as lmd
+
+    child = lmd.LayaChild.__new__(lmd.LayaChild)
+    child._fut_lock = threading.RLock()
+    child._proc_lock = threading.RLock()
+    child._write_lock = threading.Lock()
+    child._futures = {}
+    child._inflight = 0
+    child._next_id = 0
+    child._generation = 0
+    child.loaded = False
+    child.pid = None
+    child._proc = None
+    child.stderr_tail = __import__('collections').deque(maxlen=20)
+    child.node_bin = 'node'
+    child.child_path = '/nonexistent/laya_child.mjs'
+    child.last_used = time.monotonic()
+
+    class _FakeProc:
+        """Stands in for a spawned child: empty stdio, alive until told otherwise."""
+
+        def __init__(self):
+            self.pid = 4242
+            self.stdout = iter(())
+            self.stderr = iter(())
+            self.stdin = None
+
+        def poll(self):
+            return None
+
+    real_popen = lmd.subprocess.Popen
+    real_thread = threading.Thread
+    spawned = []
+
+    class _NoThread:
+        """Swallow the reader threads; the fake stdio is empty anyway.
+
+        Records (target, args) so the case can assert WHICH reader was told WHICH
+        generation. Asserting only "some thread got gen1" is too loose - the stderr
+        reader also receives a generation, so it would satisfy a check that the stdout
+        reader (the actual CR-0020 call site) was left in the dark.
+        """
+
+        def __init__(self, target=None, args=(), **kw):
+            spawned.append((getattr(target, '__name__', str(target)), args))
+
+        def start(self):
+            pass
+
+    try:
+        lmd.subprocess.Popen = lambda *a, **kw: _FakeProc()
+        lmd.threading.Thread = _NoThread
+        child._spawn_locked()
+        gen1 = child._generation
+        if gen1 != 1:
+            print('   first spawn left the generation at %r (expected 1)' % gen1)
+            return False
+        # The child dies and a NEW one is spawned in its place.
+        child._spawn_locked()
+        gen2 = child._generation
+        if gen2 <= gen1:
+            print('   the generation did not advance across a respawn (%r -> %r); every '
+                  'child would look current and a stale teardown would kill live work'
+                  % (gen1, gen2))
+            return False
+        # The request is issued against the LIVE child (#2). This is the case that
+        # matters: a request registered against the DYING child would legitimately be
+        # failed by its own teardown, and asserting otherwise would pin the old bug.
+        rid, fut = child._register()
+        # The DYING child #1 hits stdout EOF. It must NOT fail child #2's request.
+        child._fail_pending(lmd.ChildGone('old child stdout closed'), gen1)
+        if fut.done():
+            print('   a DYING child\'s teardown failed the LIVE child\'s request %r' % rid)
+            return False
+        # ...and the CURRENT child's own teardown must still fail it, so a guard that
+        # refuses everything cannot pass this case.
+        child._fail_pending(lmd.ChildGone('current child closed'), gen2)
+        if not fut.done():
+            print('   the CURRENT child\'s teardown no longer fails its own pending request')
+            return False
+        # The STDOUT reader - the actual CR-0020 call site - must be told which child it
+        # belongs to. Checked by name, not "some thread got the generation".
+        stdout_readers = [a for name, a in spawned if name == '_read_stdout']
+        if not stdout_readers:
+            print('   the stdout reader thread was never started')
+            return False
+        if not any(gen1 in (a or ()) for a in stdout_readers):
+            print('   the stdout reader was not given the child generation %r' % gen1)
+            return False
+        return True
+    finally:
+        lmd.subprocess.Popen = real_popen
+        lmd.threading.Thread = real_thread
+
+
+lm_probe('localmodels (phase18): the model lock is REENTRANT (a plain Lock deadlocks '
+         'repair->_build)', p18_lock_is_reentrant)
+
+lm_probe('localmodels (phase18): /repair with NEEDLE_WEIGHTS set to a real file RETURNS '
+         'instead of deadlocking [CR-0010]', p18_repair_with_weights)
+
+lm_probe('localmodels (phase18): MODEL_POOL has a finite queue bound AND cancels the work '
+         'item on the timeout path [CR-0019]', p18_pool_is_bounded)
+
+lm_probe('localmodels (phase18): the (N+1)th concurrent model call is REFUSED, not queued '
+         '[CR-0019]', p18_pool_refuses_over_saturation)
+
+lm_probe('localmodels (phase18): a DYING child\'s teardown does not fail the LIVE child\'s '
+         'pending request, and the current child\'s own teardown still does [CR-0020]',
+         p18_stale_child_teardown_spares_live_child)
+
+
+def p18_respawn_cannot_slip_through_the_fence():
+    """CR-0020, the TOCTOU half: the fence and the drain must be ONE critical section.
+
+    The single-threaded case above cannot tell a correct fence from a check performed
+    outside the lock, because nothing interleaves. This case forces the interleaving
+    deterministically: the respawn is made to happen exactly when the teardown takes
+    `_fut_lock` - i.e. precisely inside the window a non-atomic fence leaves open.
+
+      fence OUTSIDE the lock: check passes (gen still matches) -> respawn bumps the
+        generation and registers fresh work -> drain kills that fresh work. Dead.
+      fence INSIDE the lock: the respawn happens first, so the check now sees a
+        generation that no longer matches and the teardown is a no-op. Alive.
+    """
+    import local_models_daemon as lmd
+
+    child = lmd.LayaChild.__new__(lmd.LayaChild)
+    child._proc_lock = threading.RLock()
+    child._write_lock = threading.Lock()
+    child._futures = {}
+    child._inflight = 0
+    child._next_id = 0
+    child._generation = 1
+    child.loaded = True
+    child.pid = None
+    child._proc = None
+    child.stderr_tail = __import__('collections').deque(maxlen=20)
+    child.node_bin = 'node'
+    child.child_path = '/nonexistent/laya_child.mjs'
+    child.last_used = time.monotonic()
+
+    fresh = {}
+
+    class _RespawnOnAcquire:
+        """A lock whose acquisition performs the respawn - landing the interleaving
+        exactly in the window between an outside-the-lock fence and the drain.
+
+        Armed explicitly, because `_register` also takes this lock: arming it during
+        setup would fire the respawn long before the teardown it is meant to interrupt.
+        """
+
+        def __init__(self):
+            self._real = threading.RLock()
+            self.armed = False
+
+        def __enter__(self):
+            self._real.acquire()
+            if self.armed:
+                self.armed = False
+                # The dying child is replaced while the teardown is mid-flight.
+                with self._real:
+                    child._generation += 1        # child #2 is now current
+                    from concurrent.futures import Future as _F
+                    fresh['fut'] = _F()
+                    # registered the way _register does it: (generation, future)
+                    child._futures['ly%d' % (child._next_id + 1)] = (child._generation,
+                                                                     fresh['fut'])
+                    child._next_id += 1
+                    child._inflight += 1
+            return self
+
+        def __exit__(self, *a):
+            self._real.release()
+            return False
+
+    fence_lock = _RespawnOnAcquire()
+    child._fut_lock = fence_lock
+
+    # Work in flight against child #1.
+    rid_old, fut_old = child._register()
+
+    fence_lock.armed = True
+    # Child #1's stdout reader hits EOF, believing it is still the current child.
+    child._fail_pending(lmd.ChildGone('child stdout closed'), 1)
+
+    new_fut = fresh.get('fut')
+    if new_fut is None:
+        print('   the forced respawn never happened - the case did not exercise the race')
+        return False
+    if new_fut.done():
+        print('   a respawn that happened DURING the teardown had its fresh request killed '
+              '(the fence was evaluated outside _fut_lock - CR-0020 reopens)')
+        return False
+    if not fut_old.done():
+        print('   the dying child\'s own request was not failed - the fence is too strict '
+              'and would leave real work hanging')
+        return False
+    return True
+
+
+def p18_teardown_signature_is_fenced():
+    """CR-0020, structurally: every teardown must NAME the child it is about.
+
+    Two properties, both asserted because either alone leaves the invariant unenforceable:
+      - `_fail_pending` takes `generation` with NO default, so a call site that forgets it
+        is a TypeError at review time rather than a silent reinstatement of the old bug;
+      - every call site in the module passes one.
+    """
+    import ast
+    import local_models_daemon as lmd
+    path = os.path.join(BASE, 'localmodels', 'local_models_daemon.py')
+    tree = ast.parse(open(path, encoding='utf-8').read())
+
+    problems = []
+    cls = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef) and n.name == 'LayaChild':
+            cls = n
+    if cls is None:
+        return False
+    fp = None
+    for n in cls.body:
+        if isinstance(n, ast.FunctionDef) and n.name == '_fail_pending':
+            fp = n
+    if fp is None:
+        problems.append('_fail_pending not found')
+    else:
+        args = fp.args.args[1:]                # skip self
+        names = [a.arg for a in args]
+        if 'generation' not in names:
+            problems.append('_fail_pending has no `generation` parameter')
+        elif fp.args.defaults:
+            problems.append('_fail_pending\'s `generation` has a default - the unscoped '
+                            'teardown path is reachable again')
+    # Every call site must pass a generation.
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and n.func.attr == '_fail_pending':
+            if len(n.args) < 2:
+                problems.append('line %d: _fail_pending called without a generation'
+                                % n.lineno)
+    if problems:
+        print('   ' + '; '.join(problems))
+        return False
+    return True
+
+
+lm_probe('localmodels (phase18): a respawn DURING a teardown does not have its fresh '
+         'request killed, and the dying child\'s own request is still failed [CR-0020]',
+         p18_respawn_cannot_slip_through_the_fence)
+
+lm_probe('localmodels (phase18): _fail_pending requires a generation and every teardown '
+         'call site names its child [CR-0020]', p18_teardown_signature_is_fenced)
+
+
+def _bare_child(lmd):
+    """A LayaChild wired up exactly as the other phase-18 cases wire it."""
+    child = lmd.LayaChild.__new__(lmd.LayaChild)
+    child._fut_lock = threading.RLock()
+    child._proc_lock = threading.RLock()
+    child._write_lock = threading.Lock()
+    child._futures = {}
+    child._inflight = 0
+    child._next_id = 0
+    child._generation = 0
+    child.loaded = False
+    child.pid = None
+    child._proc = None
+    child.stderr_tail = __import__('collections').deque(maxlen=20)
+    child.node_bin = 'node'
+    child.child_path = '/nonexistent/laya_child.mjs'
+    child.last_used = time.monotonic()
+    return child
+
+
+def p18_teardown_clears_loaded_flag():
+    """A child that dies with NO request in flight must still be marked not-loaded.
+
+    `_fail_pending` returned False on an empty drain BEFORE resetting `loaded`, so an
+    idle child that was reaped - or one that crashed between two requests - stayed
+    `loaded=True` forever. `health_obj()` then reports `laya.loaded: true` for a child
+    that does not exist, and nothing else in the daemon clears it until a successful
+    `_laya_decide`. The flag describes THE CHILD, so it must follow the child's death,
+    not the fate of the requests that happened to be in flight.
+
+    Caught by an independent review of the phase-18 diff; the mutation harness could
+    not see it because every other phase-18 case leaves a request registered, so the
+    early return never fired.
+    """
+    import local_models_daemon as lmd
+
+    child = _bare_child(lmd)
+    child._generation = 1
+    child.loaded = True                       # the engine had finished loading
+    child._futures = {}                       # ... and nothing is in flight right now
+
+    child._fail_pending(lmd.ChildGone('child stdout closed'), 1)
+
+    if child.loaded:
+        print('   a child that died with no request in flight stayed loaded=True - '
+              '/health would report a live engine that no longer exists')
+        return False
+    return True
+
+
+def p18_stale_teardown_leaves_live_child_loaded():
+    """The CR-0020 fence must cover the `loaded` FLAG, not only the futures.
+
+    The generation fence was applied to the future drain only. `self.loaded = False`
+    still fired unconditionally, so a dying child's teardown that happened to match at
+    least one stale entry cleared the flag belonging to a NEWER, live, loaded child -
+    the same class of defect as the one this phase exists to close, one line away.
+
+    `loaded` is only set True again by a successful `_laya_decide`, so /health lies
+    about the engine until the next decide happens to succeed.
+    """
+    import local_models_daemon as lmd
+    from concurrent.futures import Future as _F
+
+    child = _bare_child(lmd)
+    # Child #1 had one request in flight; it has since died.
+    child._generation = 1
+    stale = _F()
+    child._futures = {'ly1': (1, stale)}
+    child._inflight = 1
+    # Child #2 respawned and finished loading - it is the live, loaded engine.
+    child._generation = 2
+    child.loaded = True
+
+    # Child #1's stdout reader now hits EOF and tears itself down.
+    child._fail_pending(lmd.ChildGone('child stdout closed'), 1)
+
+    if not stale.done():
+        print('   the dying child\'s own in-flight request was not failed - the fence is '
+              'too strict and real work would hang until its caller timed out')
+        return False
+    if not child.loaded:
+        print('   a DYING child\'s teardown cleared `loaded` on the LIVE current child - '
+              'the generation fence does not cover the loaded flag (CR-0020 half-open)')
+        return False
+    return True
+
+
+def p18_stamp_binds_to_the_receiving_child():
+    """`_stamp` must bind a request to the child that RECEIVED the bytes.
+
+    `_stamp` re-read `self._generation` at stamp time, after both `_proc_lock` and
+    `_write_lock` had been released. A respawn between the write and the stamp (any
+    other thread reaching `_write` while the dead child is being replaced) therefore
+    stamps the request with the NEW child's generation - so the teardown of the child
+    that actually received, and was serving, the request does not match it, and the
+    caller waits out its entire timeout instead of being told the child is gone.
+
+    This is exactly the leak the `_stamp` re-stamp was added to close, reopened by
+    reading the counter instead of carrying the identity of the process the bytes went
+    to. The fix is to capture the generation under `_proc_lock`, next to the proc
+    handle that IS the identity, and hand it to `_stamp`.
+    """
+    import local_models_daemon as lmd
+    from concurrent.futures import Future as _F
+
+    child = _bare_child(lmd)
+    child._generation = 1
+    fut = _F()
+    child._futures = {'ly1': (1, fut)}
+    child._next_id = 1
+    child._inflight = 1
+
+    class _LiveProc:
+        pid = 4242
+        stdout = iter(())
+        stderr = iter(())
+        stdin = None
+
+        def poll(self):
+            return None
+
+    # The write lands on child #1 ...
+    child._proc = _LiveProc()
+    # ... and a concurrent respawn replaces it BEFORE the stamp runs.
+    child._generation = 2
+    child._proc = _LiveProc()
+
+    # `_stamp` must be handed the identity of the child the bytes went to. Call it the
+    # way the fixed `_write` will - with that generation - and assert the binding.
+    child._stamp('ly1', 1)
+
+    if child._futures.get('ly1', (None, None))[0] != 1:
+        print('   the request was not bound to the child that received it (generation %r '
+              'recorded, expected 1) - a respawn between the write and the stamp '
+              're-opens the CR-0020 request leak'
+              % (child._futures.get('ly1'),))
+        return False
+    return True
+
+
+def p18_stdout_pop_is_locked():
+    """Every mutation of `_futures` must hold `_fut_lock` (CR-0020 structural half).
+
+    `_fail_pending` drains `_futures` under `_fut_lock` and its whole atomicity claim
+    rests on that: the fence and the drain must be one critical section. But
+    `_read_stdout` pops from the SAME dict with no lock at all, so the reader thread
+    that resolves a request can interleave with the drain's iteration. The lock
+    protects the dict against every writer except the one that matters most.
+
+    Asserted with AST rather than behaviourally: the interleaving is a narrow window,
+    and a test that cannot reliably provoke it would report coverage that does not
+    exist. The rule is the property - every `_futures` mutation is inside a `with
+    self._fut_lock` - and it is checked at every call site, so a future reader added
+    without the lock fails as itself.
+    """
+    import ast
+    path = os.path.join(BASE, 'localmodels', 'local_models_daemon.py')
+    tree = ast.parse(open(path, encoding='utf-8').read())
+
+    cls = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef) and n.name == 'LayaChild':
+            cls = n
+    if cls is None:
+        print('   LayaChild not found')
+        return False
+
+    def locked_regions(fn):
+        """Byte-ranges of `fn`'s body that run inside `with self._fut_lock`."""
+        spans = []
+        for node in ast.walk(fn):
+            if isinstance(node, ast.With):
+                for item in node.items:
+                    expr = item.context_expr
+                    if (isinstance(expr, ast.Attribute)
+                            and expr.attr == '_fut_lock'
+                            and isinstance(expr.value, ast.Name)
+                            and expr.value.id == 'self'):
+                        spans.append((node.lineno, max(getattr(s, 'end_lineno', node.lineno)
+                                                      for s in ast.walk(node))))
+        return spans
+
+    problems = []
+    checked = 0
+    for fn in cls.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        spans = locked_regions(fn)
+        for node in ast.walk(fn):
+            # A subscript assignment or a `.pop()` on self._futures is a mutation.
+            hit = None
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
+                v = node.value
+                if (isinstance(v, ast.Attribute) and v.attr == '_futures'
+                        and isinstance(v.value, ast.Name) and v.value.id == 'self'):
+                    hit = 'assignment to self._futures'
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'pop'):
+                v = node.func.value
+                if (isinstance(v, ast.Attribute) and v.attr == '_futures'
+                        and isinstance(v.value, ast.Name) and v.value.id == 'self'):
+                    hit = 'self._futures.pop(...)'
+            if hit is None:
+                continue
+            checked += 1
+            if not any(lo <= node.lineno <= hi for lo, hi in spans):
+                problems.append('%s(): line %d does %s outside `with self._fut_lock`'
+                                % (fn.name, node.lineno, hit))
+
+    if not checked:
+        print('   no self._futures mutation found at all - the AST walk is broken, so '
+               'this case proved nothing')
+        return False
+    if problems:
+        print('   ' + '; '.join(problems))
+        return False
+    return True
+
+
+lm_probe('localmodels (phase18): a child that dies with NO request in flight is still '
+         'marked not-loaded', p18_teardown_clears_loaded_flag)
+
+lm_probe('localmodels (phase18): a DYING child\'s teardown does not clear `loaded` on '
+         'the LIVE current child [CR-0020 flag half]', p18_stale_teardown_leaves_live_child_loaded)
+
+lm_probe('localmodels (phase18): _stamp binds a request to the child that RECEIVED the '
+         'bytes, not to whichever is current at stamp time [CR-0020]',
+         p18_stamp_binds_to_the_receiving_child)
+
+lm_probe('localmodels (phase18): EVERY self._futures mutation holds _fut_lock, including '
+         'the stdout reader\'s pop [CR-0020 atomicity]', p18_stdout_pop_is_locked)
+
+def p18_http_repair_with_weights():
+    """CR-0010, the SEAM: a REAL daemon process answering a REAL POST /repair.
+
+    The in-process probe above proves the lock; this proves the shipped route. They can
+    disagree - the handler thread, the pool and the lock are three different hops - and a
+    deadlock anywhere along that path is what an operator actually hits. The daemon runs
+    on its own port in a temp dir (never in the repo: it writes a pid/log beside itself),
+    with a stub `needle` on PYTHONPATH so the tuned-weights build path is really taken.
+    """
+    w = p18_weights_file()
+    stubdir = tempfile.mkdtemp(prefix='p18-stub-')
+    with open(os.path.join(stubdir, 'needle.py'), 'w', encoding='utf-8') as fh:
+        fh.write(
+            'class Needle:\n'
+            '    def __init__(self, **kw):\n'
+            '        self.kw = kw\n'
+            '    def complete(self, text, max_new_tokens=384):\n'
+            '        return {"function_calls": [], "confidence": None, "reasoning": "",\n'
+            '                "success": True}\n')
+    d = tempfile.mkdtemp(prefix='p18-http-')
+    # An EPHEMERAL port, not a hardcoded one: if something else already held a fixed
+    # port, /health would succeed against the WRONG process and this case would pass
+    # without ever exercising the daemon under test.
+    import socket
+    with socket.socket() as _s:
+        _s.bind(('127.0.0.1', 0))
+        port = _s.getsockname()[1]
+    env = dict(os.environ)
+    env['NEEDLE_WEIGHTS'] = w                       # the documented tuned-weights config
+    env['PYTHONPATH'] = stubdir + os.pathsep + env.get('PYTHONPATH', '')
+    pb = subprocess.Popen(
+        [sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+         '--port', str(port), '--ledger', os.path.join(d, 'l.jsonl')],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=d, env=env)
+    try:
+        deadline = time.time() + 15
+        up = False
+        while time.time() < deadline:
+            try:
+                if req(port, '/health')[0] == 200:
+                    up = True
+                    break
+            except Exception:
+                time.sleep(0.3)
+        if not up:
+            return False
+        # The repair must ANSWER. The whole point of the case is the timeout: with the
+        # plain Lock the handler thread parks inside MODEL_POOL's single worker forever
+        # and this request never comes back.
+        try:
+            s, j = req(port, '/repair', {'suspect': {'name': 'raed_file', 'arguments':
+                                                      {'path': 'a.py'}},
+                                         'candidates': [{'name': 'read_file',
+                                                         'description': 'Read a file.',
+                                                         'parameters': {}}]})
+        except Exception as e:
+            print('   POST /repair never returned (%s) - the model worker is wedged' % e)
+            return False
+        if s != 200:
+            print('   POST /repair answered %s: %r' % (s, j))
+            return False
+        if not (isinstance(j, dict) and j.get('ok') is True):
+            print('   POST /repair returned a non-ok envelope: %r' % (j,))
+            return False
+        return True
+    finally:
+        pb.terminate()
+        try:
+            pb.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pb.kill()
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(stubdir, ignore_errors=True)
+        try:
+            os.unlink(w)
+        except OSError:
+            pass
+
+
+lm_probe('localmodels (phase18): a REAL daemon answers POST /repair with tuned weights '
+         'set - the shipped route, not just the in-process lock [CR-0010]',
+         p18_http_repair_with_weights)
+
+# Never leave the stub behind for a later phase to inherit silently.
+sys.modules.pop('needle', None)
+
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)
