@@ -27,6 +27,12 @@ def req(port, path, payload=None, origin=None, raw=None):
             return e.code, {'raw': body.decode('utf-8', 'replace')}
 
 # ---------------- bridge worker ----------------
+# PHASE 16: the bridge's git policy tables are the single source the frontend's policy is
+# generated from (CR-Nanites-harness-0009), so the test asserts against the real tables
+# rather than a literal restatement of them.
+sys.path.insert(0, BASE)
+import bridge as bridge_mod  # noqa: E402
+
 proj = tempfile.mkdtemp(prefix='cogtest-')
 open(os.path.join(proj, 'hello.py'), 'w', encoding='utf-8').write('print("hi")\n# TODO fix me\n')
 os.makedirs(os.path.join(proj, 'venv'))
@@ -70,6 +76,137 @@ try:
     check(s == 200, 'localhost Origin allowed')
     s, j = req(port, '/tools/execute', {'name': 'read_file', 'arguments': {'path': 'hello.py'}}, origin='http://127.0.0.1:8080')
     check(s == 200, '127.0.0.1 Origin allowed')
+    # ---- PHASE 16: the bridge jail is closed on git's file-writing flags (CR-0001) ----
+    #
+    # RED when written: `_git_flag_audit` returned the subcommand for ANY args on a GIT_READ
+    # member, so `git log --output=<file>` reached subprocess.run and wrote outside ROOT.
+    # The assertion is the FILE, not just the status: a 403 that still wrote the file would
+    # pass a status-only check, and the write is the whole finding.
+    outside = os.path.join(tempfile.gettempdir(), 'cog-phase16-escape.txt')
+    if os.path.exists(outside):
+        os.remove(outside)
+    for args in ['log --output=' + outside, 'diff --output=' + outside, 'show --output=' + outside,
+                 'blame --output=' + outside, 'log --output-indicator-new=x', 'log --exec-path=/tmp',
+                 'format-patch -1', 'archive --output=' + outside]:
+        s, j = req(port, '/tools/execute', {'name': 'git', 'arguments': {'args': args}})
+        check(s == 403, 'git read subcommand with a file-writing flag refused: ' + args)
+        check(not os.path.exists(outside),
+              'refused git invocation wrote NO file outside ROOT: ' + args)
+        if os.path.exists(outside):
+            os.remove(outside)
+    # The inverse: the ordinary read subcommands must STILL work. A guard that refuses
+    # everything would satisfy every case above.
+    for args in ['status --short', 'log --oneline -1', 'diff --stat', 'show --stat HEAD']:
+        s, j = req(port, '/tools/execute', {'name': 'git', 'arguments': {'args': args}})
+        check(s in (200, 404), 'ordinary read subcommand still accepted: ' + args)
+    # ---- PHASE 16: t_grep jails every file it opens (CR-0002) ----
+    #
+    # The existing symlink case above covers list_dir and a symlinked DIRECTORY. This one
+    # plants a symlinked FILE, which is the actual gap: os.walk(followlinks=False) already
+    # protects directories, so grep's missing per-file jail() was invisible to that test.
+    if hasattr(os, 'symlink'):
+        secret_dir = tempfile.mkdtemp(prefix='cog-phase16-outside-')
+        try:
+            secret_path = os.path.join(secret_dir, 'secret.txt')
+            with open(secret_path, 'w', encoding='utf-8') as fh:
+                fh.write('TOPSECRET_MARKER_9931\n')
+            os.makedirs(os.path.join(proj, 'sub'), exist_ok=True)
+            link = os.path.join(proj, 'sub', 'link.txt')
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(secret_path, link)
+            s, j = req(port, '/tools/execute', {'name': 'grep', 'arguments': {'pattern': 'TOPSECRET_MARKER_9931', 'path': 'sub'}})
+            check(s == 200 and 'TOPSECRET_MARKER_9931' not in j.get('result', ''),
+                  'grep does NOT match a symlinked file pointing outside the jail')
+            # read_file/list_dir must still refuse it -- the fix must not weaken them.
+            s, j = req(port, '/tools/execute', {'name': 'read_file', 'arguments': {'path': 'sub/link.txt'}})
+            check(s == 403, 'read_file still refuses the symlinked file')
+            s, j = req(port, '/tools/execute', {'name': 'list_dir', 'arguments': {'path': 'sub'}})
+            check(s == 200, 'list_dir still lists the directory containing the symlink')
+            os.remove(link)
+        finally:
+            shutil.rmtree(secret_dir, ignore_errors=True)
+    # ---- PHASE 16: the frontend policy is GENERATED from the bridge (CR-0009) ----
+    #
+    # The block in index.html is emitted by tools/gen_git_policy.py from bridge.py's
+    # tables. Without this check the two copies drift silently and the frontend starts
+    # approving something the bridge refuses (or the reverse) with every suite still
+    # green — which is the exact condition 0009 was filed about.
+    r = subprocess.run([sys.executable, os.path.join(BASE, 'tools', 'gen_git_policy.py'), '--check'],
+                       capture_output=True, text=True, cwd=BASE)
+    check(r.returncode == 0, 'the frontend git policy is not stale w.r.t. bridge.py '
+                             '(run tools/gen_git_policy.py --write): ' + (r.stdout + r.stderr).strip()[:300])
+    # And the generator must actually be derived from the bridge, not a private copy:
+    # a subcommand in one table and not the other has to be visible here.
+    r = subprocess.run([sys.executable, os.path.join(BASE, 'tools', 'gen_git_policy.py')],
+                       capture_output=True, text=True, cwd=BASE)
+    gen = r.stdout
+    for sub in sorted(bridge_mod.GIT_READ):
+        check(("'%s'" % sub) in gen, 'generator emits the bridge read subcommand: ' + sub)
+    for flag in bridge_mod.GIT_JAIL_FLAGS:
+        check(flag in gen, 'generator emits the bridge output flag: ' + flag)
+    for sub in sorted(bridge_mod.GIT_REFUSED_WRITE):
+        check(("'%s'" % sub) in gen, 'generator emits the refused-write subcommand: ' + sub)
+    # A symlinked DIRECTORY must not be descended into either. This case is GREEN both
+    # with and without the explicit `islink` prune in bridge.py, because os.walk's default
+    # is followlinks=False — so it DOCUMENTS the property rather than pinning the prune.
+    # The prune's real job is to stop a future edit that flips that kwarg from silently
+    # turning grep into a walk out of the jail; `tools/mutate_phase16.py` records M6 as a
+    # documented equivalent for exactly this reason. The walk below is called with
+    # followlinks=False EXPLICITLY so the property does not rest on a default.
+    if hasattr(os, 'symlink'):
+        out_dir = tempfile.mkdtemp(prefix='cog-phase16-outdir-')
+        try:
+            with open(os.path.join(out_dir, 'bigsecret.txt'), 'w', encoding='utf-8') as fh:
+                fh.write('DIRSECRET_MARKER_4471\n')
+            os.makedirs(os.path.join(proj, 'sub'), exist_ok=True)
+            dlink = os.path.join(proj, 'sub', 'dirlink')
+            if os.path.lexists(dlink):
+                os.remove(dlink)
+            os.symlink(out_dir, dlink)
+            s, j = req(port, '/tools/execute', {'name': 'grep', 'arguments': {'pattern': 'DIRSECRET_MARKER_4471', 'path': 'sub'}})
+            check(s == 200 and 'DIRSECRET_MARKER_4471' not in j.get('result', ''),
+                  'grep does not descend into a symlinked directory pointing outside the jail')
+            os.remove(dlink)
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+    # The walk is called with followlinks=False EXPLICITLY. Asserted structurally because
+    # no behavioural test can distinguish it from the default — the default IS False, so a
+    # suite asserting the behaviour passes whether or not the kwarg is written. This is
+    # the property the islink prune above is defending.
+    with open(os.path.join(BASE, 'bridge.py'), encoding='utf-8') as fh:
+        bridge_src = fh.read()
+    check('os.walk(p, followlinks=False)' in bridge_src,
+          't_grep calls os.walk with followlinks=False EXPLICITLY, not by default')
+    # ---- the suite must name the subcommand, so the more specific refusal wins ----
+    # `archive --output=x` carries BOTH a refused-write subcommand and an output flag. The
+    # subcommand check is the more specific of the two and must be evaluated first, or the
+    # generic flag message shadows it and the refusal stops naming what it refused.
+    for args, named in (('format-patch -1', 'format-patch'), ('archive --output=/tmp/x.tar', 'archive')):
+        s, j = req(port, '/tools/execute', {'name': 'git', 'arguments': {'args': args}})
+        check(s == 403 and named in json.dumps(j),
+              'the file-writing refusal NAMES the subcommand: ' + args)
+    # ---- PHASE 16: `git diff --no-index` reads arbitrary paths outside the jail ----
+    #
+    # Found by the phase-16 independent review, and confirmed by a direct probe: `--no-index`
+    # makes diff compare two ARBITRARY paths instead of repo contents, so
+    # `git diff --no-index /etc/passwd /dev/null` returns the contents of a file outside
+    # ROOT — the same class of escape as CR-0002, reached through the git tool instead of
+    # grep. It was auto-approved as a read in BOTH layers, so no operator ever saw it.
+    # The negative case is the load-bearing half: an ALLOW-list keyed on the subcommand
+    # alone would call this a read, since `diff` is in GIT_READ.
+    for args in ['diff --no-index /etc/passwd /dev/null',
+                 'diff --no-index -- /etc/passwd /dev/null',
+                 'diff --no-index /etc/hostname /dev/null',
+                 'log --no-index']:
+        s, j = req(port, '/tools/execute', {'name': 'git', 'arguments': {'args': args}})
+        check(s == 403, 'git diff --no-index (reads arbitrary out-of-jail paths) refused: ' + args)
+        check('root:' not in json.dumps(j),
+              'refused --no-index returned no out-of-jail file content: ' + args)
+    # And the inverse: ordinary diffs, including --no-color and --stat, still work.
+    for args in ['diff --stat', 'diff --no-color', 'diff HEAD~1 HEAD --stat']:
+        s, j = req(port, '/tools/execute', {'name': 'git', 'arguments': {'args': args}})
+        check(s in (200, 404), 'ordinary diff still accepted: ' + args)
     s, j = req(port, '/tools/execute', raw=b'{"name":"read_file","arguments":{"path":"' + b'a' * (2 * 1024 * 1024) + b'"}}')
     check(s == 413, 'oversized POST refused')
     # --allow-file-origin is the explicit opt-in that re-trusts a null Origin.
