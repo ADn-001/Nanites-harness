@@ -43,7 +43,16 @@ GENERATION = 3
 
 # One process-global active instance per generation (needle.__init__._active) =>
 # one process-global lock serialising every model call.
-_LOCK = threading.Lock()
+#
+# It MUST be reentrant (CR-Nanites-harness-0010): `repair` holds this lock across
+# `self._build(tools)`, and `_build` acquires it AGAIN for the tuned-weights path
+# (a FineTuneWorker is spawned there and a half-built agent must not be visible).
+# With a plain Lock that second acquire parks forever, so every /repair made with
+# NEEDLE_WEIGHTS set deadlocked the single model worker permanently. `load()` has
+# the same shape: it holds the lock and then calls `_build`. Reentrancy here is not
+# a weakening of mutual exclusion - a thread that already holds it is the only one
+# that can re-take it, which is exactly the nesting these two call sites perform.
+_LOCK = threading.RLock()
 
 
 class NeedleBackend:
