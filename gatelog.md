@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 17 — Agent turn: bind its own message, well-formed tool protocol, teardown on every exit**
+Next phase to work on: **Phase 18 — Sidecar: RLock the model lock, bound the pool, fence child teardown by generation**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1234,7 +1234,7 @@ escapes, 2 documented equivalents** (M6 and M9 — findings 5 and 6). Re-run it 
 ---
 
 ## Phase 17 — Agent turn: bind its own message, well-formed tool protocol, teardown on every exit
-Status: **not started**
+Status: **DONE** (after two review rounds: R1 and R2 — see Findings)
 Ticket: `TICKET-2026-10-01-agent-turn-stream-integrity` (CR-Nanites-harness-0011 critical, 0012 critical, 0015 high, 0013 high, 0014 high)
 
 Deliverable: the SSE pump and `refreshLast` bind the message they were handed instead of
@@ -1256,6 +1256,81 @@ bridge POSTs — the Phase 11 landmine still applies. Done = no path leaves the 
 busy, and no outbound request can be rejected by a strict OpenAI-compatible server.
 
 ### Findings
+
+**The gate was met, but only after two review rounds — and the harness was lying the whole time.**
+
+Five CRs (0011/0012/0013/0014/0015) are fixed and pinned. What the record must carry forward:
+
+- **`tools/mutate_phase17.py` was a SyntaxError and had NEVER RUN.** M10c shipped as a
+  multi-line plain `"..."` literal (Python cannot span a plain string across lines), so the
+  whole harness died at import. Phase 17 looked fully instrumented — 21 mutation tuples, three
+  carefully documented equivalents — while having produced *zero* mutation evidence. If you add
+  a mutation, RUN the harness; "it exists" is not "it executed". A harness is code: `ast.parse`
+  it before believing it.
+
+- **A harness pointed at the wrong suite invents findings.** M7b and M10c target assertions in
+  the R1 file, but the harness only ever ran `phase17_agent_turn.test.js`. Scored there they
+  report ESCAPED — a hole that does not exist. Measured, not assumed: each was run against BOTH
+  files and lands green on one, red on the other. There are now three suite constants
+  (`JS`/`JS_R1`/`JS_R2`) and which one scores a mutation is a measurement, not a guess.
+
+- **The harness could never exit 0.** `expect_red=None` (a documented equivalent) was scored
+  `ESCAPED`, so three permanent equivalents made the exit code always 1 and a real regression
+  was indistinguishable from baseline. Equivalents now get their own `equivalent` verdict and
+  are excluded from the exit code. Three remain, all proved unobservable by reachability:
+  M3, M3b, M10.
+
+- **R2-A (CR-0011 was incomplete):** `runAgentLoop` mints a FRESH assistant message every
+  iteration but never rebound `streamTarget`, so from iteration 1 the pump wrote into the turn's
+  FIRST assistant bubble. The defect was *relocated*, not fixed — same user symptom (the live
+  bubble empty), different message. **Lesson: when a fix binds a target, every site that
+  REBINDS that target must rebind it too. Follow the ownership when it moves.**
+
+- **R2-B (CR-0012 was incomplete):** `buildMessages`' budget trim `break`s on the first
+  over-budget message with no dangling-tool guard, so it could keep a `tool` message while
+  dropping the assistant that declared its `tool_call_id` — the exact illegality `declareRites`
+  was added to remove, re-created by the trim. `compactChat` had this guard all along; port it
+  rather than invent a second shape.
+
+- **R2-C (CR-0015 introduced a crash):** `compactToolCalls` REBOUND `acc.toolCalls` to a
+  `filter(Boolean)` result, but the pump assigns `m.toolCalls = acc.toolCalls` BY REFERENCE.
+  The message therefore kept the hole-bearing array, `ctxTokens`' `for...of` yields `undefined`
+  for holes, and `tok(t.args)` threw out of `renderMessages` — message rendering broken until
+  reload, with the throw silently swallowed by pumpSSE's `catch(e){}`. Now compacts IN PLACE.
+  **The distinguishing input is a PERMANENT hole** (a skipped/truncated index). If every index
+  eventually arrives the array ends up dense and the defect is invisible — my first fixture sent
+  {2,0,1} and passed *vacuously*. **Also: `some`/`map`/`filter` SKIP holes; `for...of` does not.**
+  A sparse array can look clean to every assertion built on the skipping methods.
+
+- **R2-D:** `msgAction('del')` — the per-message purge — was not guarded by `generating`.
+  Deleting the streaming message makes the bound target vanish, `refreshLast`'s
+  `indexOf(...)!==-1` check fails, and it SILENTLY falls back to `messages[length-1]`: CR-0011
+  returning through the back door. **When you guard one purge path, enumerate ALL of them** —
+  `clearActive`, `deleteChat` and `msgAction('del')` are three, and only two were guarded.
+
+- **R2-E (CR-0014 was incomplete twice):** R1 moved four preamble statements inside the `try`
+  but LEFT `generating=true; abortCtl=...; const sig=streamSignal();` above it, reasoning that
+  those "cannot throw". `streamSignal()` calls `AbortSignal.timeout`/`any` and CAN throw, so the
+  last uncovered window sat one line above the fix claiming to close it. **Rule now written into
+  the code: nothing that can throw may live above the `try{`.** `sig` is declared with `target`
+  and `m` before the try, because a binding declared inside a try is out of scope in its own
+  `finally` — which would make the teardown itself throw.
+
+- **Do NOT run the mutation harness concurrently with anything that reads `index.html`.** It
+  mutates that file in place. A review subagent reading it during a sweep sees three different
+  hashes and its line references may point at mutated code. Serialise them, or copy the tree.
+
+- **`buildMessages` is async and reads `active()`** — it takes no chat argument. A probe that
+  calls it synchronously gets a Promise, and `active()` is `undefined` until a chat exists (send
+  one turn first). Two of my first three R2 fixtures were broken probes, not product defects.
+
+- `bridge_daemon.log` is TRACKED and carries runtime noise. It was already tracked before this
+  phase; it is excluded from phase commits rather than untracked here (a phase does not
+  silently change repo conventions).
+
+Evidence: `npm test` -> FRONTEND SUITE: ALL GREEN (20 files) + `0 FAILURES` from
+`test_e2e.py`. `python3 tools/mutate_phase17.py` -> 26 mutations, 22 caught, 0 escaped,
+3 documented equivalents, 0 stale.
 
 ---
 

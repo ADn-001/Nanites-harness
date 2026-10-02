@@ -522,10 +522,18 @@ function startSkullCycle(){
 function newChat(){const c={id:uid(),title:'UNTITLED LOG-'+String(chats.length+1).padStart(3,'0'),created:Date.now(),updated:Date.now(),messages:[],summary:''};
   chats.unshift(c);activeId=c.id;save();persistActive();renderAll();closeSidebar();$('ta').focus();}
 function deleteChat(id,ev){ev.stopPropagation();
+  /* PHASE 17 (CR-0013): a purge mid-stream destroys the message the running turn is streaming
+     into, leaving `generating` set with nothing left to write to. Refuse, like the other
+     rite-in-progress guards. */
+  if(generating){flashCompact('RITE IN PROGRESS — COMMUNION LOCKED UNTIL COMPLETION');return;}
   if(!confirm('PURGE THIS DATA-LOOM?'))return;
   chats=chats.filter(c=>c.id!==id);if(activeId===id){activeId=chats[0]?.id||null;}
   save();persistActive();renderAll();}
-function clearActive(){const c=active();if(!c)return;if(!confirm('WIPE MESSAGES IN THIS LOG?'))return;
+function clearActive(){const c=active();if(!c)return;
+  /* PHASE 17 (CR-0013): same guard — a wipe mid-stream empties the array the pump holds a
+     message reference into. */
+  if(generating){flashCompact('RITE IN PROGRESS — COMMUNION LOCKED UNTIL COMPLETION');return;}
+  if(!confirm('WIPE MESSAGES IN THIS LOG?'))return;
   c.messages=[];c.summary='';c.updated=Date.now();save();renderMessages();renderList();}
 function autoTitle(c){if(c.titled)return;const m=c.messages.find(m=>m.role==='user');
   if(m){const t=CogCore.contentText(m.content);c.title=t.replace(/\s+/g,' ').trim().slice(0,42)+(t.length>42?'…':'');c.titled=true;}}
@@ -632,16 +640,45 @@ ${code}</span>`;
 }
 function msgAction(a,i){
   const c=active();if(!c)return;
+  /* PHASE 17 R2 (consequence of CR-0011): the per-message PURGE needs the same
+     `if(generating)return;` guard clearActive/deleteChat got. Deleting the message a turn is
+     streaming into makes the bound target vanish, so refreshLast's `indexOf(...)!==-1` check
+     fails and it SILENTLY falls back to messages[length-1] — CR-0011 returning through the
+     back door, with the same symptom the phase exists to remove. Guarding the delete is the
+     fix; the fallback is deliberately left as-is because it is the correct behaviour for a
+     non-streaming refresh that has no bound target. */
+  if(a==='del'&&generating)return;
   if(a==='copy'){navigator.clipboard?.writeText(CogCore.contentText(c.messages[i].content));}
   else if(a==='del'){c.messages.splice(i,1);save();renderMessages();renderList();}
   else if(a==='regen'){regenerate();}
 }
-function refreshLast(){const c=active();const box=$('messages');
-  const i=c.messages.length-1;const el=document.getElementById('body-'+i);
-  if(el){el.innerHTML=renderMd(c.messages[i].content)+(generating?'<span class="caret"></span>':'');
+/* PHASE 17 (CR-0011) — the message THIS turn is streaming into.
+
+   The old code re-derived `active().messages[length-1]` on every delta. That index is only
+   correct while the assistant message is the last one, and an agent turn appends tool
+   messages WHILE the next stream runs — so `length-1` pointed at the TOOL message and the
+   pump wrote the assistant's prose into it, leaving the real assistant bubble empty. The
+   target is bound once per turn and never re-derived. */
+let streamTarget=null;
+function streamTargetBegin(c,m){streamTarget={chat:c,msg:m};return streamTarget;}
+function streamTargetEnd(t){if(streamTarget===t)streamTarget=null;}
+function refreshLast(){
+  const t=streamTarget;
+  /* A bound target wins; without one (a non-streaming refresh) fall back to the last message. */
+  if(t&&t.chat&&t.msg&&t.chat.messages.indexOf(t.msg)!==-1)return refreshLastFor(t.chat,t.msg);
+  const c=active();if(!c)return;
+  return refreshLastFor(c,c.messages[c.messages.length-1]);
+}
+function refreshLastFor(c,m){
+  if(!c||!m)return;
+  const box=$('messages');
+  const i=c.messages.indexOf(m);
+  if(i===-1)return;
+  const el=document.getElementById('body-'+i);
+  if(el){el.innerHTML=renderMd(m.content)+(generating?'<span class="caret"></span>':'');
     const tgl=box.querySelector(`.think-toggle[data-i="${i}"]`);
-    if(c.messages[i].thinking){if(tgl){tgl.innerHTML=`&#9656; COGITATION RECORD (${tok(c.messages[i].thinking)} tok)`;
-      document.getElementById('think-'+i).textContent=c.messages[i].thinking;}
+    if(m.thinking){if(tgl){tgl.innerHTML=`&#9656; COGITATION RECORD (${tok(m.thinking)} tok)`;
+      document.getElementById('think-'+i).textContent=m.thinking;}
       else renderMessages();}
     $('messages').scrollTop=$('messages').scrollHeight;}
   ctxUsage();
@@ -679,7 +716,17 @@ async function buildMessages(opts={}){
   }
   for(let i=end-1;i>=0;i--){const m=c.messages[i];
     const cost=tok(m.content)+tok(m.thinking||'')+(m.toolCalls||[]).reduce((a,t)=>a+tok(t.args),0);
-    if(used+cost>budget&&msgs.length)break;
+    if(used+cost>budget&&msgs.length){
+      /* PHASE 17 R2 (consequence of CR-0012): never emit an ORPHAN tool message. `break` on
+         the first over-budget message can stop BETWEEN an assistant's tool_calls and the tool
+         messages answering them, so the request keeps role:'tool' whose tool_call_id no
+         surviving assistant declares — the exact protocol illegality declareRites() was added
+         to remove, re-created by the budget trim instead. compactChat() has had this guard all
+         along; port it rather than invent a second shape. Walk back over any tool messages
+         already collected, and drop the message that would have declared them. */
+      while(msgs.length&&msgs[0].role==='tool')msgs.shift();
+      break;
+    }
     used+=cost;
     const seq=[];
     if(m.role==='tool'){
@@ -779,7 +826,22 @@ function streamSignal(ms=180000){
 function apiSig(ms=8000){return AbortSignal.timeout?AbortSignal.timeout(ms):undefined;}
 function mergeToolDelta(acc,t){
   if(!t)return;
-  const idx=Number.isInteger(t.index)?t.index:(acc._fallback=(acc._fallback||0)+1);
+  /* PHASE 17 (CR-0015) — index is authoritative and fragments may arrive OUT OF ORDER, so
+     NOTHING is compacted here. The old code ran `acc.toolCalls.filter(Boolean)` on every
+     single delta, which renumbered the slots mid-stream: a fragment for index 1 arriving
+     before index 0 compacted index 1 down into slot 0, and the two distinct calls then
+     merged into ONE with their arguments concatenated. Compaction happens ONCE, at hand-off
+     (`compactToolCalls`), where no further fragment can arrive to be misfiled. */
+  let idx;
+  if(Number.isInteger(t.index)){idx=t.index;}
+  else{
+    /* No `index` key: these fragments belong to the SAME in-flight call, so bind them all to
+       one stable slot above every explicit index seen so far. Minting a fresh slot per
+       fragment (the old counter) split one streamed call into several. */
+    if(acc._fbIdx===undefined||acc._fbIdx>=(acc._next||0))acc._fbIdx=(acc._next||0);
+    idx=acc._fbIdx;
+  }
+  if(idx>=(acc._next||0))acc._next=idx+1;
   let slot=acc.toolCalls[idx];
   if(!slot)slot=acc.toolCalls[idx]={id:'',name:'',args:''};
   if(t.id)slot.id=t.id;
@@ -787,9 +849,26 @@ function mergeToolDelta(acc,t){
   if(f.name)slot.name=f.name;
   if(f.arguments!==undefined)slot.args+=(typeof f.arguments==='string'?f.arguments:JSON.stringify(f.arguments));
   if(f.args!==undefined)slot.args+=(typeof f.args==='string'?f.args:JSON.stringify(f.args));
-  acc.toolCalls=acc.toolCalls.filter(Boolean);
 }
-function newAcc(){return{content:'',thinking:'',toolCalls:[],_fallback:0};}
+/* The ONE compaction point — called at hand-off, never inside the delta loop.
+   PHASE 17 R2 (consequence of CR-0015): this MUTATES IN PLACE rather than rebinding.
+   The stream pump assigns `m.toolCalls = acc.toolCalls` by REFERENCE on every delta, so any
+   rebinding here leaves the message holding the OLD, hole-bearing array. `filter(Boolean)`
+   builds a new array precisely when there is a hole to remove — which is the only case that
+   matters — so the message would permanently keep a sparse array, and ctxTokens' `for...of`
+   yields undefined for holes and `tok(t.args)` throws out of renderMessages, breaking message
+   rendering until reload. Compacting in place keeps every holder of the reference in sync.
+   Defence in depth: `s.length=0` cannot leave holes, and the finalizer at each hand-off site
+   still filters, so a caller holding a stale COPY is also safe. */
+function compactToolCalls(acc){
+  const s=acc.toolCalls||[];
+  const keep=s.filter(Boolean);
+  s.length=0;
+  for(let i=0;i<keep.length;i++)s[i]=keep[i];
+  acc.toolCalls=s;
+  return s;
+}
+function newAcc(){return{content:'',thinking:'',toolCalls:[],_fallback:0,_next:0};}
 /* PHASE 15 — INCREMENTAL DETECTION wiring.
    `cortexTurn` is the ONE per-turn holder the stream pump and the end-of-stream stage share.
    It is deliberately a module-level singleton rather than a pump argument: `pumpSSE` is called
@@ -888,7 +967,9 @@ async function pumpSSE(body,acc,onDelta){
     const data=tail.replace(/^data:\s?/,'').trim();
     if(data&&data!=='[DONE]'){try{processStreamObject(JSON.parse(data),acc);onDelta&&onDelta(acc);}catch(e){}}
   }
-  acc.toolCalls=acc.toolCalls.filter(Boolean);
+  /* PHASE 17 (CR-0015): the stream is over, so compacting here is safe — no further fragment
+     can arrive to be misfiled. This is the ONLY compaction point on the SSE path. */
+  compactToolCalls(acc);
   return acc;
 }
 function processOllamaObject(j,acc){
@@ -919,7 +1000,8 @@ async function callOpenAI(messages,options,nonStream,signal){
   if(!r.body)throw new Error('NO BODY');
   const acc=newAcc();
   return await pumpSSE(r.body,acc,()=>{
-    const c=active();const m=c?.messages[c.messages.length-1];
+    /* PHASE 17 (CR-0011): write into the message THIS turn created, never messages[length-1]. */
+    const t=streamTarget;const m=(t&&t.msg)||null;
     if(m){m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=acc.toolCalls;refreshLast();}
   });
 }
@@ -942,13 +1024,15 @@ async function callOllamaNative(messages,options,nonStream,signal){
       processOllamaObject(j,acc);
       /* PHASE 15 — same cheap tick on the native Ollama line-delimited stream. */
       cortexStreamTick(acc);
-      const c=active();const m=c?.messages[c.messages.length-1];
+      /* PHASE 17 (CR-0011): same bound target as the OpenAI pump. */
+      const t=streamTarget;const m=(t&&t.msg)||null;
       if(m){m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=acc.toolCalls;refreshLast();}
     }
   }
   const tail=buf.trim();
   if(tail){try{processOllamaObject(JSON.parse(tail),acc);}catch(e){}}
-  acc.toolCalls=acc.toolCalls.filter(Boolean);
+  /* PHASE 17 (CR-0015): compact once, at hand-off. */
+  compactToolCalls(acc);
   return acc;
 }
 async function readSSE(body,m){
@@ -1164,9 +1248,32 @@ async function runCortexDispatch(c,m,iter){
   const auto=[],card=[];
   for(const p of proposals)(p.autoRun?auto:card).push(p);
   const autoRan=[];
+  /* PHASE 17 (CR-0012) — PROTOCOL LEGALITY. A `role:'tool'` message is only meaningful to an
+     OpenAI-compatible server when an EARLIER assistant message declared that `tool_call_id`.
+     The pre-router dispatched rites and pushed their results with NO such declaration, so the
+     very first request of a dispatched turn was malformed and a strict server rejected the
+     whole turn. `declareRites` synthesises the missing assistant message — the model then sees
+     that these rites ran, which is also what it needs to reason about their output. */
+  function declareRites(calls,origin){
+    const list=(calls||[]).filter(tc=>tc&&tc.id);
+    if(!list.length)return;
+    /* PHASE 17 R1 (review finding — CR-0012 was incomplete): CogCore's validator pushes
+       `args` already PARSED (it requires a JSON *object*, so sanitized[].args is one), and
+       buildMessages emits `arguments: t.args` verbatim. So copying the object through put an
+       OBJECT in `function.arguments`, where the OpenAI wire format requires a JSON-encoded
+       STRING — the turn stayed protocol-illegal on a strict server for a different reason than
+       the one this declaration fixed. Encode here rather than in buildMessages: this is the one
+       place that mints declarations from parsed args, and the model-authored path already
+       carries strings. */
+    c.messages.push({role:'assistant',content:origin||'',thinking:'',toolCalls:
+      list.map(tc=>({id:tc.id,name:tc.name||'',
+        args:(typeof tc.args==='string')?tc.args:JSON.stringify(tc.args||{})})),
+      ts:Date.now(),cortexSynthesized:true});
+  }
   for(const p of auto){
     const gate=CogCore.validateStructuredOutput([{id:p.id,name:p.name,args:p.args}],TOOL_SCHEMAS);
     if(!gate.ok||!gate.sanitized.length)continue;   /* the Phase 7 gate is never weakened */
+    declareRites(gate.sanitized,'[ AUTO-ROUTED READ RITE ]');
     for(const tc of gate.sanitized){
       const result=await executeTool(tc);
       c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
@@ -1179,6 +1286,7 @@ async function runCortexDispatch(c,m,iter){
     if(!accepted)continue;                          /* IGNORE ⇒ zero dispatch, model proceeds */
     const gate=CogCore.validateStructuredOutput([{id:p.id,name:p.name,args:p.args}],TOOL_SCHEMAS);
     if(!gate.ok||!gate.sanitized.length)continue;
+    declareRites(gate.sanitized,'[ OPERATOR-ACCEPTED RITE ]');
     for(const tc of gate.sanitized){
       const result=await executeTool(tc);
       c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
@@ -1370,7 +1478,17 @@ async function runAgentLoop(c,m,sig){
       c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,content:String(result),ts:Date.now()});
       save();renderMessages();
     }
+    /* PHASE 17 R2 (consequence of CR-0011): rebind the stream target HERE too. The pump
+       writes through the module-level `streamTarget.msg`, and this loop mints a FRESH
+       assistant message every iteration. Without the rebind, from iteration 1 onward every
+       delta landed on the turn's FIRST assistant bubble — CR-0011 relocated from "the tool
+       message" to "the previous assistant message", with the same user-visible symptom (the
+       live bubble stays empty while a stale one fills up).
+       Rebinding the module-level singleton rather than threading a `target` parameter keeps
+       the pump's read path (streamTarget) as the single source of truth; a second binding
+       passed as an argument could drift from it, which is the very bug being fixed. */
     m={role:'assistant',content:'',thinking:'',toolCalls:[],ts:Date.now()};
+    if(streamTarget&&streamTarget.chat===c)streamTarget.msg=m;
     c.messages.push(m);save();renderMessages();
   }
   m.content=(m.content?m.content+'\n\n':'')+'[ AGENT RITE LIMIT REACHED — 12 INVOCATIONS WITHOUT FINAL DECREE ]';refreshLast();
@@ -1457,37 +1575,91 @@ async function send(){
 }
 async function stream(c,agentMode=false){
   if(!settings.model){alert('NO SOUL-MODEL SELECTED — OPEN RITES/CONFIG');return;}
-  generating=true;abortCtl=new AbortController();const sig=streamSignal();
-  $('send-btn').disabled=true;$('send-btn').style.display='none';$('stop-btn').style.display='inline-block';
-  c.messages.push({role:'assistant',content:'',thinking:'',toolCalls:[],ts:Date.now()});
-  renderMessages();
-  let m=c.messages[c.messages.length-1];
+  /* PHASE 17 R1+R2 (review findings — CR-0014 was incomplete twice): `generating` is set
+     before the `try{` opens, so a fault in that window skips the finally entirely and leaves
+     the app in exactly the state CR-0014 exists to prevent — `generating` stuck true, send
+     button hidden and disabled, stop button showing, a live abortCtl. Permanently busy, no
+     way out but a reload. R1 moved the four preamble statements inside the try but LEFT
+     `generating=true; abortCtl=...; const sig=streamSignal();` above it, on the theory that
+     those three "cannot throw". `streamSignal()` calls AbortSignal.timeout/any and CAN throw
+     (an unsupported or bad signal config), so the last uncovered window sat one line above
+     the fix that claimed to close it. R2 moves all three inside, as the first guarded step.
+     A `finally` cannot be skipped BY a throw, but code that never REACHES the try skips it
+     entirely — so nothing that can throw may live above the `try{`.
+     Each preamble step is individually guarded so one failing step cannot strand the rest.
+     `target` and `m` are declared BEFORE the try because a binding declared inside a try
+     block is out of scope in its own finally, which would make the teardown itself throw —
+     the very failure mode this phase exists to remove. `sig` is declared there for the same
+     reason: the catch body below reports into the message and must not depend on a binding
+     the failed step never got to assign. */
+  let target=null,m=null,sig=null;
   try{
+  try{generating=true;abortCtl=new AbortController();sig=streamSignal();}catch(e){}
+  try{$('send-btn').disabled=true;$('send-btn').style.display='none';$('stop-btn').style.display='inline-block';}catch(e){}
+  try{c.messages.push({role:'assistant',content:'',thinking:'',toolCalls:[],ts:Date.now()});}catch(e){}
+  try{renderMessages();}catch(e){}
+  /* PHASE 17 (CR-0011): bind the message this turn created, so the pump can never re-derive
+     `messages[length-1]` and write into a tool message appended after it. */
+  try{target=streamTargetBegin(c,c.messages[c.messages.length-1]);}catch(e){}
+  try{m=c.messages[c.messages.length-1];}catch(e){}
     if(agentMode)await runAgentLoop(c,m,sig);
     else{const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
       m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=[];refreshLast();}
-  }catch(e){m=c.messages[c.messages.length-1];
+  }catch(e){
+    /* PHASE 17 (CR-0011 + CR-0014): report onto the message THIS turn created. The old code
+       re-derived `c.messages[c.messages.length-1]` here, which after a mid-turn tool append was
+       the TOOL message — so the failure notice was written into the wrong bubble.
+
+       The whole reporting body is wrapped: this block is a BEST-EFFORT reporter, so a fault
+       raised while reporting (a renderer fault, a detached node) must not escape `stream()`
+       as an unhandled rejection on top of the fault already being handled. Swallowing it here
+       is deliberate — the `finally` below still guarantees teardown either way. */
+    try{
+    /* PHASE 17 R1 (review finding — CR-0011 was incomplete): this line re-derived
+       `m=c.messages[c.messages.length-1]`, which is the exact defect CR-0011 was filed to
+       remove; the comment above already described it as the bug while the code still did
+       it. After a mid-turn tool append that re-derivation pointed at the TOOL message, so
+       "[ RITE FAILED ... ]" landed on the tool bubble and the assistant bubble stayed
+       empty precisely when the operator most needs to read the error. Report onto the
+       message THIS turn created — `m` is bound to it at the top of stream(). */
     if(e.name==='AbortError'){m.content+='\n\n[ TRANSMISSION HALTED BY OPERATOR ]';}
     else{
       m.content+='\n\n[ RITE FAILED: '+(e.message||e)+' — VERIFY ENDPOINT LINK ]';refreshLast();
       if(currentBackend()==='lmstudio'){
         m.content+='\n[ ATTEMPTING SOUL-LOAD RITE... ]';refreshLast();
         try{const lr=await fetch(api('/api/v1/models/load'),{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(120000),body:JSON.stringify(loadBody())});
-          if(lr.ok){m.content='';m.thinking='';refreshLast();await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);m=c.messages[c.messages.length-1];}
+          if(lr.ok){m.content='';m.thinking='';refreshLast();await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);}
           else m.content+='\n[ SOUL-LOAD RITE REFUSED: HTTP '+lr.status+' ]';
         }catch(e2){m.content+='\n[ SOUL-LOAD RITE FAILED: '+(e2.message||e2)+' ]';}
       }
     }
     refreshLast();
+    }catch(reportFault){
+      /* A fault while REPORTING a fault. Append it to the message when that is still possible,
+         then let the finally tear down. Never rethrow — the turn's own error is already handled
+         and there is no caller above `stream()` that could act on a second one. */
+      try{if(m)m.content+='\n[ RITE REPORT FAULTED: '+(reportFault&&reportFault.message||reportFault)+' ]';}catch(e){}
+    }
+  }finally{
+    /* PHASE 17 (CR-0014): teardown on EVERY exit. Previously it sat after the try/catch, so a
+       throw from INSIDE the catch (a renderer fault, a missing node) escaped `stream()`
+       entirely and left `generating` true forever — the app permanently busy, no send button,
+       no way out but a reload. A `finally` cannot be skipped. Each step below is also
+       individually guarded: one failing teardown step must not strand the rest. */
+    try{streamTargetEnd(target);}catch(e){}
+    try{
+      const lastMsg=c.messages[c.messages.length-1];
+      if(lastMsg&&lastMsg.role==='assistant'&&!lastMsg.content.trim()&&!(lastMsg.toolCalls||[]).length){
+        lastMsg.content='[ THE SPIRIT ANSWERED WITH SILENCE — VERIFY THE SOUL-MODEL IS BOUND, AWAKE, AND THAT THE RESPONSE WAS READABLE (CORS) ]';refreshLast();
+      }
+    }catch(e){}
+    /* The two flags FIRST and unconditionally: these are what make the app usable again. */
+    generating=false;abortCtl=null;
+    try{c.updated=Date.now();save();renderList();}catch(e){}
+    try{$('send-btn').disabled=false;$('send-btn').style.display='inline-block';$('stop-btn').style.display='none';}catch(e){}
+    try{renderMessages();$('ta').focus();}catch(e){}
+    try{maybeAutoCompact();}catch(e){}
   }
-  const lastMsg=c.messages[c.messages.length-1];
-  if(lastMsg&&lastMsg.role==='assistant'&&!lastMsg.content.trim()&&!(lastMsg.toolCalls||[]).length){
-    lastMsg.content='[ THE SPIRIT ANSWERED WITH SILENCE — VERIFY THE SOUL-MODEL IS BOUND, AWAKE, AND THAT THE RESPONSE WAS READABLE (CORS) ]';refreshLast();
-  }
-  generating=false;abortCtl=null;
-  c.updated=Date.now();save();renderList();
-  $('send-btn').disabled=false;$('send-btn').style.display='inline-block';$('stop-btn').style.display='none';
-  renderMessages();$('ta').focus();maybeAutoCompact();
 }
 function regenerate(){
   const c=active();if(!c||generating)return;
@@ -1495,7 +1667,12 @@ function regenerate(){
   save();renderMessages();stream(c,settings.agent);
 }
 function halt(){
-  if(approvalResolve)settleApproval(false);
+  /* PHASE 17 (CR-0013): settle EVERY pending resolver, not just the approval one. `halt()`
+     used to settle `approvalResolve` only, so a STOP pressed while the CORTEX PROPOSAL CARD was
+     open left `runCortexDispatch` awaiting forever — `generating` stuck true and the app
+     permanently busy. Each settle is independent: one throwing must not strand the others. */
+  if(proposalResolve){try{settleCortexProposal(false);}catch(e){proposalResolve=null;}}
+  if(approvalResolve){try{settleApproval(false);}catch(e){approvalResolve=null;}}
   if(abortCtl)abortCtl.abort();
 }
 /* ================= WORKDIR / BRIDGE DAEMON SUBSYSTEM ================= */
