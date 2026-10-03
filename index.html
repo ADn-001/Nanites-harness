@@ -968,9 +968,50 @@ function anySignal(signals){
   if(AbortSignal.any)return AbortSignal.any(signals);
   return signals[0];
 }
-function streamSignal(ms=180000){
+/* PHASE 23 (CR-0005) — the turn's model-call budget, in ONE place.
+   The old code passed 180000 as a default argument and the catch block's message had no
+   way to name the number the operator actually ran into, so the report could not tell them
+   what to raise. Read the value back from here instead of hard-coding it twice.
+
+   `let`, not `const`, for ONE reason: the budget has to be reachable from a test so the
+   multi-iteration scenario is runnable in milliseconds instead of three minutes. Production
+   never assigns it; `tests/frontend/phase23_probe_and_timeout.test.js` does, and that is the
+   only way this defect can be tested behaviourally rather than by reading the source. */
+let STREAM_BUDGET_MS=180000;
+function streamBudgetMs(){return STREAM_BUDGET_MS;}
+
+/* The operator's kill signal carries NO timeout. This is the whole point of the fix: the
+   turn-wide `sig` used to be `AbortSignal.any([abortCtl.signal, AbortSignal.timeout(180s)])`,
+   so the budget expired ONCE for the entire turn and every `if(sig.aborted)` guard in the
+   agent loop then killed iteration after iteration — building a per-iteration signal changed
+   nothing, because the turn-wide signal was still the binding constraint at the next guard.
+   Separating them means: abortCtl = "stop now" (no time limit), and the budget applies to
+   each model call individually. */
+function operatorSignal(){return abortCtl?abortCtl.signal:undefined;}
+
+/* Classify why a signal aborted. `AbortSignal.any()` propagates the REASON of whichever
+   constituent fired, so an expired budget is distinguishable from an operator halt by the
+   reason's name — the platform fires 'TimeoutError' for its own timer and 'AbortError' for
+   a manual `AbortController.abort()`. The old loop guards hardcoded 'AbortError', which is
+   how a budget expiry ended up reporting "TRANSMISSION HALTED BY OPERATOR". */
+function abortCause(sig){
+  if(!sig||!sig.aborted)return null;
+  const r=sig.reason;
+  if(r&&r.name==='TimeoutError')return 'TimeoutError';
+  return 'AbortError';
+}
+/* Throw the RIGHT abort for why the signal fired, so the catch block above can report a
+   timeout as a timeout and an operator halt as a halt. */
+function throwAbort(sig){
+  if(abortCause(sig)==='TimeoutError')throw new DOMException('The operation timed out.','TimeoutError');
+  throw new DOMException('Aborted','AbortError');
+}
+function streamSignal(ms){
+  ms=(typeof ms==='number'&&isFinite(ms)&&ms>0)?ms:streamBudgetMs();
   const t=AbortSignal.timeout?AbortSignal.timeout(ms):null;
-  return t?anySignal([abortCtl.signal,t]):abortCtl.signal;
+  const base=operatorSignal();
+  if(!t)return base;
+  return base?anySignal([base,t]):t;
 }
 function apiSig(ms=8000){return AbortSignal.timeout?AbortSignal.timeout(ms):undefined;}
 function mergeToolDelta(acc,t){
@@ -1204,7 +1245,15 @@ async function fetchLMSModels(){const r=await fetch(api('/api/v1/models'),{signa
   if(!r.ok)return null;const d=await r.json();const arr=d.models||d.data||[];
   const names=arr.map(m=>typeof m==='string'?m:(m.id||m.key||m.model_key||m.name)).filter(Boolean);
   return names.length?names:null;}
-async function fetchLMSLoaded(){try{const r=await fetch(api('/api/v0/models'),{signal:apiSig()});
+/* PHASE 23 (CR-0029) — `headers: authHeaders()`, like all five sibling probes.
+   This call site was the ONLY one of the six that omitted it, so against a keyed LM Studio
+   (or proxied) backend this single request failed auth while every other probe succeeded:
+   the model list reported "not loaded" with no error anywhere, sending the operator to
+   debug a backend that was working fine. README.txt states /v0/models carries the
+   configured key, so the code and the documentation disagreed about a route the user can
+   see in their own settings panel. Fixed at the call site because the rule belongs there —
+   `authHeaders()` is the one sanctioned way to build these headers. */
+async function fetchLMSLoaded(){try{const r=await fetch(api('/api/v0/models'),{signal:apiSig(),headers:authHeaders()});
   if(!r.ok)return{};const d=await r.json().catch(()=>null);if(!d)return{};const map={};
   for(const m of (d.data||[]))map[m.id||m.name]=m.state||'';return map;}catch(e){return{};}}
 function fetchBlocked(e){return e&&(e.name==='TypeError'||/failed to fetch|networkerror|fetch blocked/i.test(e.message||''));}
@@ -1494,7 +1543,7 @@ async function runAgentLoop(c,m,sig){
      dispatch note is re-applied underneath them. */
   let dispatchNote='';
   for(let iter=0;iter<12;iter++){
-    if(sig.aborted)throw new DOMException('Aborted','AbortError');
+    if(sig.aborted)throwAbort(sig);
     /* PHASE 14 — LOCAL CORTEX DISPATCHER (F3), ONCE per send and BEFORE the first
        big-model call (iter===0: never re-probe per iteration). A high-confidence read-only
        proposal auto-runs through the UNCHANGED validator -> approveToolCall -> executeTool
@@ -1507,7 +1556,7 @@ async function runAgentLoop(c,m,sig){
       let dr=null;
       try{dr=await runCortexDispatch(c,m,iter);}catch(e){dr=null;}
       if(dr&&dr.note)dispatchNote=dr.note;
-      if(sig.aborted)throw new DOMException('Aborted','AbortError');
+      if(sig.aborted)throwAbort(sig);
     }
     const lm=normLocalModels(settings.localModels);
     let cortexClient=null;
@@ -1523,7 +1572,16 @@ async function runAgentLoop(c,m,sig){
        refuses anyway — the turn then costs zero requests exactly as in Phase 14. */
     const cTurn=cortexTurnBegin(cortexClient,lm);
     let acc=null;
-    try{ acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig); }
+    /* PHASE 23 (CR-0005) — a FRESH per-iteration signal for this model call. The loop used
+       to reuse the single turn-wide `sig`, so the 180 s budget covered all 12 iterations and
+       a legitimate multi-iteration tool-using turn was cut off mid-work. `iterSig` still
+       carries abortCtl, so the operator's STOP remains the loop-wide kill switch — this widens
+       the budget per iteration without weakening the kill. A per-iteration timeout is reported
+       as a timeout by the catch block above, which is the correct place for that distinction. */
+    let iterSig=sig;
+    try{iterSig=streamSignal();}catch(e){iterSig=sig;}
+    if(sig.aborted)throwAbort(sig);
+    try{ acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,iterSig); }
     finally{ /* the pump must never keep ticking at the next send's holder */
       if(cortexTurn===cTurn)cortexTurnEnd(); }
     m.content=acc.content;m.thinking=acc.thinking;
@@ -1626,7 +1684,7 @@ async function runAgentLoop(c,m,sig){
       }catch(e){heldCalls=[];}
     }
     for(const tc of gate.sanitized){
-      if(sig.aborted)throw new DOMException('Aborted','AbortError');
+      if(sig.aborted)throwAbort(sig);
       if(heldCalls.includes(tc)){
         c.messages.push({role:'tool',name:tc.name,toolCallId:tc.id,
           content:'[RITE HELD BY LOCAL CORTEX — the local pre-flight judged these arguments implausible for '+tc.name+'. Re-issue a corrected call, or answer in prose.]',ts:Date.now()});
@@ -1753,7 +1811,15 @@ async function stream(c,agentMode=false){
      the failed step never got to assign. */
   let target=null,m=null,sig=null;
   try{
-  try{generating=true;abortCtl=new AbortController();sig=streamSignal();}catch(e){}
+  /* PHASE 23 (CR-0005) — the turn-wide signal is now the OPERATOR kill signal ONLY, with
+     no timeout on it. It used to be `streamSignal()`, i.e. `AbortSignal.any([abortCtl.signal,
+     AbortSignal.timeout(180s)])`, so one 180 s budget covered the whole turn and — because
+     every guard in runAgentLoop tests this signal — the loop was cut off mid-work after
+     180 s no matter how many iterations remained. `runAgentLoop` now builds a FRESH budgeted
+     signal per model call via `streamSignal()`, and this signal stays the loop-wide STOP
+     switch with no time limit. Both still travel through runAgentLoop: `sig` for "stop now",
+     the per-iteration signal for "this call ran out of time". */
+  try{generating=true;abortCtl=new AbortController();sig=operatorSignal();}catch(e){}
   try{$('send-btn').disabled=true;$('send-btn').style.display='none';$('stop-btn').style.display='inline-block';}catch(e){}
   try{c.messages.push({role:'assistant',content:'',thinking:'',toolCalls:[],ts:Date.now()});}catch(e){}
   try{renderMessages();}catch(e){}
@@ -1762,7 +1828,15 @@ async function stream(c,agentMode=false){
   try{target=streamTargetBegin(c,c.messages[c.messages.length-1]);}catch(e){}
   try{m=c.messages[c.messages.length-1];}catch(e){}
     if(agentMode)await runAgentLoop(c,m,sig);
-    else{const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,sig);
+    else{
+      /* PHASE 23 (CR-0005) — the plain (non-agent) path still needs a BUDGETED signal.
+         `sig` is now the operator kill signal alone, so passing it here would leave a
+         plain chat turn with NO time limit at all — a regression in the opposite
+         direction. Build the budgeted signal for this one model call, exactly as
+         runAgentLoop does per iteration. */
+      let plainSig=sig;
+      try{plainSig=streamSignal();}catch(e){plainSig=sig;}
+      const acc=await callModel(await buildMessages({excludeLastAssistant:true}),opts(),false,plainSig);
       m.content=acc.content;m.thinking=acc.thinking;m.toolCalls=[];refreshLast();}
   }catch(e){
     /* PHASE 17 (CR-0011 + CR-0014): report onto the message THIS turn created. The old code
@@ -1781,7 +1855,26 @@ async function stream(c,agentMode=false){
        "[ RITE FAILED ... ]" landed on the tool bubble and the assistant bubble stayed
        empty precisely when the operator most needs to read the error. Report onto the
        message THIS turn created — `m` is bound to it at the top of stream(). */
+    /* PHASE 23 (CR-0005) — TWO abort causes, and the old code could only see one.
+       `streamSignal()` returns AbortSignal.any([abortCtl.signal, AbortSignal.timeout(ms)]).
+       The timeout signal aborts with a DOMException whose `name` is 'TimeoutError', NOT
+       'AbortError', so testing only `e.name==='AbortError'` routed a genuine 180 s budget
+       expiry into the ELSE branch: the operator was told to VERIFY ENDPOINT LINK (the one
+       thing that is not wrong) and, on LM Studio, a full SOUL-LOAD retry fired — a SECOND
+       120 s model load on top of a turn that had already run 180 s.
+
+       So classify the cause rather than the abort:
+         - TimeoutError  -> report the BUDGET. Do NOT retry: retrying spends another
+                            120 s loading a model on a turn that has already timed out,
+                            and the retry can only fail the same way.
+         - AbortError    -> the operator pressed STOP. Reported as a halt (unchanged).
+         - anything else -> a real endpoint/protocol fault, which is what the old text
+                            claimed. The soul-load recovery is kept for exactly this case,
+                            since that is the one it was written for. */
     if(e.name==='AbortError'){m.content+='\n\n[ TRANSMISSION HALTED BY OPERATOR ]';}
+    else if(e.name==='TimeoutError'){
+      m.content+='\n\n[ TURN TIMED OUT — THE '+streamBudgetMs()+'ms BUDGET EXPIRED. THE ENDPOINT IS REACHABLE; IT WAS STILL ANSWERING. RAISE THE BUDGET OR SHORTEN THE WORK. ]';refreshLast();
+    }
     else{
       m.content+='\n\n[ RITE FAILED: '+(e.message||e)+' — VERIFY ENDPOINT LINK ]';refreshLast();
       if(currentBackend()==='lmstudio'){
