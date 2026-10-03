@@ -408,6 +408,59 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
+    def _read_body(self):
+        """Read the JSON body as a BOUND, CONTAINED read (CR-Nanites-harness-0021).
+
+        Returns (obj, err). `err` is None, or a (code, message) pair the caller
+        answers with verbatim. ONE shape, shared with bridge_daemon.py.
+
+        Why each refusal is what it is:
+
+        * Content-Length absent, non-numeric or <= 0 => 400. `int()` used to be
+          unwrapped, so "abc" raised ValueError and was only ever caught by the
+          broad `except Exception` at the bottom of do_POST — a 400 whose body was
+          the Python dump, i.e. a refusal for the wrong reason. And n <= 0 was
+          accepted at all: rfile.read(-1) reads UNTIL EOF, an unbounded read that is
+          precisely what MAX_JSON_BYTES exists to prevent (it also parsed and
+          EXECUTED the body), while read(0) was coerced to {} and dispatched with an
+          empty tool name.
+        * Content-Length > MAX_JSON_BYTES => 413. Too large, and 413 outranks the 404
+          so an oversized body can never be routed.
+        * The READ itself is capped at MAX_JSON_BYTES bytes, and anything actually
+          delivered beyond that is 413. Capping only the DECLARED number leaves the
+          read itself trusting the client; this is the read-bound.
+        * Not valid JSON => 400, and valid JSON that is not an object => 400. Both
+          used to reach `.get()` and raise AttributeError behind a 400.
+
+        The length check happens BEFORE the read, so an over-limit body is never
+        buffered at all.
+        """
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None or not str(raw_len).strip():
+            return None, (400, "request body required: Content-Length missing")
+        try:
+            n = int(str(raw_len).strip())
+        except (TypeError, ValueError):
+            return None, (400, "invalid Content-Length header")
+        if n <= 0:
+            return None, (400, "invalid Content-Length header")
+        if n > MAX_JSON_BYTES:
+            return None, (413, "request exceeds %d byte limit" % MAX_JSON_BYTES)
+        try:
+            raw = self.rfile.read(min(n, MAX_JSON_BYTES + 1))
+        except Exception:
+            return None, (400, "could not read request body")
+        if raw is None or len(raw) > MAX_JSON_BYTES:
+            return None, (413, "request exceeds %d byte limit" % MAX_JSON_BYTES)
+        if not raw.strip():
+            return None, (400, "request body required: empty body")
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+        except (json.JSONDecodeError, ValueError):
+            return None, (400, "invalid JSON body")
+        if not isinstance(obj, dict):
+            return None, (400, "request body must be a JSON object")
+        return obj, None
     def do_OPTIONS(self):
         # A preflight cannot carry the token's VALUE, so the token check is not
         # performed here - the real request is where it is enforced. The Host and
@@ -435,10 +488,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.rstrip("/").endswith("tools/execute"):
             self._json(404, {"ok": False, "error": "unknown rite"}); return
         try:
-            n = int(self.headers.get("Content-Length", "0"))
-            if n > MAX_JSON_BYTES:
-                self._json(413, {"ok": False, "error": "request exceeds %d byte limit" % MAX_JSON_BYTES}); return
-            req = json.loads(self.rfile.read(n) or b"{}")
+            req, err = self._read_body()
+            if err is not None:
+                self._json(err[0], {"ok": False, "error": err[1]}, cors=False); return
             name, args = req.get("name"), req.get("arguments") or {}
             if name not in TOOLS:
                 self._json(400, {"ok": False, "error": "unknown tool: %r" % name}); return

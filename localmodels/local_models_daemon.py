@@ -548,6 +548,25 @@ def degraded_reasons():
 # read the ledger file, so the daemon has to surface them.
 LEDGER_COUNT_KEYS = ('proposals', 'accepted', 'ignored', 'rejected', 'passed_through', 'timeout')
 LEDGER_COUNT_TAIL = 2000
+#: The hard CEILING on how much `_ledger_tail` will ever read, in bytes
+#: (CR-Nanites-harness-0025). The window used to double without limit until it held
+#: LEDGER_COUNT_TAIL lines, so FAT records - 10 of 100 KB each - walked it past a
+#: megabyte and /health read an unbounded amount of a large ledger.
+#:
+#: Sized from two MEASURED fixtures, not picked round, because the number is only
+#: honest if it sits between them:
+#:   * a realistic 5000-line ledger needs ~232 KB to yield its last 2000 lines
+#:     (2000 outcome lines at ~116 bytes) - the phase-14 guarantee. The ceiling must
+#:     stay ABOVE this or it silently under-reports an ordinary ledger, which would
+#:     be the very bug the growing window was written to avoid;
+#:   * the finding's fat fixture - 10 records of 100 KB - is ~1 MB and must stay
+#:     ABOVE this or the bound is never exercised.
+#: 512 KiB sits between them: ~2.2x the headroom an ordinary ledger needs, and half
+#: the fat fixture. The line count stays the primary bound; this is the backstop.
+LEDGER_TAIL_MAX_BYTES = 512 * 1024
+#: The FIRST window a backwards tail read opens. Named because the ceiling above is
+#: only meaningful relative to it - the loop doubles from here and stops there.
+LEDGER_TAIL_START_BYTES = 65536
 # The outcome lines written by POST /ledger carry an `action` and NO `op` key; that is how
 # accepted/ignored are counted, and is intentional.
 _LEDGER_ACTIONS = {'accepted': 'accepted', 'accepted_by_operator': 'accepted',
@@ -556,31 +575,66 @@ _LEDGER_ACTIONS = {'accepted': 'accepted', 'accepted_by_operator': 'accepted',
 
 
 def _ledger_tail(path):
-    """The last LEDGER_COUNT_TAIL lines of `path`, without reading the whole file.
+    """The last LEDGER_COUNT_TAIL lines of `path`, bounded by LINES and by BYTES.
 
     A session ledger is append-only and grows without bound, so /health must never read
-    all of it. The window therefore GROWS backwards in chunks until it holds 2000 lines or
-    the start of the file is reached - a fixed byte window would silently under-report
-    whenever the lines are long (measured: a 64 KiB window held only 1489 of 2000 lines
-    and reported 1489 instead of 2000). Bounded by the chunked read, never unbounded.
+    all of it. The window GROWS backwards in chunks from EOF until it holds 2000 lines
+    or the start of the file is reached - a fixed byte window would silently
+    under-report whenever the lines are long (measured: a 64 KiB window held only 1489
+    of 2000 lines and reported 1489 instead of 2000).
+
+    The growth is CEILINGED by LEDGER_TAIL_MAX_BYTES (CR-Nanites-harness-0025), because
+    growing "until 2000 lines" is not a bound at all when the lines are fat: 10 records
+    of 100 KB each never reach 2000 lines, so the loop kept doubling and read whatever
+    the file held. Two bounds, and the loop stops at whichever comes first:
+
+      * the line count (2000), which is what the counters are specified over, and
+      * LEDGER_TAIL_MAX_BYTES, which is the backstop for pathological records.
+
+    WHEN THE BYTE CEILING IS HIT FIRST: the tail is TRUNCATED, not failed. It returns
+    the MOST RECENT lines that fit within the ceiling - the same lines it would have
+    returned had they been shorter - and it TERMINATES. That is the honest answer: a
+    silently shortened counter is visibly short, whereas an unbounded read is a
+    /health that stops answering at all. The alternative, refusing to report anything
+    past the ceiling, would make the counters read as all-zero for a large ledger,
+    which is a fabricated measurement wearing a measurement's clothes.
+
     Returns [] for a missing/unreadable file; never raises.
     """
     try:
         with open(path, 'rb') as f:
             size = f.seek(0, os.SEEK_END)
-            window = 65536
+            window = LEDGER_TAIL_START_BYTES
             start = max(0, size - window)
             while True:
                 f.seek(start)
                 data = f.read(size - start)
                 lines = data.decode('utf-8', 'replace').splitlines()
-                if len(lines) > LEDGER_COUNT_TAIL or start == 0:
+                enough_lines = len(lines) > LEDGER_COUNT_TAIL
+                at_start = start == 0
+                at_ceiling = window >= LEDGER_TAIL_MAX_BYTES
+                if enough_lines or at_start or at_ceiling:
                     # Drop the first line when the window started mid-line.
+                    if start > 0 and lines:
+                        lines = lines[1:]
                     return lines[-LEDGER_COUNT_TAIL:]
-                window *= 2
+                window = min(window * 2, LEDGER_TAIL_MAX_BYTES)
                 start = max(0, size - window)
     except Exception:
         return []
+
+
+def ledger_size(path=None):
+    """The active ledger's size in bytes, for /health. NEVER raises; 0 when absent.
+
+    Surfaced so an operator can see a ledger approaching its rotation bound
+    (CR-Nanites-harness-0006) without reading the file, and so the bound is
+    observable from outside the process at all.
+    """
+    try:
+        return os.path.getsize(path or LEDGER_PATH)
+    except OSError:
+        return 0
 
 
 def _ledger_counts(path):
@@ -633,6 +687,11 @@ def health_obj():
             'cache': laya_cache_path(),
         },
         'ledger': {'path': os.path.abspath(LEDGER_PATH), 'writable': ledger_writable(),
+                   # `bytes` + `max_bytes` make the rotation bound (CR-0006) observable
+                   # from outside the process: an operator can see the ledger
+                   # approaching its limit without reading the file.
+                   'bytes': ledger_size(LEDGER_PATH),
+                   'max_bytes': ledger.MAX_BYTES,
                    'counts': _ledger_counts(LEDGER_PATH)},
         'degraded': degraded_reasons(),
     }
@@ -640,6 +699,43 @@ def health_obj():
 
 def _new_trace_id():
     return ledger.new_trace_id()
+
+
+def _candidate_name(c):
+    """The rite NAME of one candidate entry, or None. Accepts every shape; never raises.
+
+    Three shapes reach this daemon and all three are legitimate:
+      {"function": {"name": "read_file"}}   the nested OpenAI tool schema,
+      {"name": "read_file"}                the flat schema the frontend sends,
+      {"function": "read_file"}            the flattened form, where `function` is
+                                          already the NAME and not a wrapper dict.
+
+    The third one is why this is a function and not an inline expression
+    (CR-Nanites-harness-0022). `(c.get('function') or {}).get('name')` raises
+    AttributeError ON THE STRING - and because that expression is an ARGUMENT to
+    `ledger.append_record`, it is evaluated before the call, so append_record's own
+    blanket `except` never runs and the exception escapes into the HTTP handler.
+    The result was not a 500 but a dead connection: BaseHTTPRequestHandler had no
+    answer left to send. Anything unusable yields None (the ledger records a null
+    name, which is honest - the request carried none) and never an exception.
+    """
+    if not isinstance(c, dict):
+        return None
+    fn = c.get('function')
+    if isinstance(fn, dict):
+        name = fn.get('name')
+        return name if isinstance(name, str) and name else None
+    if isinstance(fn, str) and fn:
+        return fn                     # the flattened shape: function IS the name
+    name = c.get('name')
+    return name if isinstance(name, str) and name else None
+
+
+def _candidate_names(candidates):
+    """The names of a candidate list, in request order. Never raises."""
+    if not isinstance(candidates, list):
+        return []
+    return [_candidate_name(c) for c in candidates if isinstance(c, dict)]
 
 
 def _repair_call(suspect, candidates, timeout_ms, trace_id):
@@ -956,19 +1052,61 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False, "error": "unknown rite"})
 
     def _read_body(self):
-        """Size cap BEFORE routing (413 must outrank 404). Returns (obj, error_code)."""
+        """Size cap BEFORE routing (413 must outrank 404). Returns (obj, error_code).
+
+        The Content-Length is validated as a WHOLE number in [0, MAX_JSON_BYTES] and
+        anything outside that is a 400, not a body. Three ways it used to go wrong
+        (CR-Nanites-harness-0025, LE-1), all of which let an unread request continue
+        as though it had arrived:
+          * a NEGATIVE value passed `if n > MAX_JSON_BYTES` and reached
+            `self.rfile.read(-1)`, which reads until EOF - an unbounded read, and a
+            hang for as long as the client holds the socket open;
+          * a NON-NUMERIC value raised ValueError, was swallowed into `n = 0`, and
+            returned ({}, None) - so /repair answered a success-shaped 200 for a
+            body that was never read;
+          * a VALID positive length whose bytes never arrived took the same route.
+            `except Exception: raw = b''` turned a socket error into an empty body,
+            and `if not raw: return {}, None` then treated a SHORT read (a client
+            truncated mid-flight, or a peer that half-closed early) as a legitimately
+            empty body. Refusing is the honest answer: the bytes that were promised
+            never arrived, so there is nothing to serve.
+
+        The rule this function now implements: a length of 0, or NO length at all,
+        is an empty body (every route validates its own fields, so that is legal);
+        but `n > 0` means the caller PROMISED `n` bytes, and anything short of that -
+        including a read that raises - is a truncated request and a 400. The error is
+        a distinct 'truncated' code rather than the plain 400 for bad JSON, because
+        those are different diagnoses: the payload may be perfectly well formed and
+        merely incomplete.
+        """
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            # No length at all: an empty body is a legitimate request on these
+            # routes (every one of them validates its own fields), so this is NOT
+            # a refusal - only a length that was stated and is unusable is.
+            return {}, None
         try:
-            n = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            n = 0
+            n = int(str(raw_len).strip())
+        except (TypeError, ValueError):
+            return None, 'bad-length'
+        if n < 0:
+            return None, 'bad-length'    # read(-n) is not a bounded read; refuse
         if n > MAX_JSON_BYTES:
             return None, 413
+        if n == 0:
+            return {}, None
         try:
             raw = self.rfile.read(n)
         except Exception:
-            raw = b''
-        if not raw:
-            return {}, None
+            # A read that RAISES is an I/O failure, not an empty body. Swallowing it
+            # into b'' is what produced the success-shaped 200 for a request whose
+            # body was never read.
+            return None, 'truncated'
+        if not raw or len(raw) < n:
+            # Promised n bytes, got fewer: the request was cut off. This is the case
+            # the phase-22 length suite could not see, because every case it wrote
+            # used an UNUSABLE length rather than a short one.
+            return None, 'truncated'
         try:
             obj = json.loads(raw.decode('utf-8', 'replace'))
             return (obj if isinstance(obj, dict) else {}), None
@@ -985,74 +1123,124 @@ class Handler(BaseHTTPRequestHandler):
         if err == 413:
             self._json(413, {"ok": False, "error": "request exceeds %d byte limit" % MAX_JSON_BYTES}); return
         route = self._route()
+        if err == 'bad-length':
+            # Distinct from "your body was not JSON": one is a framing bug the
+            # caller can fix by not sending that header value, the other is a
+            # payload bug. Saying which is the difference between a diagnosable
+            # 400 and a mystery.
+            self._json(400, {"ok": False, "error": "invalid Content-Length"}); return
         if err == 400:
             self._json(400, {"ok": False, "error": "invalid JSON body"}); return
+        if err == 'truncated':
+            # LE-1. A positive Content-Length whose bytes never arrived: the client was
+            # cut off mid-body, or the socket raised. Refused BEFORE the route runs,
+            # so no handler sees a half-body and - the part that matters - no ledger
+            # record is written for a request that never arrived. Kept distinct from
+            # the "invalid JSON body" 400 above: the payload may be perfectly well
+            # formed and merely incomplete, and a caller can only fix this by resending
+            # the whole request.
+            self._json(400, {"ok": False,
+                             "error": "request body truncated: Content-Length promised "
+                                      "%s bytes that never arrived"
+                                      % self.headers.get("Content-Length")})
+            return
         if route == '/repair':
             tid = body.get('trace_id') or _new_trace_id()
             res = _repair_call(body.get('suspect'), body.get('candidates'),
                                NEEDLE_TIMEOUT_MS, tid)
-            # One ledger record per /repair call (the future fine-tuning corpus);
-            # never raise into the request path.
+            # One ledger record per /repair call (the future fine-tuning corpus).
+            #
+            # The BUILD is inside the try as well as the append, and that is the
+            # whole point (CR-Nanites-harness-0022): a record is constructed as an
+            # ARGUMENT EXPRESSION, so any failure while building it happens BEFORE
+            # append_record is entered and therefore escapes the blanket except
+            # inside it. `append_record never raises` is true and was never enough -
+            # only "the whole build-and-append never raises" is. The response below
+            # is computed and is correct regardless of what the telemetry does.
             out = res.get('calls') if res.get('ok') else {'degraded': res.get('reason')}
-            ledger.append_record({
-                'trace_id': tid, 'model': 'needle', 'op': 'repair',
-                'input_redacted': True,
-                'request': {'suspect': body.get('suspect'),
-                            'candidates': [(c.get('name') or (c.get('function') or {}).get('name'))
-                                           for c in (body.get('candidates') or [])
-                                           if isinstance(c, dict)]},
-                'output': out,
-                'confidence': res.get('confidence'),
-                'latency_ms': res.get('latency_ms'),
-                'degraded': bool(res.get('degraded')),
-                'action': None,
-            }, path=LEDGER_PATH)
+            try:
+                ledger.append_record({
+                    'trace_id': tid, 'model': 'needle', 'op': 'repair',
+                    'input_redacted': True,
+                    'request': {'suspect': body.get('suspect'),
+                                'candidates': _candidate_names(body.get('candidates'))},
+                    'output': out,
+                    'confidence': res.get('confidence'),
+                    'latency_ms': res.get('latency_ms'),
+                    'degraded': bool(res.get('degraded')),
+                    'action': None,
+                }, path=LEDGER_PATH)
+            except Exception as e:
+                sys.stderr.write('[LOCALMODELS] repair ledger skipped: %s: %s\n'
+                                 % (type(e).__name__, e))
             self._json(200, res); return
         if route == '/select':
             tid = body.get('trace_id') or _new_trace_id()
             res = _select_call(body.get('input'), body.get('candidates'),
                                NEEDLE_SELECT_TIMEOUT_MS, tid)
             # One ledger record per /select proposal; the operator's ACCEPT/IGNORE arrives
-            # later as a POST /ledger outcome line on the same trace_id. Never raise into
-            # the request path.
+            # later as a POST /ledger outcome line on the same trace_id. Build inside the
+            # try for the reason given on /repair (CR-0022).
             out = res.get('calls') if res.get('ok') else {'degraded': res.get('reason')}
-            ledger.append_record({
-                'trace_id': tid, 'model': 'needle', 'op': 'select',
-                'input_redacted': True,
-                'request': {'input': body.get('input'),
-                            'candidates': [(c.get('name') or (c.get('function') or {}).get('name'))
-                                           for c in (body.get('candidates') or [])
-                                           if isinstance(c, dict)]},
-                'output': out,
-                'confidence': res.get('confidence'),
-                'latency_ms': res.get('latency_ms'),
-                'degraded': bool(res.get('degraded')),
-                'action': None,
-            }, path=LEDGER_PATH)
+            try:
+                ledger.append_record({
+                    'trace_id': tid, 'model': 'needle', 'op': 'select',
+                    'input_redacted': True,
+                    'request': {'input': body.get('input'),
+                                'candidates': _candidate_names(body.get('candidates'))},
+                    'output': out,
+                    'confidence': res.get('confidence'),
+                    'latency_ms': res.get('latency_ms'),
+                    'degraded': bool(res.get('degraded')),
+                    'action': None,
+                }, path=LEDGER_PATH)
+            except Exception as e:
+                sys.stderr.write('[LOCALMODELS] select ledger skipped: %s: %s\n'
+                                 % (type(e).__name__, e))
             self._json(200, res); return
         if route == '/decide':
             tid = body.get('trace_id') or _new_trace_id()
             res = _laya_decide(body.get('state'), body.get('questions'), LAYA_TIMEOUT_MS, tid)
             # One ledger record per /decide call, carrying the child's raw answers INCLUDING
-            # the probability distributions (the future fine-tuning corpus). Never raise
-            # into the request path.
-            ledger.append_record({
-                'trace_id': tid, 'model': 'laya', 'op': 'decide',
-                'input_redacted': True,
-                'request': {'state': body.get('state'),
-                            'questions': _questions_summary(body.get('questions'))},
-                'output': {'answers': res.get('answers') or {}},
-                'confidence': _laya_confidence(res.get('answers')),
-                'latency_ms': res.get('latency_ms'),
-                'degraded': bool(res.get('degraded')),
-                'action': None,
-            }, path=LEDGER_PATH)
+            # the probability distributions (the future fine-tuning corpus). Build inside
+            # the try for the reason given on /repair (CR-0022).
+            try:
+                ledger.append_record({
+                    'trace_id': tid, 'model': 'laya', 'op': 'decide',
+                    'input_redacted': True,
+                    'request': {'state': body.get('state'),
+                                'questions': _questions_summary(body.get('questions'))},
+                    'output': {'answers': res.get('answers') or {}},
+                    'confidence': _laya_confidence(res.get('answers')),
+                    'latency_ms': res.get('latency_ms'),
+                    'degraded': bool(res.get('degraded')),
+                    'action': None,
+                }, path=LEDGER_PATH)
+            except Exception as e:
+                sys.stderr.write('[LOCALMODELS] decide ledger skipped: %s: %s\n'
+                                 % (type(e).__name__, e))
             self._json(200, res); return
         if route == '/ledger':
             tid = body.get('trace_id')
             action = body.get('action')
             if not isinstance(tid, str) or not tid or not isinstance(action, str) or not action:
                 self._json(400, {"ok": False, "error": "trace_id + action required"}); return
+            # Server-side vocabulary check (CR-Nanites-harness-0006). The old gate was
+            # `isinstance(action, str) and action`, so "accepted " (trailing space) and
+            # "ACCEPTED" were written to the ledger. `_ledger_counts` ignores them, but
+            # `tools/tune_thresholds.py` keeps its OWN copy of this vocabulary, and the
+            # acceptance rate Phase 15's tuning rests on is computed from it: an unknown
+            # word one side ignores and the other folds in silently moves the measured
+            # rate. Refusing is the honest answer, and it is refused HERE rather than
+            # left to the reader.
+            #
+            # Validation is on the KEYS. `_LEDGER_ACTIONS` maps an action word to the
+            # folded counter it contributes to ('accepted_by_operator' -> 'accepted'),
+            # and it is the keys that are the vocabulary.
+            if action not in _LEDGER_ACTIONS:
+                self._json(400, {"ok": False,
+                                 "error": "unknown action %r; expected one of %s"
+                                          % (action, ', '.join(sorted(_LEDGER_ACTIONS)))}); return
             ok = ledger.append_record({'trace_id': tid, 'action': action,
                                        'note': body.get('note')}, path=LEDGER_PATH)
             self._json(200, {'ok': bool(ok)}); return

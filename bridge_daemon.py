@@ -451,10 +451,58 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get('Content-Length') or 0)
-        if n <= 0 or n > MAX_JSON_BYTES: return {}
-        try: return json.loads(self.rfile.read(n) or b'{}')
-        except json.JSONDecodeError: return {}
+        """Read the JSON body as a BOUND, CONTAINED read (CR-Nanites-harness-0021).
+
+        Returns (obj, err). `err` is None, or a (code, message) pair the caller
+        answers with verbatim. ONE shape, shared with bridge.py — do_POST below is
+        the only call site, and it refuses on it, so no route can be reached by a
+        body that was never contained.
+
+        Why each refusal is what it is:
+
+        * Content-Length absent, non-numeric or <= 0 => 400. `int()` used to be
+          unwrapped, so "abc" raised ValueError straight out of here into the
+          caller's handler — a dropped connection or a 500, i.e. a malformed request
+          could take a handler down. A guard that crashes is not a guard that refuses.
+        * Content-Length > MAX_JSON_BYTES => 413, not a silent {}. Silently coercing
+          an oversized body to {} meant the route RAN on an empty request and could
+          answer success-shaped for a request that was never read. 413 outranks the
+          404 below, so an oversized body is never routed.
+        * The READ itself is capped at MAX_JSON_BYTES bytes, and anything actually
+          delivered beyond that is 413. Capping only the DECLARED number leaves the
+          read itself trusting the client; this is the read-bound.
+        * Not valid JSON => 400, and valid JSON that is not an object => 400. A list
+          used to reach `b.get('path')` and raise AttributeError, killing the handler.
+
+        The length check happens BEFORE the read, so an over-limit body is never
+        buffered at all.
+        """
+        raw_len = self.headers.get('Content-Length')
+        if raw_len is None or not str(raw_len).strip():
+            return None, (400, 'request body required: Content-Length missing')
+        try:
+            n = int(str(raw_len).strip())
+        except (TypeError, ValueError):
+            return None, (400, 'invalid Content-Length header')
+        if n <= 0:
+            return None, (400, 'invalid Content-Length header')
+        if n > MAX_JSON_BYTES:
+            return None, (413, 'request exceeds %d byte limit' % MAX_JSON_BYTES)
+        try:
+            raw = self.rfile.read(min(n, MAX_JSON_BYTES + 1))
+        except Exception:
+            return None, (400, 'could not read request body')
+        if raw is None or len(raw) > MAX_JSON_BYTES:
+            return None, (413, 'request exceeds %d byte limit' % MAX_JSON_BYTES)
+        if not raw.strip():
+            return None, (400, 'request body required: empty body')
+        try:
+            obj = json.loads(raw.decode('utf-8', 'replace'))
+        except (json.JSONDecodeError, ValueError):
+            return None, (400, 'invalid JSON body')
+        if not isinstance(obj, dict):
+            return None, (400, 'request body must be a JSON object')
+        return obj, None
 
     def do_OPTIONS(self):
         # A preflight cannot carry the token's VALUE, so the token check is not
@@ -495,7 +543,14 @@ class Handler(BaseHTTPRequestHandler):
         if denied:
             self._json({'ok': False, 'error': denied}, 403, cors=False); return
         u = urlparse(self.path).path
-        b = self._body()
+        # ONE contained read, ONE refusal, ahead of routing. Every POST route below
+        # (/pick_directory /set_workdir /start /stop /install_autostart
+        # /remove_autostart) went through this single call site, so handling the
+        # refusal here covers all of them: 413 outranks the 404 for an unknown route,
+        # and a route is never reached by a body that was never contained.
+        b, berr = self._body()
+        if berr is not None:
+            self._json({'ok': False, 'error': berr[1]}, berr[0], cors=False); return
         if u == '/pick_directory':
             p = pick_directory_dialog()
             self._json({'ok': bool(p), 'path': p})
