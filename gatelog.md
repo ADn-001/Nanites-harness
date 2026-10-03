@@ -1,10 +1,10 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 22 — Sidecar request path and ledger: contain malformed input, bound growth, actually redact**
-(Phase 21 is DONE in PR #8, which targets PR #7's branch (`fix/phase20-compaction-data-loss`), NOT
-main. The chain is now #4 -> #5 -> #6 -> #7 -> #8, all five unmerged: merge in that order. Phase 22
-must branch from `fix/phase21-sw-offline-html` unless #8 has merged. `gh pr view 4 5 6 7 8`
-before starting.)
+Next phase to work on: **Phase 23 — Report a stream timeout as a timeout, and send the auth header the LM Studio probe omits**
+(Phase 22 is DONE in PR #9, which targets PR #8's branch (`fix/phase21-sw-offline-html`), NOT
+main. The chain is now #4 -> #5 -> #6 -> #7 -> #8 -> #9, all six unmerged: merge in that order.
+Phase 23 must branch from `fix/phase22-request-and-ledger-integrity` unless #9 has merged.
+`gh pr view 4 5 6 7 8 9` before starting.)
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1750,27 +1750,98 @@ Done = a failed script fetch surfaces as an honest error, never as a parse-failu
 ---
 
 ## Phase 22 — Sidecar request path and ledger: contain malformed input, bound growth, actually redact
-Status: **not started**
+Status: **DONE** — PR #9 (targets `fix/phase21-sw-offline-html`, NOT main; chain #4..#9, merge in order)
 Ticket: `TICKET-2026-10-01-sidecar-request-and-ledger-integrity` (CR-Nanites-harness-0021, 0022, 0025, 0006, 0004)
 
-Deliverable: the `n <= 0 or n > MAX` body form used in all three servers, the `int()` parse
-wrapped to return 400, and a byte cap during the read — a lying length is the whole attack, so
-declared length alone is not a bound (0021); candidate name extraction normalised to accept both
-the nested and flattened `function` shapes, with the ledger append in its own `try/except` so
-telemetry can never affect the response path (0022); `action` validated server-side against
-`_LEDGER_ACTIONS` so the daemon and `tools/tune_thresholds.py` cannot disagree (0006); size-based
-rotation in `append_record` with the size surfaced in `/health` (0006); `_ledger_tail` bounded by
-BYTES as well as lines, seeking backward from EOF (0025); the configured provider key actually
-passed to the redaction call, or the docstring corrected to stop asserting a rule no code path
-provides (0004).
-Gate: `test_e2e.py` asserts a negative and a non-numeric `Content-Length` are refused rather than
-read or dropped, a candidate with `{"function":"read_file"}` gets a clean response, an action
-outside the vocabulary is refused, an injected unknown action word does NOT land in the measured
-acceptance rate, rotation bounds the file, and a ~10-fat-record ledger does not defeat the
-`/health` read bound. **Order matters: this phase must land AFTER Phase 19**, which moves the same
-servers' request handling and already touches `bridge.py`/`bridge_daemon.py` body parsing — two
-agents must not edit those lines. Done = no malformed request hangs, drops or 500s a handler, and
-the acceptance rate Phase 15's tuning rests on cannot be silently depressed.
+Gate evidence: `python3 test_e2e.py` -> 277 checks, **0 FAILURES**; `npm run test:front` -> ALL GREEN;
+`tests/phase22_bridge_body_read.py` -> 0 FAILURES (24 checks); an independent 31-assertion live probe ->
+0 FAILURES; an independent mutation sweep caught 5 of 6 mutants.
+
+### Findings (Phase 22)
+
+**READ THIS BEFORE PHASE 23 — the three request-body servers now share ONE shape.**
+All three (`bridge.py` `_read_body`, `bridge_daemon.py` `_body`, the sidecar's
+`_read_body`) return `(obj, err)`. Refusals: non-numeric / negative / unusable length
+=> 400; `> MAX_JSON_BYTES` => 413 checked **before** the read so the body is never
+buffered; the read itself is capped. A route that needs a body must handle the tuple.
+`bridge_daemon.py`'s `_body()` has exactly ONE call site (`do_POST`), so all seven of
+its POST routes are covered — if you add a route, it inherits the refusal.
+
+**The three refusals are NOT interchangeable, and one of them is a trap.**
+Absent `Content-Length` and `Content-Length: 0` legitimately return `({}, None)` on the
+sidecar — those routes validate their own fields, so an empty body is a real request
+there. But `n > 0` with `len(raw) < n` is a **truncated** request and MUST be refused
+(`'truncated'`). Do not "simplify" the truncated branch away: the review found that
+returning `{}` there produced **HTTP 200 plus a written ledger record for a body that
+was never read** — the exact defect this phase exists to close, and the branch's own
+docstring claimed it was fixed. A short read is an I/O failure, not an empty body.
+
+**A docstring asserting a guarantee the code does not provide is worse than silence.**
+Three of this phase's own findings were that shape (CR-0004's rule 1, the rotation
+"no filename at all" claim, and the `_read_body` docstring). When you fix a defect,
+check whether the surrounding prose now promises more than the code delivers.
+
+**Rotation: `append_record` holds a module-level `threading.Lock` across the append AND
+the rotate decision.** Without it, rotation destroyed records another thread appended
+in between its size-read and its `os.replace`, while returning True. Measured: control
+arm (rotation disabled) 0/200 lost, armed arm **110/200 lost**. `_rotate_if_oversize`
+has NO internal lock guard — the caller contract is documented only, so a future direct
+caller bypassing `append_record` reintroduces the bug. Use `tempfile.mkstemp` in the
+target's directory (a FIXED temp name lets two rotations consume each other's file:
+one `os.replace` succeeds, the other gets `FileNotFoundError`, swallowed into a stderr
+note while the append reports success).
+
+**Rotation compacts IN PLACE, never to a `.1` sibling.** The phase-10 `lm_no_stray_files`
+check allows exactly `{local-models.jsonl, local-models-2.jsonl}`, so a third permanent
+name would break it. It does create one **short-lived** temp file and sweeps stale
+`target + '.rotating*'` on the next append, so a crash in the window before
+`os.replace` does not permanently break that invariant.
+
+**CR-0004: the daemon genuinely cannot redact the configured provider key, and there is
+no config path that would let it.** `grep -n api_key local_models/ledger.py`-level
+tracing plus `appcore.js`'s own comment ("`/repair` and `/ledger` requests carry NO
+Authorization header and never the provider API key") agree: the key lives in browser
+`settings.apiKey` and only ever goes to the *provider* endpoint via `authHeaders()`.
+The docstring now states the rule is NOT enforced rather than deleting it. **Do not
+"restore" rule 1 by threading a key into `append_record`** — there is nothing to pass.
+
+**CR-0006: the daemon's `_LEDGER_ACTIONS` and `tools/tune_thresholds.py`'s `KNOWN_ACTIONS`
+were already the same 6 words.** The defect was the ABSENCE of a guard, not a live
+disagreement — so this was locked with a test rather than "fixing" a non-bug. Validate
+on the dict's **KEYS** (the values are the folded counter names).
+
+**Candidate extraction: `_candidate_name` / `_candidate_names` are the ONLY sanctioned
+way.** `(c.get('function') or {}).get('name')` raises on `{"function": "read_file"}`,
+and because that expression is an ARGUMENT to `append_record` it evaluates before the
+call — so `append_record`'s own blanket `except` never runs and the exception escapes
+into the handler as a **dead connection, not a 500**. A tokenize-based test asserts no
+call site inlines the old assumption any more; if you add a candidate-extraction site,
+use the helper or that test goes red.
+
+**MUTATION NOTE (the one that escaped, and why it is not a test gap).** Removing
+`_ledger_tail`'s `min(window*2, LEDGER_TAIL_MAX_BYTES)` cap alone leaves the suite
+GREEN, because the loop has a SECOND guard (`at_ceiling = window >= LEDGER_TAIL_MAX_BYTES`
+as an exit condition). Mutating BOTH layers goes red. Recorded as defence-in-depth, not
+as a missing test — do not spend an hour re-deriving it. Ceiling is 512 KiB
+(`LEDGER_TAIL_MAX_BYTES`), chosen by measurement: 232 KB is needed for the phase-14
+2000-line guarantee, and a 4 MiB ceiling proved nothing because the fat fixture was
+only ~1 MB and never exceeded it.
+
+**A concurrency fixture must not make correct behaviour look like the bug.** The first
+LE-2 test seeded records that overflowed the retained window, so rotation CORRECTLY
+dropped them and the test failed on the fixed code. Seed a fat file to ARM rotation, and
+keep the records under test small enough to sit inside the retained window. Re-run the
+RED against the unfixed source once the fixture is right.
+
+**Cases that passed on their FIRST run** (pre-existing behaviour pinned as regression
+guards, NOT new coverage — do not re-claim them): the `_LEDGER_ACTIONS`/`KNOWN_ACTIONS`
+equality, the injected-unknown-word-vs-measured-rate check (the tool already filtered by
+`KNOWN_ACTIONS`), and the oversized-POST 413 on `bridge.py`.
+
+**NOT FIXED — inherited by Phase 23 or a later phase:** multi-process concurrency on one
+ledger path. The lock is in-process; two sidecar instances sharing a ledger can still
+lose records. `_sweep_stale_temp_files` also runs one extra `os.listdir` per ledger write
+on the request path (cheap — the directory holds <= 2 files — but not optimised).
 
 ### Findings
 
