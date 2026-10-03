@@ -7,7 +7,7 @@
 #                         write fresh bridge.py, optionally respawn
 #   POST /start | /stop   spawn | kill the worker
 #   GET  /status | /health
-import argparse, json, os, signal, socket, subprocess, sys, threading, time
+import argparse, hmac, json, os, secrets, signal, socket, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -15,6 +15,14 @@ DEFAULT_PORT   = 8930
 BRIDGE_PORT    = 8931
 BRIDGE_MARKER  = '# ==== COGITATOR BRIDGE — managed by bridge_daemon.py ===='
 MAX_JSON_BYTES = 1 * 1024 * 1024
+#: The Host header must name loopback. The whole value is split on the last
+#: colon and the NAME must equal one of these exactly, so neither
+#: "localhost.evil.example" nor "127.0.0.1.evil.example" can pass as
+#: "localhost". A missing Host is refused: HTTP/1.1 requires one, so its
+#: absence means a crafted request rather than a browser. The bracketed IPv6
+#: literal "[::1]" is handled separately in _host_allowed, because it carries
+#: its port inside the brackets and would not survive a naive split on ":".
+LOOPBACK_HOSTS = ('localhost', '127.0.0.1')
 
 # Every daemon route is privileged, so the Origin allow-list is enforced on
 # every GET and POST. Missing Origin = curl/native caller (allowed); null is
@@ -33,6 +41,30 @@ def origins_desc():
 _here = os.path.dirname(os.path.abspath(__file__))
 STATE = {'workdir': None, 'proc': None, 'bridge_port': BRIDGE_PORT, 'started_at': None}
 _lock = threading.RLock()
+#: The per-install token path. The spawned worker is handed the SAME path via
+#: --token-file, so one paste into the UI covers the daemon and the worker.
+TOKEN_PATH = os.path.join(_here, '.cogitator-token')
+TOKEN = ''
+
+
+def load_or_create_token(path):
+    """Per-install token, 0600. Read-or-create so the operator pastes it into the UI once."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(tok + '\n')
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return tok
 
 def log(msg):
     line = time.strftime('[%Y-%m-%d %H:%M:%S] ') + msg
@@ -75,22 +107,39 @@ def read_bridge_source():
 def bridge_supports_args(src):
     return ('--port' in src) and ('--root' in src)
 
+def expected_bridge_source():
+    """The daemon's own source with BRIDGE_MARKER forced onto LINE 1.
+
+    Unconditional, and line 1 rather than "somewhere in the first 4096 bytes":
+    the verify step must not depend on how much of the file a reader happened to
+    see, and a source that already carried the marker deep inside it must still
+    produce a file whose FIRST line is the marker (CR-Nanites-harness-0024).
+    """
+    src = read_bridge_source()
+    lines = src.splitlines(True)
+    while lines and lines[0].strip() == BRIDGE_MARKER:
+        lines.pop(0)
+    return BRIDGE_MARKER + '\n' + ''.join(lines)
+
 def valid_workdir(path):
     return (isinstance(path, str) and os.path.isabs(path)
             and os.path.isdir(path) and os.access(path, os.W_OK))
 
 def stop_bridge():
+    # CR-Nanites-harness-0023: takes _lock so /stop and /start are mutually exclusive
+    # with /set_workdir, which holds the same RLock around the whole rebind. It is an
+    # RLock, so set_workdir calling this is safe and is not a deadlock.
     with _lock:
         proc = STATE['proc']; STATE['proc'] = None; STATE['started_at'] = None
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate(); proc.wait(timeout=5)
-        except Exception:
-            try: proc.kill()
-            except Exception: pass
-        log('bridge worker stopped')
-        return True
-    return False
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate(); proc.wait(timeout=5)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+            log('bridge worker stopped')
+            return True
+        return False
 
 def scrub_old_bridge():
     wd = STATE.get('workdir')
@@ -109,53 +158,107 @@ def scrub_old_bridge():
         log('warning: could not scrub old bridge.py in %s: %s' % (wd, e))
 
 def write_bridge(workdir):
-    src = read_bridge_source()
-    if BRIDGE_MARKER not in src:
-        src = BRIDGE_MARKER + '\n' + src
     dest = os.path.join(workdir, 'bridge.py')
+    # Back up a foreign file FIRST, and never destroy what we find. A file the
+    # daemon itself wrote that the operator later edited is also not byte-equal
+    # to the source, so verify_or_plant_bridge re-plants it - and that edit is
+    # backed up here rather than lost (CR-Nanites-harness-0016).
     if os.path.exists(dest):
         try:
             with open(dest, 'r', encoding='utf-8', errors='replace') as f:
-                foreign = BRIDGE_MARKER not in f.read(4096)
+                on_disk = f.read()
         except OSError:
-            foreign = True
-        if foreign:
+            on_disk = ''
+        if on_disk != expected_bridge_source():
             bak = dest + '.cogitator-bak'
             n = 1
             while os.path.exists(bak):
                 n += 1; bak = dest + '.cogitator-bak%d' % n
             os.replace(dest, bak)
-            log('foreign bridge.py in %s backed up to %s (never destroyed)' % (workdir, bak))
-    with open(dest, 'w', encoding='utf-8') as f:
-        f.write(src)
+            log('existing bridge.py in %s backed up to %s (never destroyed)' % (workdir, bak))
+    src = expected_bridge_source()
+    # CR-Nanites-harness-0024: atomic. Write to a temp file in the SAME directory
+    # (os.replace is only atomic within one filesystem) and replace into position,
+    # so a crash mid-write can never leave a truncated bridge.py behind.
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=workdir,
+                                         delete=False, prefix='.cogitator-bridge-') as f:
+            tmp = f.name
+            f.write(src); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, dest)
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.remove(tmp)
+            except OSError: pass
     log('wrote bridge.py -> ' + dest)
     return dest
 
-def start_bridge():
-    if STATE['proc'] and STATE['proc'].poll() is None:
-        return False, 'already running'
-    if not STATE['workdir']:
-        return False, 'no working directory bound'
-    bridge_path = os.path.join(STATE['workdir'], 'bridge.py')
-    if not os.path.isfile(bridge_path):
-        write_bridge(STATE['workdir'])
-    argv = [sys.executable, bridge_path]
-    if bridge_supports_args(read_bridge_source()):
-        argv += ['--root', STATE['workdir'], '--port', str(STATE['bridge_port'])]
-    kwargs = dict(cwd=STATE['workdir'], stdout=subprocess.DEVNULL,
-                  stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-    if os.name == 'nt':
-        kwargs['creationflags'] = (getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-                                   | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    else:
-        kwargs['start_new_session'] = True
+def verify_or_plant_bridge(workdir):
+    """Never spawn a file the daemon did not write (CR-Nanites-harness-0016).
+
+    Returns (ok, msg). The on-disk file must be byte-equal to the daemon's own
+    source with BRIDGE_MARKER on line 1; anything else (missing, truncated,
+    tampered, hand-edited) is re-planted, with the old file backed up rather than
+    destroyed, and the message says so. `start_bridge` spawns only after this
+    returns ok, and spawns the path it just verified.
+    """
     try:
-        STATE['proc'] = subprocess.Popen(argv, **kwargs)
-        STATE['started_at'] = time.time()
-        log('bridge worker spawned (pid %d) in %s' % (STATE['proc'].pid, STATE['workdir']))
-        return True, 'spawned'
-    except OSError as e:
+        expected = expected_bridge_source()
+    except RuntimeError as e:
         return False, str(e)
+    dest = os.path.join(workdir, 'bridge.py')
+    reason = None
+    try:
+        with open(dest, 'r', encoding='utf-8', errors='replace') as f:
+            on_disk = f.read()
+    except OSError:
+        on_disk, reason = None, 'missing'
+    else:
+        if on_disk != expected:
+            reason = 'differs from the daemon source'
+        elif on_disk.splitlines()[:1] != [BRIDGE_MARKER]:
+            reason = 'BRIDGE_MARKER is not on line 1'
+    if reason is None:
+        return True, 'bridge.py verified against the daemon source'
+    write_bridge(workdir)
+    return True, 're-planted bridge.py in %s (%s); the previous file was backed up' % (workdir, reason)
+
+def start_bridge():
+    # CR-Nanites-harness-0023: holds _lock, so /start and /set_workdir are mutually
+    # exclusive and the daemon cannot end up bound to one directory while the live
+    # worker serves another. _lock is an RLock: set_workdir already holds it and
+    # calls this, which is safe precisely because it is reentrant.
+    with _lock:
+        if STATE['proc'] and STATE['proc'].poll() is None:
+            return False, 'already running'
+        if not STATE['workdir']:
+            return False, 'no working directory bound'
+        ok, vmsg = verify_or_plant_bridge(STATE['workdir'])
+        if not ok:
+            return False, vmsg
+        bridge_path = os.path.join(STATE['workdir'], 'bridge.py')
+        argv = [sys.executable, bridge_path]
+        if bridge_supports_args(read_bridge_source()):
+            argv += ['--root', STATE['workdir'], '--port', str(STATE['bridge_port'])]
+        # The worker shares the DAEMON's token file, so one paste in the UI covers
+        # the whole stack instead of two.
+        argv += ['--token-file', TOKEN_PATH]
+        kwargs = dict(cwd=STATE['workdir'], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        if os.name == 'nt':
+            kwargs['creationflags'] = (getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+                                       | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        else:
+            kwargs['start_new_session'] = True
+        try:
+            STATE['proc'] = subprocess.Popen(argv, **kwargs)
+            STATE['started_at'] = time.time()
+            log('bridge worker spawned (pid %d) in %s' % (STATE['proc'].pid, STATE['workdir']))
+            return True, 'spawned; ' + vmsg
+        except OSError as e:
+            return False, str(e)
 
 def set_workdir(path, autostart=True):
     # The full rebind sequence is atomic: another /set_workdir cannot interleave
@@ -256,13 +359,51 @@ def bridge_healthy():
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
+    def _host_allowed(self):
+        """The Host header must name loopback, with or without a port."""
+        host = (self.headers.get('Host') or '').strip().lower()
+        if not host:
+            # HTTP/1.1 requires a Host; its absence means a crafted request, not a browser.
+            return False
+        if host.startswith('['):
+            if host == '[::1]':
+                return True
+            return host.startswith('[::1]:') and host[6:].isdigit()
+        name, sep, port = host.partition(':')
+        if name not in LOOPBACK_HOSTS:
+            return False
+        return not sep or port.isdigit()
+
+    def _token_ok(self):
+        """Constant-time compare of X-Cogitator-Token against the per-install token.
+
+        Compare the ASCII-safe form: hmac.compare_digest raises TypeError on any
+        str holding a byte >= 0x80, and http.server decodes header bytes as
+        latin-1, so a malformed token would crash the gate instead of being
+        refused with a 403. See bridge.py for the full note.
+        """
+        sent = self.headers.get('X-Cogitator-Token') or ''
+        if not sent or not TOKEN:
+            return False
+        try:
+            return hmac.compare_digest(sent.encode('utf-8'), TOKEN.encode('utf-8'))
+        except (UnicodeError, TypeError):
+            return False
+
+    def _privileged(self):
+        """Every POST on the daemon is privileged; /health and /status are not."""
+        return self.command == 'POST'
+
     def _origin_allowed(self):
         if ALLOW_ANY_ORIGIN:
             return True
         origin = self.headers.get('Origin')
         if not origin:
-            # curl / native callers send no Origin at all.
-            return True
+            # Absent Origin on a PRIVILEGED route is refused (CR-Nanites-harness-0017):
+            # curl / native callers send none, and they must carry the token.
+            # GET /health and GET /status keep treating it as allowed, so the UI's
+            # status chip is alive before the operator has paired.
+            return not self._privileged()
         if origin == 'null':
             # Sandboxed iframe, data:/blob: document, or file:// page — any
             # hostile page can obtain an opaque origin. Opt-in only.
@@ -271,14 +412,40 @@ class Handler(BaseHTTPRequestHandler):
         return (low.startswith('http://localhost:') or low.startswith('http://127.0.0.1:')
                 or low in ('http://localhost', 'http://127.0.0.1'))
 
-    def _cors(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+    def _auth_gate(self):
+        """Return an error string when the request must be refused, else None.
 
-    def _json(self, obj, code=200):
+        The three checks are ANDed on a privileged route: a correct token never
+        buys a past a foreign Origin, and a local Origin never buys a past a
+        missing token.
+        """
+        if not self._host_allowed():
+            return 'host not permitted'
+        if self._privileged() and not self._token_ok():
+            return 'X-Cogitator-Token required'
+        if not self._origin_allowed():
+            return 'origin not permitted'
+        return None
+
+    def _cors(self, reflect=True):
+        """Reflect the SPECIFIC request Origin. Never `*`.
+
+        `reflect=False` on a refusal: a wildcard ACAO on a 403 is part of what
+        CR-Nanites-harness-0017 calls out, so no ACAO is emitted at all then.
+        ALLOW-Methods/ALLOW-HEADERS stay unconditional - they leak nothing and
+        the preflight needs them (X-Cogitator-Token especially, or the browser
+        refuses the real request and the UI breaks silently).
+        """
+        if reflect:
+            origin = self.headers.get('Origin')
+            if origin and self._origin_allowed():
+                self.send_header('Access-Control-Allow-Origin', origin)
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Cogitator-Token')
+
+    def _json(self, obj, code=200, cors=True):
         body = json.dumps(obj).encode()
-        self.send_response(code); self._cors()
+        self.send_response(code); self._cors(cors)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers(); self.wfile.write(body)
@@ -290,11 +457,19 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError: return {}
 
     def do_OPTIONS(self):
-        self.send_response(204); self._cors(); self.end_headers()
+        # A preflight cannot carry the token's VALUE, so the token check is not
+        # performed here - the real request is where it is enforced. The Host and
+        # Origin checks still gate the 204.
+        if not self._host_allowed():
+            self._json({'ok': False, 'error': 'host not permitted'}, 403, cors=False); return
+        if not self._origin_allowed():
+            self._json({'ok': False, 'error': 'origin not permitted'}, 403, cors=False); return
+        self.send_response(204); self._cors(True); self.end_headers()
 
     def do_GET(self):
-        if not self._origin_allowed():
-            self._json({'ok': False, 'error': 'origin not permitted'}, 403); return
+        denied = self._auth_gate()
+        if denied:
+            self._json({'ok': False, 'error': denied}, 403, cors=False); return
         u = urlparse(self.path).path
         if u == '/health':
             self._json({'ok': True, 'daemon': True, 'workdir': STATE['workdir'],
@@ -316,8 +491,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok': False, 'error': 'unknown route'}, 404)
 
     def do_POST(self):
-        if not self._origin_allowed():
-            self._json({'ok': False, 'error': 'origin not permitted'}, 403); return
+        denied = self._auth_gate()
+        if denied:
+            self._json({'ok': False, 'error': denied}, 403, cors=False); return
         u = urlparse(self.path).path
         b = self._body()
         if u == '/pick_directory':
@@ -349,7 +525,7 @@ def _cleanup():
 
 def main():
     import atexit
-    global ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN
+    global ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN, TOKEN, TOKEN_PATH
     atexit.register(_cleanup)
     if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
@@ -359,9 +535,11 @@ def main():
     ap.add_argument('--allow-file-origin', action='store_true', help='trust a null Origin (file:// page) — not recommended')
     ap.add_argument('--install-autostart', action='store_true', help='install the login autostart entry and exit')
     ap.add_argument('--remove-autostart', action='store_true', help='remove the login autostart entry and exit')
+    global TOKEN, TOKEN_PATH
     a = ap.parse_args()
     ALLOW_ANY_ORIGIN = a.allow_any_origin
     ALLOW_FILE_ORIGIN = a.allow_file_origin
+    TOKEN = load_or_create_token(TOKEN_PATH)
     port = a.port
     if a.install_autostart:
         print('autostart:', install_autostart()); return
@@ -370,6 +548,8 @@ def main():
     single_instance()
     log('daemon listening on http://127.0.0.1:%d' % port)
     log('  origins : %s' % origins_desc())
+    # The token itself is never logged - only where to read it from.
+    log('  token   : %s  (paste into the UI with: cat "%s")' % (TOKEN_PATH, TOKEN_PATH))
     srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     try:
         srv.serve_forever()
