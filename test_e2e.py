@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, shutil, subprocess, sys, tempfile, threading, time, urllib.request, urllib.error
+import json, os, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request, urllib.error
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 fails = []
@@ -9,22 +9,174 @@ def check(cond, msg):
     if not cond:
         fails.append(msg)
 
-def req(port, path, payload=None, origin=None, raw=None):
+AMBIENT = object()
+"""Sentinel: "use the token registered for this port".
+
+Phase 19 made X-Cogitator-Token mandatory on every privileged route. The
+pre-phase-19 call sites test something else entirely (git policy, jail escapes,
+needle salvage) and were written when no token existed, so rather than editing
+~60 call sites by hand each server registers its own token against its port
+below and `req()` sends it by default. Passing token=None explicitly still
+sends NO header — which is how the phase-19 cases assert the refusal, and how
+the pre-existing foreign-Origin cases still assert a 403 for the Origin reason.
+
+Phase 19 deliberately does NOT register its ports, so its "no token" cases stay
+honest: the negative direction cannot be satisfied by an ambient default.
+"""
+
+PORT_TOKENS = {}
+
+# The one allowed browser Origin the ambient default uses. Defined here rather
+# than beside the phase-19 block because _send() needs it at call time.
+P19_ORIGIN = 'http://localhost:8080'
+
+
+def register_port_token(port, token):
+    PORT_TOKENS[port] = token
+
+
+def read_server_token(path, deadline=15.0):
+    """Read a server's per-install token, waiting (bounded) for it to be created.
+
+    Phase 19 made the token mandatory on privileged routes, so every pre-phase-19
+    case needs the real one. The suite never invents a token: it reads the file the
+    server itself wrote, which is also why these cases stay honest - a fabricated
+    constant would pass nothing and fail everything.
+    """
+    end = time.time() + deadline
+    while time.time() < end:
+        try:
+            with open(path, encoding='utf-8') as f:
+                tok = f.read().strip()
+            if tok:
+                return tok
+        except OSError:
+            pass
+        time.sleep(0.2)
+    raise AssertionError('no token file at %s after %.0fs - the server never wrote one'
+                         % (path, deadline))
+
+
+def _send(port, path, payload=None, origin=None, raw=None, token=AMBIENT, host=None, method=None):
+    """One HTTP round-trip, returning (status, parsed_body, response_headers_lower).
+
+    `token` sets X-Cogitator-Token and `host` overrides Host. token=AMBIENT (the
+    default) resolves via PORT_TOKENS; token=None sends no header at all.
+    """
+    if token is AMBIENT:
+        token = PORT_TOKENS.get(port)
+        if origin is None:
+            # Phase 19 also made "no Origin header" mean REFUSED on a privileged
+            # route (that was CR-0017's actual hole). So the ambient default has
+            # to carry an allowed Origin too, or every pre-phase-19 rite would
+            # be refused for a reason it is not testing. An explicit origin=
+            # always wins, so the foreign-Origin cases keep asserting 403.
+            origin = P19_ORIGIN
     data = raw if raw is not None else (json.dumps(payload).encode() if payload is not None else None)
     headers = {'Content-Type': 'application/json'}
     if origin:
         headers['Origin'] = origin
-    r = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=data, headers=headers)
+    if token:
+        headers['X-Cogitator-Token'] = token
+    if host is not None:
+        headers['Host'] = host
+    r = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=data, headers=headers,
+                               method=method or ('POST' if data is not None else 'GET'))
     try:
         with urllib.request.urlopen(r, timeout=10) as resp:
             body = resp.read() or b'{}'
-            return resp.status, json.loads(body)
+            status = resp.status
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as e:
         body = e.read() or b'{}'
-        try:
-            return e.code, json.loads(body)
-        except json.JSONDecodeError:
-            return e.code, {'raw': body.decode('utf-8', 'replace')}
+        status = e.code
+        hdrs = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        obj = {'raw': body.decode('utf-8', 'replace')}
+    return status, obj, hdrs
+
+
+def req(port, path, payload=None, origin=None, raw=None, token=AMBIENT, host=None):
+    s, j, _ = _send(port, path, payload, origin, raw, token, host)
+    return s, j
+
+
+def req_cors(port, path, payload=None, origin=None, token=AMBIENT, host=None, method=None):
+    """Like req(), but also returns the response headers - CORS assertions need them."""
+    return _send(port, path, payload, origin, None, token, host, method)
+
+
+def req_absent_host(port, path, payload=None, token=None, origin=None, timeout=10):
+    """POST with NO Host header at all.
+
+    urllib always synthesises one, and HTTP/1.1 requires it, so a crafted
+    request that omits it can only be written by hand. This is the "absent Host
+    must be refused" half of the Host pin (spec section 3).
+    """
+    import socket
+    body = json.dumps(payload if payload is not None else {}).encode()
+    lines = ['POST %s HTTP/1.1' % path,
+             'Content-Type: application/json',
+             'Content-Length: %d' % len(body),
+             'Connection: close']
+    if token:
+        lines.append('X-Cogitator-Token: %s' % token)
+    if origin:
+        lines.append('Origin: %s' % origin)
+    wire = ('\r\n'.join(lines) + '\r\n\r\n').encode() + body
+    sock = socket.create_connection(('127.0.0.1', port), timeout=timeout)
+    try:
+        sock.sendall(wire)
+        chunks = []
+        while True:
+            part = sock.recv(65536)
+            if not part:
+                break
+            chunks.append(part)
+    finally:
+        sock.close()
+    head = b''.join(chunks).split(b'\r\n', 1)[0].decode('latin-1')
+    try:
+        return int(head.split()[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def req_non_ascii_token(port, path, payload=None, timeout=10):
+    """POST a token header containing bytes >= 0x80, via a raw socket.
+
+    urllib would encode the value as UTF-8 and the header would never arrive as
+    the single latin-1 char http.server decodes it to, so this has to be written
+    by hand. The point is the STATUS LINE: an auth check that raises drops the
+    connection, and -1 here is how that crash reports itself.
+    """
+    body = json.dumps(payload if payload is not None else {}).encode()
+    lines = ['POST %s HTTP/1.1' % path,
+             'Host: 127.0.0.1:%d' % port,
+             'Origin: http://localhost:8080',
+             'Content-Type: application/json',
+             'Content-Length: %d' % len(body),
+             'X-Cogitator-Token: caf%s-x' % chr(0xE9),   # 'e-acute', one latin-1 char
+             'Connection: close']
+    wire = ('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1') + body
+    sock = socket.create_connection(('127.0.0.1', port), timeout=timeout)
+    try:
+        sock.sendall(wire)
+        chunks = []
+        while True:
+            part = sock.recv(65536)
+            if not part:
+                break
+            chunks.append(part)
+    finally:
+        sock.close()
+    head = b''.join(chunks).split(b'\r\n', 1)[0].decode('latin-1')
+    try:
+        return int(head.split()[1])
+    except (IndexError, ValueError):
+        return -1                                 # no status line: the handler died
 
 # ---------------- bridge worker ----------------
 # PHASE 16: the bridge's git policy tables are the single source the frontend's policy is
@@ -41,6 +193,7 @@ port = 18931
 br = subprocess.Popen([sys.executable, os.path.join(BASE, 'bridge.py'), '--root', proj, '--port', str(port)],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(1.0)
+register_port_token(port, read_server_token(os.path.join(BASE, '.cogitator-token')))
 try:
     s, j = req(port, '/health'); check(s == 200 and j['ok'], 'bridge health')
     s, j = req(port, '/tools/execute', {'name': 'read_file', 'arguments': {'path': 'hello.py'}})
@@ -214,6 +367,7 @@ try:
     br2 = subprocess.Popen([sys.executable, os.path.join(BASE, 'bridge.py'), '--root', proj,
                             '--port', str(port2), '--allow-file-origin'],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    register_port_token(port2, read_server_token(os.path.join(BASE, '.cogitator-token')))
     try:
         time.sleep(1.0)
         try:
@@ -241,6 +395,7 @@ wd1, wd2 = tempfile.mkdtemp(prefix='cogwd1-'), tempfile.mkdtemp(prefix='cogwd2-'
 open(os.path.join(wd2, 'bridge.py'), 'w', encoding='utf-8').write('# user-authored bridge, NOT managed\nprint(1)\n')
 da = subprocess.Popen([sys.executable, os.path.join(BASE, 'bridge_daemon.py'), '--port', str(dport)],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+register_port_token(dport, read_server_token(os.path.join(BASE, '.cogitator-token')))
 time.sleep(1.0)
 try:
     s, j = req(dport, '/status'); check(s == 200 and j['ok'], 'daemon status')
@@ -339,6 +494,7 @@ lmledger = os.path.join(lmdir, 'local-models.jsonl')
 lmd = subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
                         '--port', str(lmport), '--ledger', lmledger, '--no-needle', '--no-laya'],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=lmdir)
+register_port_token(lmport, read_server_token(os.path.join(BASE, 'localmodels', '.cogitator-token')))
 time.sleep(1.0)
 try:
     def lm_health_shape():
@@ -367,6 +523,7 @@ try:
     lmd2 = subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
                              '--port', str(lmport2), '--ledger', lm2ledger, '--no-laya'],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=lmdir)
+    register_port_token(lmport2, read_server_token(os.path.join(BASE, 'localmodels', '.cogitator-token')))
     time.sleep(1.0)
     try:
         def lm_needle_enabled():
@@ -666,10 +823,12 @@ LAYA_STATE = {'utterance': 'write the cleaned log to out/final.log', 'tool': 'wr
 
 
 def laya_daemon(port, ledger_path, extra=(), env=None):
-    return subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+    p = subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
                              '--port', str(port), '--ledger', ledger_path] + list(extra),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             cwd=laya_dir, env=env)
+    register_port_token(port, read_server_token(os.path.join(BASE, 'localmodels', '.cogitator-token')))
+    return p
 
 
 def laya_stop(proc):
@@ -997,10 +1156,12 @@ SEL_TOOLS = [{'type': 'function',
 
 
 def sel_daemon(port, ledger_path, extra=(), env=None):
-    return subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+    p = subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
                              '--port', str(port), '--ledger', ledger_path] + list(extra),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             cwd=sel_dir, env=env)
+    register_port_token(port, read_server_token(os.path.join(BASE, 'localmodels', '.cogitator-token')))
+    return p
 
 
 def sel_stop(proc):
@@ -1949,6 +2110,7 @@ try:
             [sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
              '--port', str(port), '--ledger', led, '--no-needle', '--no-laya'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=d)
+        register_port_token(port, read_server_token(os.path.join(BASE, 'localmodels', '.cogitator-token')))
         try:
             time.sleep(1.2)
             req(port, '/repair', {'suspect': {'name': 'read-file', 'args': '{"path":"a.py"}'},
@@ -2754,6 +2916,7 @@ def p18_http_repair_with_weights():
         [sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
          '--port', str(port), '--ledger', os.path.join(d, 'l.jsonl')],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=d, env=env)
+    register_port_token(port, read_server_token(os.path.join(BASE, 'localmodels', '.cogitator-token')))
     try:
         deadline = time.time() + 15
         up = False
@@ -2805,6 +2968,608 @@ lm_probe('localmodels (phase18): a REAL daemon answers POST /repair with tuned w
 
 # Never leave the stub behind for a later phase to inherit silently.
 sys.modules.pop('needle', None)
+
+# =====================================================================
+# PHASE 19 — per-install auth token + Host pin + CORS-on-refusal +
+# daemon lifecycle (CR-Nanites-harness-0017, 0016, 0023, 0024)
+# =====================================================================
+#
+# Every case below is a real behavioural assertion against a real server
+# process, not a source-shape check. Three rules this block obeys:
+#
+#  * Each server is launched from a COPY in a temp dir. bridge_daemon.py
+#    writes bridge_daemon.pid and bridge_daemon.log NEXT TO ITSELF, so a
+#    suite that launched it in-place would litter the repo (finding 0008).
+#  * Every token is READ FROM THAT SERVER'S OWN TOKEN FILE. The suite knows
+#    the path because the suite chose the directory the server runs in, so
+#    the test never hardcodes a secret and never invents one.
+#  * Every live/concurrent case is bounded, so a deadlock FAILS the suite
+#    instead of stalling the run (phase 18's lesson).
+
+P19_WRONG_TOKEN = 'p19-not-the-token-' + 'x' * 40
+P19_BRIDGE_MARKER = '# ==== COGITATOR BRIDGE — managed by bridge_daemon.py ===='
+
+
+def p19_probe(msg, fn):
+    """Run one phase-19 case; an exception is a FAIL for that case, not an abort."""
+    try:
+        check(bool(fn()), msg)
+    except Exception as e:
+        check(False, '%s [%s: %s]' % (msg, type(e).__name__, e))
+
+
+def p19_wait_port(port, deadline=20.0):
+    """Wait for a server to accept connections. Bounded so a boot failure FAILS.
+
+    Also proves the port was FREE before we started: a phase that reuses a port
+    an earlier phase still holds never binds its own server, yet /health answers
+    from the leftover process and every case silently tests the wrong program.
+    `p19_assert_ports_free` is the real guard; this just confirms liveness.
+    """
+    end = time.time() + deadline
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:%d/health' % port, timeout=2) as r:
+                r.read()
+                return True
+        except urllib.error.HTTPError:
+            return True                      # a 403 is still a live server
+        except Exception:
+            time.sleep(0.2)
+    return False
+
+
+def p19_assert_ports_free(ports):
+    """Refuse to run a phase whose ports are already held.
+
+    Without this the collision is invisible: our own server exits with
+    'address already in use', someone else's answers, and the phase reports a
+    pass for behaviour it never exercised. This is the loud version of the same
+    failure, and it is the reason the 18970-18972 comment above exists.
+    """
+    for p in ports:
+        try:
+            s = socket.create_connection(('127.0.0.1', p), timeout=1)
+            s.close()
+            check(False, 'phase19: port %d was ALREADY IN USE before launch - another '
+                         'phase still owns it, so every case here would test that server '
+                         'instead of ours' % p)
+            return False
+        except OSError:
+            pass                             # nothing listening: the good case
+    return True
+
+
+def p19_read_token(path, label, deadline=15.0):
+    """Read a server's per-install token, waiting (bounded) for it to be created.
+
+    Returns None if the server never wrote one — which is itself the RED
+    signal, and is reported as a failure of its own below.
+    """
+    end = time.time() + deadline
+    tok = None
+    while time.time() < end:
+        try:
+            with open(path, encoding='utf-8') as f:
+                tok = f.read().strip()
+            if tok:
+                break
+        except OSError:
+            pass
+        time.sleep(0.2)
+    check(tok is not None, 'phase19 %s: created its per-install token file at %s'
+          % (label, os.path.basename(path)))
+    if tok is None:
+        return P19_WRONG_TOKEN              # placeholder: cases still run and still fail
+    check(len(tok) >= 32, 'phase19 %s: the token carries 32+ bytes of entropy' % label)
+    if hasattr(os, 'stat'):
+        mode = os.stat(path).st_mode & 0o777
+        check(mode == 0o600, 'phase19 %s: the token file is mode 0600, not %o' % (label, mode))
+    return tok
+
+
+def p19_expected_bridge(src):
+    """What bridge_daemon must write: its own source with BRIDGE_MARKER on line 1."""
+    if src.startswith(P19_BRIDGE_MARKER):
+        return src
+    return P19_BRIDGE_MARKER + '\n' + src
+
+
+def p19_stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+p19_servers = []
+
+# ---- the three servers, each from a temp-dir copy ---------------------
+# bridge worker: its own copy, so ITS token file lands in the temp dir too.
+p19_bdir = tempfile.mkdtemp(prefix='cogp19-bridge-')
+p19_proj = tempfile.mkdtemp(prefix='cogp19-proj-')
+with open(os.path.join(p19_proj, 'hello.py'), 'w', encoding='utf-8') as f:
+    f.write('print("phase19")\n')
+shutil.copy2(os.path.join(BASE, 'bridge.py'), os.path.join(p19_bdir, 'bridge.py'))
+# Ports are 18970-18972 on purpose. The obvious choice (18940-18942) is
+# ALREADY TAKEN by phase 13/14 above (laya_port_f, laya_port_g, sel_port_a),
+# and the collisions were silent: the phase-19 sidecar never bound, so
+# p19_wait_port() saw a live server and every case was answered by a leftover
+# phase-14 daemon on the same port. Two of those cases went red only after an
+# unrelated edit changed timing. A port that another phase still holds is a
+# collision you cannot see from the phase that owns it.
+p19_bport = 18970
+
+# supervisor: bridge_daemon.py AND bridge.py together, because the daemon
+# refuses to spawn a bridge.py it cannot find next to itself.
+p19_ddir = tempfile.mkdtemp(prefix='cogp19-daemon-')
+shutil.copy2(os.path.join(BASE, 'bridge_daemon.py'), os.path.join(p19_ddir, 'bridge_daemon.py'))
+shutil.copy2(os.path.join(BASE, 'bridge.py'), os.path.join(p19_ddir, 'bridge.py'))
+p19_dport = 18971
+
+# sidecar: launched from the repo (its token file is specified as living in
+# localmodels/ next to the script), but its runtime state is all in a temp dir.
+p19_ldir = tempfile.mkdtemp(prefix='cogp19-lm-')
+p19_lport = 18972
+p19_ledger = os.path.join(p19_ldir, 'local-models.jsonl')
+
+# All three ports are declared BEFORE anything launches, so this guard can see
+# all of them. A collision is silent otherwise (see p19_assert_ports_free).
+p19_assert_ports_free([p19_bport, p19_dport, p19_lport])
+
+p19_bproc = subprocess.Popen(
+    [sys.executable, os.path.join(p19_bdir, 'bridge.py'), '--root', p19_proj, '--port', str(p19_bport)],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=p19_bdir)
+p19_servers.append(p19_bproc)
+
+p19_dproc = subprocess.Popen(
+    [sys.executable, os.path.join(p19_ddir, 'bridge_daemon.py'), '--port', str(p19_dport)],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=p19_ddir)
+p19_servers.append(p19_dproc)
+
+p19_lproc = subprocess.Popen(
+    [sys.executable, os.path.join(BASE, 'localmodels', 'local_models_daemon.py'),
+     '--port', str(p19_lport), '--ledger', p19_ledger, '--no-needle', '--no-laya'],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=p19_ldir)
+p19_servers.append(p19_lproc)
+
+P19_SUSPECT = {'name': 'read-file', 'arguments': '{"path": "a.py"}'}
+P19_CANDIDATES = [{'type': 'function',
+                   'function': {'name': 'read_file', 'description': 'Read a file.',
+                                'parameters': {'type': 'object',
+                                               'properties': {'path': {'type': 'string'}},
+                                               'required': ['path']}}}]
+
+if sys.platform == 'win32':
+    p19_autostart_entry = None
+elif sys.platform == 'darwin':
+    p19_autostart_entry = os.path.expanduser('~/Library/LaunchAgents/com.cogitator.CogitatorBridgeDaemon.plist')
+else:
+    p19_autostart_entry = os.path.expanduser('~/.config/autostart/CogitatorBridgeDaemon.desktop')
+
+try:
+    p19_wait_port(p19_bport)
+    p19_wait_port(p19_dport)
+    p19_wait_port(p19_lport)
+
+    p19_btok = p19_read_token(os.path.join(p19_bdir, '.cogitator-token'), 'bridge worker')
+    p19_dtok = p19_read_token(os.path.join(p19_ddir, '.cogitator-token'), 'bridge_daemon')
+    p19_ltok = p19_read_token(os.path.join(BASE, 'localmodels', '.cogitator-token'), 'local_models_daemon')
+
+    # ---------------- 1-6: the bridge's privileged route --------------
+    def p19_bridge_read():
+        s, j = req(p19_bport, '/tools/execute',
+                   {'name': 'read_file', 'arguments': {'path': 'hello.py'}})
+        return s, j
+    p19_probe('phase19 bridge: POST /tools/execute with NO token and NO Origin => 403',
+              lambda: p19_bridge_read()[0] == 403)
+    p19_probe('phase19 bridge: POST /tools/execute with NO token but a localhost Origin => 403 '
+              '(the gate: a privileged route is refused even from loopback)',
+              lambda: req(p19_bport, '/tools/execute',
+                          {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                          origin=P19_ORIGIN)[0] == 403)
+    p19_probe('phase19 bridge: POST /tools/execute with the RIGHT token and an allowed Origin => 200',
+              lambda: req(p19_bport, '/tools/execute',
+                          {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                          origin=P19_ORIGIN, token=p19_btok)[0] == 200)
+    # Spec section 4: on a privileged route an ABSENT Origin is refused, even
+    # with the right token. This is the deliberate behaviour change of the
+    # phase (the `if not origin: return True` hole). Asserted explicitly
+    # because it is the single line that makes the whole token gate meaningful.
+    p19_probe('phase19 bridge: POST /tools/execute with the RIGHT token but NO Origin => 403 '
+              '(absent Origin is refused on a privileged route)',
+              lambda: req(p19_bport, '/tools/execute',
+                          {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                          token=p19_btok)[0] == 403)
+    p19_probe('phase19 bridge: POST /tools/execute with a WRONG token => 403',
+              lambda: req(p19_bport, '/tools/execute',
+                          {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                          origin=P19_ORIGIN, token=P19_WRONG_TOKEN)[0] == 403)
+    p19_probe('phase19 bridge: the RIGHT token plus a FOREIGN Origin => 403 '
+              '(the token does not buy past the Origin check — both must hold)',
+              lambda: req(p19_bport, '/tools/execute',
+                          {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                          origin='https://evil.example.com', token=p19_btok)[0] == 403)
+    p19_probe('phase19 bridge: GET /health with NO token => 200 (non-privileged route stays open, '
+              'so the UI status chip is alive before pairing)',
+              lambda: req(p19_bport, '/health', origin=P19_ORIGIN)[0] == 200)
+
+    # ---------------- 7-9: the daemon's privileged routes --------------
+    p19_atk_wd = tempfile.mkdtemp(prefix='cogp19-atkwd-')
+
+    def p19_daemon_set_workdir_no_token():
+        s, j = req(p19_dport, '/set_workdir', {'path': p19_atk_wd, 'autostart': True})
+        # The negative side effect, not just the status code: a 403 that still
+        # wrote bridge.py would pass a status-only check, and the write is the
+        # whole finding.
+        return s == 403 and not os.path.exists(os.path.join(p19_atk_wd, 'bridge.py'))
+    p19_probe('phase19 daemon: POST /set_workdir with NO token => 403 AND no bridge.py written '
+              'to the target directory', p19_daemon_set_workdir_no_token)
+
+    def p19_daemon_autostart_no_token():
+        try:
+            s, j = req(p19_dport, '/install_autostart', {})
+            if p19_autostart_entry and os.path.exists(p19_autostart_entry):
+                return False, s, 'an autostart entry WAS created'
+            return s == 403, s, 'no entry created'
+        finally:
+            # The RED run really does reach install_autostart on an
+            # unimplemented daemon, so clean up after ourselves unconditionally.
+            if p19_autostart_entry and os.path.exists(p19_autostart_entry):
+                try:
+                    os.remove(p19_autostart_entry)
+                except OSError:
+                    pass
+    _ok, _s, _why = (None, None, None)
+    try:
+        _r = p19_daemon_autostart_no_token()
+        _ok, _s, _why = _r
+    except Exception as e:
+        _ok, _s, _why = False, 'exception', '%s: %s' % (type(e).__name__, e)
+    check(bool(_ok), 'phase19 daemon: POST /install_autostart with NO token => 403 AND no '
+                    'autostart entry created (answered %s; %s)' % (_s, _why))
+
+    p19_wd_ok = tempfile.mkdtemp(prefix='cogp19-wdok-')
+    p19_probe('phase19 daemon: POST /set_workdir with the RIGHT token => 200',
+              lambda: req(p19_dport, '/set_workdir', {'path': p19_wd_ok, 'autostart': False},
+                          origin=P19_ORIGIN, token=p19_dtok)[0] == 200)
+
+    # ---------------- 10-11: the sidecar's privileged / non-privileged ----
+    p19_probe('phase19 localmodels: POST /repair with NO token => 403',
+              lambda: req(p19_lport, '/repair',
+                          {'suspect': P19_SUSPECT, 'candidates': P19_CANDIDATES},
+                          origin=P19_ORIGIN)[0] == 403)
+    p19_probe('phase19 localmodels: GET /health with NO token => 200',
+              lambda: req(p19_lport, '/health', origin=P19_ORIGIN)[0] == 200)
+
+    # ---------------- a malformed token must be REFUSED, not crash the gate --
+    # hmac.compare_digest refuses to compare str containing non-ASCII, and
+    # http.server decodes header bytes as latin-1, so a single byte >= 0x80 in
+    # the token raised TypeError inside the auth check. The request was refused
+    # in the sense that nothing was served, but the CLIENT GOT NO RESPONSE: an
+    # unauthenticated caller could drop the connection on every server. A guard
+    # that crashes is not a guard that refuses - the status line is the assertion,
+    # and -1 (no status line at all) is how the crash shows up here.
+    for _label, _port, _path in (('bridge', p19_bport, '/tools/execute'),
+                                 ('daemon', p19_dport, '/stop'),
+                                 ('localmodels', p19_lport, '/repair')):
+        p19_probe('phase19 %s: a non-ASCII token is REFUSED with a status line, '
+                  'not a dropped connection' % _label,
+                  lambda _p=_port, _pa=_path: req_non_ascii_token(
+                      _p, _pa, {'name': 'read_file', 'arguments': {'path': 'hello.py'}}
+                      if _pa == '/tools/execute' else {}) == 403)
+
+    # ---------------- 12-13: the Host pin, on all three servers --------
+    # The right token is sent on every one of these, so the ONLY thing that can
+    # produce a 403 is the Host. A Host pin that also demanded a wrong token
+    # would pass these cases for the wrong reason.
+    p19_host_cases = (
+        ('bridge', p19_bport, '/tools/execute',
+         {'name': 'read_file', 'arguments': {'path': 'hello.py'}}, p19_btok),
+        ('daemon', p19_dport, '/stop', {}, p19_dtok),
+        ('localmodels', p19_lport, '/repair',
+         {'suspect': P19_SUSPECT, 'candidates': P19_CANDIDATES}, p19_ltok),
+    )
+    for label, prt, path, payload, tok in p19_host_cases:
+        p19_probe('phase19 %s: Host pin — privileged route with the RIGHT token and '
+                  'Host: evil.example.com => 403' % label,
+                  lambda prt=prt, path=path, payload=payload, tok=tok:
+                  req(prt, path, payload, origin=P19_ORIGIN, token=tok,
+                      host='evil.example.com')[0] == 403)
+        p19_probe('phase19 %s: Host pin — privileged route with the RIGHT token and NO Host '
+                  'header at all => 403 (a crafted request, never a browser)' % label,
+                  lambda prt=prt, path=path, payload=payload, tok=tok:
+                  req_absent_host(prt, path, payload=payload, token=tok,
+                                  origin=P19_ORIGIN) == 403)
+    # Positive half: the loopback forms the pin must ACCEPT, or the pin is just
+    # a ban on everything.
+    p19_probe('phase19 bridge: Host pin — Host: localhost:PORT with the right token is accepted',
+              lambda: req(p19_bport, '/tools/execute',
+                          {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                          origin=P19_ORIGIN, token=p19_btok,
+                          host='localhost:%d' % p19_bport)[0] != 403)
+    p19_probe('phase19 bridge: Host pin — Host: 127.0.0.1:PORT with the right token is accepted',
+              lambda: req(p19_bport, '/tools/execute',
+                          {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                          origin=P19_ORIGIN, token=p19_btok,
+                          host='127.0.0.1:%d' % p19_bport)[0] != 403)
+    p19_probe('phase19 daemon: Host pin — Host: localhost:PORT with the right token is accepted',
+              lambda: req(p19_dport, '/stop', {}, origin=P19_ORIGIN, token=p19_dtok,
+                          host='localhost:%d' % p19_dport)[0] != 403)
+    p19_probe('phase19 localmodels: Host pin — Host: 127.0.0.1:PORT with the right token is accepted',
+              lambda: req(p19_lport, '/repair',
+                          {'suspect': P19_SUSPECT, 'candidates': P19_CANDIDATES},
+                          origin=P19_ORIGIN, token=p19_ltok,
+                          host='127.0.0.1:%d' % p19_lport)[0] != 403)
+
+    # ---------------- 14: _cors stops lying on a refusal ---------------
+    # The load-bearing half: a refusal must carry NO Access-Control-Allow-Origin.
+    # A wildcard ACAO on a 403 is part of what CR-0017 calls out.
+    def p19_cors_absent_on_refusal():
+        s, j, h = req_cors(p19_bport, '/tools/execute',
+                           {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                           origin=P19_ORIGIN)
+        return s == 403 and 'access-control-allow-origin' not in h
+    p19_probe('phase19 bridge: a 403 refusal carries NO Access-Control-Allow-Origin header at all',
+              p19_cors_absent_on_refusal)
+    p19_probe('phase19 daemon: a 403 refusal carries NO Access-Control-Allow-Origin header at all',
+              lambda: (lambda r: r[0] == 403 and 'access-control-allow-origin' not in r[2])(
+                  req_cors(p19_dport, '/set_workdir', {'path': p19_atk_wd}, origin=P19_ORIGIN)))
+    p19_probe('phase19 localmodels: a 403 refusal carries NO Access-Control-Allow-Origin header at all',
+              lambda: (lambda r: r[0] == 403 and 'access-control-allow-origin' not in r[2])(
+                  req_cors(p19_lport, '/repair',
+                           {'suspect': P19_SUSPECT, 'candidates': P19_CANDIDATES},
+                           origin=P19_ORIGIN)))
+
+    def p19_cors_reflects():
+        s, j, h = req_cors(p19_bport, '/tools/execute',
+                           {'name': 'read_file', 'arguments': {'path': 'hello.py'}},
+                           origin=P19_ORIGIN, token=p19_btok)
+        acao = h.get('access-control-allow-origin')
+        return s == 200 and acao is not None and acao != '*' and acao == P19_ORIGIN
+    p19_probe('phase19 bridge: an ALLOWED response reflects the specific Origin, never `*`',
+              p19_cors_reflects)
+
+    # The header the UI needs: without X-Cogitator-Token in Allow-Headers the
+    # browser preflight fails and the product breaks while every other test
+    # stays green (spec section 2 calls this load-bearing).
+    def p19_preflight():
+        s, j, h = req_cors(p19_bport, '/tools/execute', origin=P19_ORIGIN,
+                           token=p19_btok, method='OPTIONS')
+        acao = h.get('access-control-allow-origin')
+        allow = (h.get('access-control-allow-headers') or '').lower()
+        return (s == 204 and acao is not None and acao != '*' and acao == P19_ORIGIN
+                and 'x-cogitator-token' in allow)
+    p19_probe('phase19 bridge: OPTIONS preflight answers 204, reflects the Origin, and lists '
+              'X-Cogitator-Token in Access-Control-Allow-Headers', p19_preflight)
+
+    # ---------------- 15-17: daemon lifecycle -------------------------
+    # CR-0016: never spawn a file the daemon did not write. The planted
+    # bridge.py has an OBSERVABLE side effect (it writes PWNED into its own
+    # cwd), so "the planted code never ran" is asserted as a FILE, not a
+    # status code — a daemon that re-plants and then still spawns the tampered
+    # copy would pass a message-only assertion.
+    p19_tamper_wd = tempfile.mkdtemp(prefix='cogp19-tamper-')
+    p19_src = open(os.path.join(p19_ddir, 'bridge.py'), encoding='utf-8').read()
+    p19_expected = p19_expected_bridge(p19_src)
+    p19_tampered = ('import os, time\n'
+                    'open(os.path.join(os.getcwd(), "PWNED"), "w").write("x")\n'
+                    'time.sleep(5)\n')
+
+    def p19_setup_tamper():
+        # Bind without autostart, so nothing is running when the file is planted.
+        if req(p19_dport, '/set_workdir', {'path': p19_tamper_wd, 'autostart': False},
+               origin=P19_ORIGIN, token=p19_dtok)[0] != 200:
+            return False
+        req(p19_dport, '/stop', {}, origin=P19_ORIGIN, token=p19_dtok)
+        with open(os.path.join(p19_tamper_wd, 'bridge.py'), 'w', encoding='utf-8') as f:
+            f.write(p19_tampered)
+        return True
+
+    p19_probe('phase19 daemon: staged a tampered bridge.py in the bound workdir', p19_setup_tamper)
+
+    p19_start_result = {}
+
+    def p19_do_start():
+        p19_start_result['resp'] = req(p19_dport, '/start', {}, origin=P19_ORIGIN, token=p19_dtok)
+        return True
+    p19_probe('phase19 daemon: POST /start over a tampered bridge.py answered', p19_do_start)
+    # Give a wrongly-spawned planted process time to drop its sentinel.
+    time.sleep(1.2)
+
+    def p19_cr0016_replanted():
+        s, j = p19_start_result.get('resp', (0, {}))
+        return s == 200 and 'plant' in json.dumps(j).lower()
+    p19_probe('phase19 daemon [CR-0016]: /start over a tampered bridge.py says it re-planted',
+              p19_cr0016_replanted)
+    p19_probe('phase19 daemon [CR-0016]: the PLANTED code never ran (no PWNED sentinel in the '
+              'workdir) — asserted as the file, not the status code',
+              lambda: not os.path.exists(os.path.join(p19_tamper_wd, 'PWNED')))
+    p19_probe('phase19 daemon [CR-0016]: the on-disk bridge.py is byte-equal to the daemon\'s own '
+              'source after the re-plant',
+              lambda: open(os.path.join(p19_tamper_wd, 'bridge.py'), encoding='utf-8').read()
+                      == p19_expected)
+    p19_probe('phase19 daemon [CR-0016]: the tampered file was BACKED UP, never destroyed',
+              lambda: os.path.exists(os.path.join(p19_tamper_wd, 'bridge.py.cogitator-bak')))
+
+    # CR-0024: the marker is LINE 1 — not "within the first 4096 bytes", which
+    # is the weaker property the old code was checked against.
+    def p19_marker_line_one():
+        with open(os.path.join(p19_tamper_wd, 'bridge.py'), encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        return bool(lines) and P19_BRIDGE_MARKER in lines[0]
+    p19_probe('phase19 daemon [CR-0024]: BRIDGE_MARKER is on LINE 1 of the written bridge.py',
+              p19_marker_line_one)
+
+    # CR-0023: /set_workdir and /start must be mutually exclusive, or the
+    # daemon ends up bound to one directory while the live worker serves
+    # another. The assertion is the INVARIANT — the two sources agree — not
+    # which of the two racing requests won.
+    p19_race_wd_a = tempfile.mkdtemp(prefix='cogp19-raceA-')
+    p19_race_wd_b = tempfile.mkdtemp(prefix='cogp19-raceB-')
+
+    def p19_wait_port_free(bp, deadline=10.0):
+        """Wait until nothing accepts on the daemon's bridge_port.
+
+        The daemon's bridge_port is fixed (no CLI flag), so a retry issued while
+        the previous attempt's worker is still dying races it for the same port:
+        the new worker loses the bind, exits, and the attempt looks like a daemon
+        defect when it is really a port collision created by the retry itself.
+        """
+        import socket as _s
+        end = time.time() + deadline
+        while time.time() < end:
+            try:
+                c = _s.create_connection(('127.0.0.1', bp), timeout=1)
+                c.close()
+                time.sleep(0.3)
+            except OSError:
+                return True
+        return False
+
+    def p19_do_race():
+        # Two shapes, both required, because they exercise DIFFERENT things.
+        #
+        # 'spec' — bind A with autostart=True, then race /set_workdir(B) against
+        #   /start, exactly as the spec describes. Measured on the UNLOCKED daemon
+        #   this shape is mostly a NO-OP: a worker is already up, so /start
+        #   short-circuits to 'already running' (400) and never touches STATE.
+        #   It passes against broken code, so it cannot be the only shape.
+        #
+        # 'cold' — bind A with autostart=False and no worker running, so /start
+        #   does REAL work and genuinely interleaves with set_workdir's
+        #   stop/write/spawn. This is where CR-0023 bites: measured over 8 trials
+        #   each, the unlocked daemon ends the cold race with NO live worker 6
+        #   times out of 8, while the same daemon with _lock taken in
+        #   start_bridge is 8 of 8 clean.
+        #
+        # Both shapes assert the SAME invariant (the two sources agree); they
+        # differ only in how much work /start has to do.
+        #
+        # Retried up to 5 times per shape, as the spec requires, but the two
+        # failure modes are NOT alike:
+        #   running=True but not yet healthy -> the worker is still binding.
+        #     Retryable; that is the flakiness the retry budget is for.
+        #   running=False                     -> the daemon was told to serve a
+        #     directory and nothing is serving it. Retrying cannot fix that.
+        outcomes = []
+        for shape in ('spec', 'cold'):
+            verdict = 'no attempt was made'
+            for attempt in range(5):
+                req(p19_dport, '/stop', {}, origin=P19_ORIGIN, token=p19_dtok)
+                bport_try = req(p19_dport, '/status', origin=P19_ORIGIN)[1].get('bridge_port') or 8931
+                p19_wait_port_free(bport_try)
+                autostart = (shape == 'spec')
+                s, j = req(p19_dport, '/set_workdir', {'path': p19_race_wd_a, 'autostart': autostart},
+                           origin=P19_ORIGIN, token=p19_dtok)
+                if s != 200:
+                    verdict = 'could not bind workdir A (answered %s: %r)' % (s, j)
+                    print('   phase19 race[%s]: %s; retrying' % (shape, verdict))
+                    time.sleep(1.0)
+                    continue
+                deadline = time.time() + 15
+                st = {}
+                while autostart and time.time() < deadline:
+                    st = req(p19_dport, '/status', origin=P19_ORIGIN)[1]
+                    if st.get('bridge_running') and st.get('bridge_healthy'):
+                        break
+                    time.sleep(0.3)
+
+                results = {}
+                barrier = threading.Barrier(2, timeout=30)
+
+                def rebind():
+                    barrier.wait()
+                    results['set_workdir'] = req(p19_dport, '/set_workdir',
+                                                 {'path': p19_race_wd_b, 'autostart': True},
+                                                 origin=P19_ORIGIN, token=p19_dtok)
+                def restart():
+                    barrier.wait()
+                    results['start'] = req(p19_dport, '/start', {}, origin=P19_ORIGIN, token=p19_dtok)
+
+                threads = [threading.Thread(target=rebind), threading.Thread(target=restart)]
+                for t in threads:
+                    t.daemon = True
+                    t.start()
+                # ALWAYS join, with a bound: a wedge here must fail the suite, not hang it.
+                for t in threads:
+                    t.join(timeout=45)
+                alive = [t for t in threads if t.is_alive()]
+                if alive:
+                    verdict = ('%d thread(s) still alive after 45s - a /set_workdir or /start '
+                               'never returned' % len(alive))
+                    print('   phase19 race[%s]: %s' % (shape, verdict))
+                    return False
+                print('   phase19 race[%s]: /set_workdir => %s, /start => %s'
+                      % (shape, results.get('set_workdir', ('?',))[0],
+                         results.get('start', ('?',))[0]))
+
+                deadline = time.time() + 10
+                st = {}
+                while time.time() < deadline:
+                    st = req(p19_dport, '/status', origin=P19_ORIGIN)[1]
+                    if st.get('bridge_running') and st.get('bridge_healthy'):
+                        break
+                    if not st.get('bridge_running'):
+                        break
+                    time.sleep(0.4)
+
+                bport = st.get('bridge_port')
+                if not st.get('bridge_running'):
+                    verdict = ('the daemon completed the race bound to %s with NO live worker '
+                               '(bridge_running=False), although /set_workdir was asked to '
+                               'autostart and /start also ran — the racing pair tore the '
+                               'worker down after recording it'
+                               % st.get('workdir'))
+                    print('   phase19 race[%s]: %s' % (shape, verdict))
+                    return False
+                if not bport:
+                    verdict = 'the daemon reports a running worker but no bridge_port'
+                    print('   phase19 race[%s]: %s; retrying' % (shape, verdict))
+                    time.sleep(1.0)
+                    continue
+                try:
+                    hs, hj = req(bport, '/health', origin=P19_ORIGIN)
+                except Exception as e:
+                    verdict = ('the daemon claims a worker on %s but nothing answers /health '
+                               'there (%s: %s)' % (bport, type(e).__name__, e))
+                    print('   phase19 race[%s]: %s; retrying' % (shape, verdict))
+                    time.sleep(1.0)
+                    continue
+                if hs != 200 or 'root' not in hj:
+                    verdict = 'the worker on %s answered /health with %s' % (bport, hs)
+                    print('   phase19 race[%s]: %s; retrying' % (shape, verdict))
+                    time.sleep(1.0)
+                    continue
+                print('   phase19 race[%s]: the daemon says workdir %s, the LIVE worker on %s '
+                      'says root %s' % (shape, st.get('workdir'), bport, hj.get('root')))
+                if st.get('workdir') != hj.get('root'):
+                    verdict = ('the daemon is bound to %s while the live worker on %s serves %s'
+                               % (st.get('workdir'), bport, hj.get('root')))
+                    print('   phase19 race[%s]: DISAGREEMENT - %s' % (shape, verdict))
+                    return False
+                outcomes.append('%s: agreed' % shape)
+                break
+            else:
+                print('   phase19 race[%s]: gave up after 5 attempts; last outcome: %s'
+                      % (shape, verdict))
+                return False
+        print('   phase19 race: %s' % ' | '.join(outcomes))
+        return True
+    p19_probe('phase19 daemon [CR-0023]: after a racing /set_workdir + /start, the daemon\'s '
+              'workdir equals the LIVE worker\'s own root (the two sources agree)', p19_do_race)
+finally:
+    for _p in p19_servers:
+        try:
+            p19_stop(_p)
+        except Exception:
+            pass
+    if p19_autostart_entry and os.path.exists(p19_autostart_entry):
+        try:
+            os.remove(p19_autostart_entry)
+        except OSError:
+            pass
 
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)

@@ -19,3 +19,10 @@ __pycache__/
 # only ever accumulated e2e-harness churn; no code reads it. `git rm --cached` so the
 # file stays on disk (the daemon appends to it) while the repo stops carrying it.
 *.log
+
+# PHASE 19: the per-install daemon auth tokens. These are SECRETS (32+ bytes of
+# entropy, mode 0600) that the operator pastes into the UI once. Each server creates
+# its own next to itself, so both paths are ignored — committing either one would
+# hand every checkout of this repo a working privileged token.
+.cogitator-token
+localmodels/.cogitator-token
