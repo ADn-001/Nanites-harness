@@ -300,6 +300,65 @@ try:
         check(flag in gen, 'generator emits the bridge output flag: ' + flag)
     for sub in sorted(bridge_mod.GIT_REFUSED_WRITE):
         check(("'%s'" % sub) in gen, 'generator emits the refused-write subcommand: ' + sub)
+    # ---- PHASE 21: the service worker's asset digests are GENERATED (CR-0007) ----
+    #
+    # sw.js's CACHE is derived from ASSET_DIGESTS, which tools/gen_sw_cache.py emits
+    # from the real precached files. Without this check a changed asset ships with a
+    # stale digest, the cache name does not change, and the browser keeps serving the
+    # OLD asset from cache indefinitely — cache-first, no revalidation, no TTL — with
+    # every other suite still green. That is the exact condition 0007 was filed about,
+    # so the check is the guard, not a nicety.
+    r = subprocess.run([sys.executable, os.path.join(BASE, 'tools', 'gen_sw_cache.py'), '--check'],
+                       capture_output=True, text=True, cwd=BASE)
+    check(r.returncode == 0, 'sw.js asset digests are not stale w.r.t. the real files '
+                             '(run tools/gen_sw_cache.py --write): ' + (r.stdout + r.stderr).strip()[:300])
+    # The digests must be derived from the FILES, not be plausible-looking literals:
+    # recompute one here and compare. A generator that emits a constant would satisfy
+    # --check forever while invalidation silently stopped working.
+    import hashlib as _hl
+    with open(os.path.join(BASE, 'appcore.js'), 'rb') as fh:
+        want = _hl.sha256(fh.read()).hexdigest()[:16]
+    r = subprocess.run([sys.executable, os.path.join(BASE, 'tools', 'gen_sw_cache.py')],
+                       capture_output=True, text=True, cwd=BASE)
+    check(("'./appcore.js': '%s'" % want) in r.stdout,
+          'the generated appcore.js digest matches the real appcore.js bytes (derivation is real)')
+    # CR-0018 part (1): appcore.js must be precached. It is the module index.html loads
+    # via <script src>; without it the FIRST offline visit — the case offline support
+    # exists for — cannot get it at all, because the runtime cache-write needs a prior
+    # successful online fetch. Parsed from the SHELL declaration itself (not a substring
+    # of the whole file, which a comment could satisfy) via the generator's own reader,
+    # so this check and sw.js can never disagree about what is precached.
+    sys.path.insert(0, os.path.join(BASE, 'tools'))
+    import gen_sw_cache as _gen
+    check('./appcore.js' in _gen.read_shell(),
+          "sw.js's SHELL precaches ./appcore.js (CR-0018)")
+    # And the navigation fallback must be scoped to navigations. This is asserted
+    # BEHAVIOURALLY, not by looking for a substring: a `in sw_src` check would pass on
+    # an INVERTED guard (`if (isNavigation(e.request)) throw err;`) containing the very
+    # same token, which is the defect re-spelled. A tiny vm harness executes sw.js's real
+    # fetch listener with a real offline script request and asserts what it returns.
+    # (tests/frontend/phase21_service_worker.test.js is the full behavioural suite; this
+    # is the python-side smoke of the same property, so a python-only run still fails.)
+    import subprocess as _sp
+    _probe = (
+        "const fs=require('fs'),vm=require('vm');"
+        "const s={self:{addEventListener(t,f){(s._h||(s._h={}))[t]=f},skipWaiting(){},"
+        "clients:{claim(){}}},caches:{open:async()=>({}),match:async()=>undefined,"
+        "keys:async()=>[],delete:async()=>{}},location:{origin:'https://x'},"
+        "fetch:async()=>{throw new Error('offline')},URL,Promise,console};"
+        "s.self.location=s.location;vm.createContext(s);"
+        "vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),s);"
+        "const req={method:'GET',url:'https://x/appcore.js',mode:'no-cors',destination:'script'};"
+        "let out=null;s._h.fetch({request:req,respondWith(p){out=Promise.resolve(p)}});"
+        "out.then(v=>{console.log('RESOLVED:'+(v&&v.body?'body':'undefined'))},"
+        "()=>console.log('REJECTED'));"
+    )
+    r = subprocess.run(['node', '-e', _probe, os.path.join(BASE, 'sw.js')],
+                       capture_output=True, text=True, cwd=BASE)
+    check('REJECTED' in r.stdout,
+          'sw.js rejects a failed SCRIPT fetch instead of answering it with HTML (CR-0018): '
+          + (r.stdout + r.stderr).strip()[:200])
+
     # A symlinked DIRECTORY must not be descended into either. This case is GREEN both
     # with and without the explicit `islink` prune in bridge.py, because os.walk's default
     # is followlinks=False — so it DOCUMENTS the property rather than pinning the prune.
