@@ -589,6 +589,16 @@ function ctxUsage(){
   $('ctx-bar').title='CONTEXT LOAD: ~'+used+' TOKENS ACROSS '+(c?c.messages.length:0)+' TRANSMISSIONS (SYSTEM PROMPT + SUMMARY INCLUDED)';
   return used;
 }
+/* PHASE 20 (CR-0026) — THE body-rendering rule, extracted so msgHTML and refreshLastFor
+   cannot drift. Both used to decide this independently: msgHTML guarded user/tool with
+   `esc(CogCore.contentText(m.content))` while refreshLastFor passed everything to
+   renderMd(), so refreshing an attachment message stringified the array into the bubble.
+   One rule, one caller. A future edit to message rendering changes both or neither. */
+function msgBody(m){
+  const isUser=m.role==='user';
+  const isTool=m.role==='tool';
+  return isUser||isTool?esc(CogCore.contentText(m.content)):renderMd(m.content);
+}
 function msgHTML(m,i){
   const isUser=m.role==='user';
   const isTool=m.role==='tool';
@@ -601,7 +611,7 @@ function msgHTML(m,i){
     try{args=JSON.stringify(JSON.parse(args));}catch(e){}
     return `<div class="rite-call">&#9881; INVOKED RITE: ${esc(t.name||'unknown')} ${esc(args)}</div>`;
   }).join('');
-  const body=isUser||isTool?esc(CogCore.contentText(m.content)):renderMd(m.content);
+  const body=msgBody(m);
   /* PHASE 12 — operator-visible LOCAL CORTEX note (a repaired rite, or a degraded probe).
      Non-blocking: it never mutates the model's own text and never enters the request payload. */
   const cortexNote=m.cortexNote?`<div class="cortex-note${m.cortexDegraded?' degraded':''}">${esc(m.cortexNote)}</div>`:'';
@@ -694,7 +704,13 @@ function refreshLastFor(c,m){
   const i=c.messages.indexOf(m);
   if(i===-1)return;
   const el=document.getElementById('body-'+i);
-  if(el){el.innerHTML=renderMd(m.content)+(generating?'<span class="caret"></span>':'');
+  /* PHASE 20 (CR-0026): this renderer must agree with msgHTML. msgHTML renders user/tool
+     content as `esc(CogCore.contentText(m.content))` and assistant content as renderMd();
+     refreshLastFor rendered everything through renderMd(m.content), so refreshing an
+     attachment message replaced a correctly-rendered bubble with the STRINGIFIED ARRAY —
+     the view degraded the instant a delta landed. Delegating to msgHTML's own body rule
+     keeps the two renderers from drifting again: one place decides, one place is called. */
+  if(el){el.innerHTML=msgBody(m)+(generating?'<span class="caret"></span>':'');
     const tgl=box.querySelector(`.think-toggle[data-i="${i}"]`);
     if(m.thinking){if(tgl){tgl.innerHTML=`&#9656; COGITATION RECORD (${tok(m.thinking)} tok)`;
       document.getElementById('think-'+i).textContent=m.thinking;}
@@ -766,28 +782,90 @@ async function buildMessages(opts={}){
   return [...sys,...msgs];
 }
 /* ================= COMPACTION RITE ================= */
-async function compactChat(silent){
-  const c=active();if(!c)return false;
-  if(!settings.model){if(!silent)alert('NO SOUL-MODEL SELECTED — OPEN RITES/CONFIG');return false;}
-  if(c.messages.length<4){if(!silent)alert('NOTHING WORTH COMPACTING YET, OPERATOR.');return false;}
+let autoCompacting=false;
+async function compactChat(silent,claimId){
+  /* Every exit must clear the latch, INCLUDING the three below. `maybeAutoCompact` claims
+     it at SCHEDULE time, so if a queued run returns early here the `finally` is never
+     reached and the latch would stay set — wedging automatic compaction for the rest of
+     the session, with no error anywhere.
+
+     Only the CLAIMANT clears it: a manual run must not release a latch that a queued
+     automatic run still depends on, or the latch stops collapsing a burst of breaches. */
+  const done=(r)=>{if(!claimId||autoCompacting===claimId)autoCompacting=false;return r;};
+  const c=active();if(!c)return done(false);
+  /* The automatic rite is bound to the chat that claimed it. If the operator switched
+     chats inside the deferral window, this chat never breached — compacting it anyway
+     would drop its front with no operator action on it. */
+  if(claimId&&c.id!==claimId)return done(false);
+  if(!settings.model){if(!silent)alert('NO SOUL-MODEL SELECTED — OPEN RITES/CONFIG');return done(false);}
+  if(c.messages.length<4){if(!silent)alert('NOTHING WORTH COMPACTING YET, OPERATOR.');return done(false);}
+  if(!claimId)autoCompacting=c.id;
+  let committed=false;
   const btn=$('compact-btn');btn.disabled=true;
   try{
     const hist=[];
     for(const m of c.messages){
+      /* PHASE 20 (CR-0026): an attachment message's `content` is an ARRAY. Rendering it
+         raw put `[object Object]` into the summariser's prompt, so the model was asked to
+         compress a transcript whose attachments were literally gone. contentText() is the
+         renderer msgHTML/autoTitle/COPY already used since Phase 3/9. */
+      const text=CogCore.contentText(m.content);
       if(m.role==='tool'){
-        hist.push({role:'tool',content:'[TOOL RESULT '+(m.name||'')+' '+(m.toolCallId||'')+']\n'+(m.content||'')});
+        hist.push({role:'tool',content:'[TOOL RESULT '+(m.name||'')+' '+(m.toolCallId||'')+']\n'+text});
       }else if(m.role==='assistant'){
         if((m.toolCalls||[]).length){
-          hist.push({role:'assistant',content:'[INVOKED RITES]\n'+m.toolCalls.map(t=>t.name+' '+(t.args||'')).join('\n')+'\n\n'+(m.content||'')});
-        }else hist.push({role:m.role,content:m.content});
-      }else hist.push({role:m.role,content:m.content});
+          hist.push({role:'assistant',content:'[INVOKED RITES]\n'+m.toolCalls.map(t=>t.name+' '+(t.args||'')).join('\n')+'\n\n'+text});
+        }else hist.push({role:m.role,content:text});
+      }else hist.push({role:m.role,content:text});
     }
     const prompt=[
       {role:'system',content:'You are a context compression subroutine of an Adeptus Mechanicus cogitator. Compress the conversation history into a dense factual summary. Preserve: all user requirements and preferences, decisions made, facts established, code snippets and their purpose, tool rites invoked and their outcomes, names/numbers/dates, unresolved questions. Be terse but complete. Output ONLY the summary, no preamble.'},
       {role:'user',content:'COMPRESS THE FOLLOWING COMMUNION LOG:\n\n'+hist.map(m=>'['+m.role.toUpperCase()+'] '+m.content).join('\n---\n')}];
     const res=await callModel(prompt,{temperature:0.2},true);
-    c.summary=(c.summary?c.summary+'\n\n[DEEPER PAST] ':'')+res.trim();
-    const budget=Math.ceil(settings.ctxLimit*0.35)-tok(c.summary);
+    /* PHASE 20 (CR-0003) — an empty summary must cost the operator NOTHING.
+
+       This bail is deliberately placed BEFORE `c.summary` is assigned and before the
+       budget walk, because the old order destroyed the front of the conversation and
+       then reported success: it assigned `''` (or a bare `[DEEPER PAST] ` marker onto an
+       existing summary), walked the budget, sliced `c.messages`, saved, and flashed
+       "COMPACTION RITE COMPLETE". The operator saw a compacted log over a transcript
+       that was missing its front, with nothing enshrined to recover it from.
+
+       Reachable with no operator action — `maybeAutoCompact()` calls `compactChat(true)`
+       at `compactAt`% of the context limit, and an endpoint returning 200 with an empty
+       or whitespace-only body is enough.
+
+       `summaryUsable()` is the whole rule, and it is deliberately NOT `!!s.trim()`.
+       `.trim()` strips only WhiteSpace + LineTerminator, so a lone ZWNJ (U+200C), ZWJ
+       (U+200D), word joiner (U+2060), soft hyphen (U+00AD) or NUL survives at length 1 —
+       and a review probe measured 82 messages dropped to 9 on exactly those values, with
+       the rite reporting success. `typeof` also matters: `String(undefined)` is the
+       9-character truthy string "undefined", so a malformed completion body with no
+       `content` field would have been enshrinened verbatim and compacted.
+
+       The notice is flashed even on the silent path: `silent` suppresses the modal
+       `alert`, and a silent drop of the front of a conversation is exactly the failure
+       nobody would otherwise notice. */
+    if(!CogCore.summaryUsable(res)){
+      const msg='COMPACTION RITE ABORTED — THE MODEL RETURNED AN EMPTY SUMMARY. THE COMMUNION LOG IS UNCHANGED AND NOTHING WAS ENSHRINED.';
+      if(!silent)alert(msg);
+      flashCompact(msg);
+      return false;
+    }
+    const summaryText=String(res).trim();
+    /* PHASE 20 (F3) — MUTATION ORDER. The summary is COMPUTED here, not assigned.
+       It used to be assigned on line 1 of this block, before the budget walk, so any
+       throw between the assignment and the slice reported "COMPACTION RITE FAILED" AFTER
+       the transcript had already been trimmed and persisted — and with a corrupt
+       `toolCalls` field the ledger was truncated mid-write, leaving a summary that was
+       neither the old one nor the new one. Measured: 82 -> 10 messages on disk with the
+       rite reporting failure.
+
+       The order is now compute -> walk -> slice -> save -> COMMIT -> render, so no throw
+       can land between a mutation and its persistence. `budget` is derived from the
+       candidate summary rather than from `c.summary`, which is why the walk is unchanged. */
+    const newSummary=(c.summary?c.summary+'\n\n[DEEPER PAST] ':'')+summaryText;
+    const budget=Math.ceil(settings.ctxLimit*0.35)-tok(newSummary);
     let used=0,start=c.messages.length;
     for(let i=c.messages.length-1;i>=0;i--){const m=c.messages[i];
       const cost=tok(m.content)+tok(m.thinking||'')+(m.toolCalls||[]).reduce((a,t)=>a+tok(t.args),0);
@@ -796,11 +874,36 @@ async function compactChat(silent){
     }
     // Never leave a dangling tool result at the retained boundary.
     while(start>0&&c.messages[start].role==='tool')start--;
-    c.messages=c.messages.slice(start);c.updated=Date.now();save();renderAll();
-    if(!silent)flashCompact('COMPACTION RITE COMPLETE — ARCHIVE COMPRESSED TO '+tok(c.summary)+' TOKENS');
+    /* COMMIT POINT — past here the rite has succeeded; before it, nothing was touched. */
+    c.summary=newSummary;
+    c.messages=c.messages.slice(start);c.updated=Date.now();save();
+    /* PHASE 20 (F3/F-B): past the commit point the rite MUST NOT report failure, however
+       badly the aftermath behaves. `renderAll()` sits after the commit and inside this
+       try, and it throws on any message whose `content` is not a string (`renderMd` does
+       `t.slice`) — a state the app itself can now produce, since this phase widened
+       contentText and added array-bodied responses. That reported "COMPACTION RITE FAILED"
+       on a transcript whose front had already been trimmed and persisted, so the operator
+       would reasonably retry a compaction that had in fact committed, appending a second
+       [DEEPER PAST] over an already-truncated log. The flag makes the catch honest. */
+    committed=true;
+    renderAll();
+    /* PHASE 20 (F5): the success flash used to be gated on `!silent`, so the AUTOMATIC
+       rite — the one that fires with no operator action, and the one this phase's gate is
+       actually about — dropped messages and said nothing, while the abort notice is loud
+       on both paths. That asymmetry is the same one that made CR-0003 invisible. */
+    flashCompact('COMPACTION RITE COMPLETE — ARCHIVE COMPRESSED TO '+tok(c.summary)+' TOKENS');
     return true;
-  }catch(e){if(!silent)alert('COMPACTION RITE FAILED: '+e.message);return false;}
-  finally{btn.disabled=false;}
+  }catch(e){
+    /* A throw after the commit point is a rendering failure, not a compaction failure:
+       the summary is enshrinened and the transcript is trimmed on purpose. Say so, and
+       never `alert('FAILED')` — a false failure invites a retry that double-compacts. */
+    if(committed){flashCompact('COMPACTION COMPLETE, BUT THE VIEW FAILED TO REFRESH: '+e.message);return true;}
+    if(!silent)alert('COMPACTION RITE FAILED: '+e.message);return false;
+  }
+  finally{
+    btn.disabled=false;
+    if(!claimId||autoCompacting===claimId)autoCompacting=false;
+  }
 }
 function flashCompact(msg){const n=document.createElement('div');n.className='compact-note flash-compact-note';
   n.innerHTML='<span>&#9881; '+esc(msg)+'</span>';document.body.appendChild(n);
@@ -808,9 +911,36 @@ function flashCompact(msg){const n=document.createElement('div');n.className='co
 function maybeAutoCompact(){
   if(!settings.autoCompact)return;
   const c=active();if(!c||c.messages.length<4)return;
+  /* PHASE 20: an in-flight latch. `maybeAutoCompact` defers by 600ms with no guard, so a
+     chat sitting over the threshold fired one (BILLED) summarisation call per invocation —
+     6 breaches meant 6 identical calls, on every send, forever. The latch is released in
+     compactChat's own `finally`, so it cannot wedge the rite: if a run throws before the
+     try block is entered the latch is never set, and if it throws inside, the finally
+     clears it. Deliberately NOT a debounce on the threshold — a failing endpoint must be
+     retryable, and this only prevents overlap, not retries. */
+  if(autoCompacting)return;
   if(ctxTokens(c)>settings.ctxLimit*settings.compactAt/100){
-    flashCompact('MEMORY THRESHOLD BREACHED — INVOKING COMPACTION RITE...');
-    setTimeout(()=>compactChat(true),600);
+    /* Claim the latch HERE, at SCHEDULE time — not inside compactChat. The 600ms deferral
+       means every threshold breach in a burst queues its timer before the first one even
+       starts, so a latch checked only on entry sees `false` for all of them and 6 calls
+       go out. `compactChat`'s own finally clears it, so the next breach re-arms it.
+
+       The latch records WHICH CHAT claimed it, and the queued run re-checks that it is
+       still the active one before compacting. Without this, the operator switches chats
+       inside the 600ms window and the queued rite compacts the NEW chat — which never
+       breached anything, and loses its front with no operator action. Measured: chat B
+       went 30 -> 7 messages on a threshold it was nowhere near.
+
+       The claim is also wrapped: if anything between claiming and scheduling throws, the
+       latch is released. An unreleasable claim silently kills automatic compaction for
+       the rest of the session, with no error anywhere — a failure that is invisible by
+       construction. */
+    const claimedId=c.id;
+    autoCompacting=claimedId;
+    try{
+      flashCompact('MEMORY THRESHOLD BREACHED — INVOKING COMPACTION RITE...');
+      setTimeout(()=>{compactChat(true,claimedId);},600);
+    }catch(e){autoCompacting=false;throw e;}
   }
 }
 /* ================= INFERENCE + AGENTIC RITES ================= */
@@ -1014,7 +1144,17 @@ async function callOpenAI(messages,options,nonStream,signal){
   if(!r.ok)throw new Error('HTTP '+r.status);
   if(nonStream){
     const j=await r.json();const msg=j.choices?.[0]?.message||{};
-    return [msg.reasoning_content||'',msg.content||''].filter(Boolean).join('\n');
+    /* PHASE 20 (CR-0026, response side): BOTH operands go through contentText, not just
+       `msg.content`. Routing only one was the whole bug twice over: `msg.content` may be
+       the multimodal parts ARRAY — the shape this app itself SENDS, and what several
+       OpenAI-compatible proxies echo back — and `msg.reasoning_content` / `msg.thinking`
+       may be too, since a reasoning model behind such a proxy can return either as a
+       parts array. Any array operand hits `Array.prototype.join` and produces
+       "[object Object]", which is a perfectly READABLE string, so no emptiness guard
+       downstream can ever catch it: measured, 82 messages dropped to 9 while the rite
+       reported success. Fixing one operand of a two-operand expression leaves the other
+       one live — contentText() is the one renderer, applied to every field. */
+    return [CogCore.contentText(msg.reasoning_content),CogCore.contentText(msg.content)].filter(Boolean).join('\n');
   }
   if(!r.body)throw new Error('NO BODY');
   const acc=newAcc();
@@ -1032,7 +1172,7 @@ async function callOllamaNative(messages,options,nonStream,signal){
   if(!r.ok)throw new Error('HTTP '+r.status);
   if(nonStream){
     const j=await r.json();const msg=j.message||{};
-    return [msg.thinking||'',msg.content||''].filter(Boolean).join('\n');
+    return [CogCore.contentText(msg.thinking),CogCore.contentText(msg.content)].filter(Boolean).join('\n');
   }
   if(!r.body)throw new Error('NO BODY');
   const rd=r.body.getReader(),dec=new TextDecoder();const acc=newAcc();let buf='';

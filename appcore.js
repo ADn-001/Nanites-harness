@@ -114,11 +114,71 @@
       return out;
     },
 
+    /**
+         * PHASE 20 (CR-0003) — is this a summary worth ENSHRINING?
+         *
+         * The compaction rite slices the front of the conversation on the strength of this
+         * answer, so the rule is stated as its INTENT: a usable summary contains at least
+         * one character that carries meaning on its own — a letter, a number, punctuation
+         * or a symbol.
+         *
+         * Stated as an ALLOW-list of meaning rather than a deny-list of invisible things,
+         * deliberately. Two earlier attempts were deny-lists and each had a live hole:
+         *   - `!!s.trim()` accepted ZWNJ/ZWJ/word-joiner/soft-hyphen/NUL, because
+         *     `String.prototype.trim` removes only WhiteSpace + LineTerminator.
+         *   - `/[^\s\p{Cf}\p{Cc}]/u` accepted combining marks, variation selectors and lone
+         *     surrogates, which are glyphless too.
+         * Both measured 82 messages dropped to 9 while the rite reported success. A
+         * deny-list has to be complete, and "invisible" has no natural end; an allow-list
+         * only has to be right about what counts as content. A character nobody thought of
+         * is now rejected by the RULE rather than surviving because it was not on a list.
+         *
+         * `\p{L}` rather than "any non-mark": Devanagari, Thai, Hangul and Arabic rely on
+         * combining marks, so excluding `\p{M}` outright would reject real summaries and
+         * turn this guard into a new data-loss bug. Those scripts still match on their
+         * base letters.
+         *
+         * `typeof` is load-bearing: `String(undefined)` is the truthy 9-character string
+         * "undefined", so a malformed completion body with no `content` field would
+         * otherwise be enshrined verbatim and the transcript compacted.
+         *
+         * Anchored nowhere and negated once, so it is linear — measured 14ms on a
+         * 200 000-character input of pure ZWJ, no backtracking blowup.
+         */
+    summaryUsable: function (res) {
+      if (typeof res !== 'string') return false;
+      /* PHASE 20 (round 3, F-F): the allow-list ALONE still had a hole — a small set of
+         code points render BLANK while belonging to \p{L} or \p{S}, so the rule accepted
+         them: U+3164 HANGUL FILLER (the well-known invisible-Hangul hazard), U+115F/U+1160
+         HANGUL CHOSEONG/JUNGSEONG FILLER, U+FFA0 HALFWIDTH HANGUL FILLER, U+2800 BRAILLE
+         PATTERN BLANK, and U+FFFD REPLACEMENT CHARACTER. Each measured destroying 73 of 82
+         messages through the automatic rite. An allow-list fixes "a category we forgot";
+         this supplementary deny-list fixes "a glyph we forgot", and the two together are
+         stronger than either — neither set is complete on its own. */
+      if (/[\u115F\u1160\u3164\uFFA0\u2800\uFFFD]/.test(res)) return false;
+      return /[\p{L}\p{N}\p{P}\p{S}]/u.test(res);
+    },
+
     /** Plain-text rendering of a message `content` (string or array) for the UI
      *  and auto-title. Images render as a short marker, text parts joined. */
     contentText: function (content) {
-      if (!Array.isArray(content)) return content == null ? '' : String(content);
+      if (content == null) return '';
+      if (typeof content === 'string') return content;
+      /* PHASE 20 (CR-0026, response side): two shapes the multimodal array collapses on.
+         A BARE STRING element has no `.text`, so it used to render as '' — a real summary
+         arriving as `content:['A REAL SUMMARY.']` was silently dropped. And a bare OBJECT
+         (not an array) fell through to `String(content)`, giving "[object Object]" —
+         which is READABLE, so no emptiness guard downstream could catch it. */
+      if (!Array.isArray(content)) {
+        if (typeof content === 'object') {
+          if (typeof content.text === 'string') return content.text;
+          if (typeof content.content === 'string') return content.content;
+          return '';
+        }
+        return String(content);
+      }
       return content.map(function (p) {
+        if (typeof p === 'string') return p;
         p = p || {};
         if (p.type === 'image_url') return '[IMAGE]';
         return p.text == null ? '' : String(p.text);
