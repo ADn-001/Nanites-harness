@@ -1,9 +1,10 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 20 — Compaction: never discard the transcript on an empty summary, never stringify array content**
-(Phase 19 is DONE but sits in PR #6, which targets PR #5's branch, NOT main. The chain is now
-#4 -> #5 -> #6, all three unmerged: merge #4 (into main), then #5, then #6. Phase 20 must branch
-from `feat/phase19-daemon-auth` unless #6 has merged. `gh pr view 4 5 6` before starting.)
+Next phase to work on: **Phase 21 — Service worker: an offline load cannot serve HTML as the app bundle**
+(Phase 20 is DONE in PR #7, which targets PR #6's branch (`feat/phase19-daemon-auth`), NOT
+main. The chain is now #4 -> #5 -> #6 -> #7, all four unmerged: merge in that order. Phase 21
+must branch from `fix/phase20-compaction-data-loss` unless #7 has merged. `gh pr view 4 5 6 7`
+before starting.)
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1528,22 +1529,125 @@ atomicity comment is true (0023); `write_bridge` is tmp + `fsync` + `os.replace`
 ---
 
 ## Phase 20 — Compaction: never discard the transcript on an empty summary, never stringify array content
-Status: **not started**
+Status: **DONE** (three adversarial review rounds — R1, R2, R3 — each found a live hole
+after the previous round reported the previous round's finding closed)
 Ticket: `TICKET-2026-10-01-compaction-data-loss` (CR-Nanites-harness-0003 high, 0026 medium)
+PR: **#7** — https://github.com/ADn-001/Nanites-harness/pull/7
+**Targets `feat/phase19-daemon-auth` (PR #6), NOT main. The chain is now
+#4 -> #5 -> #6 -> #7, all four unmerged: merge in that order.**
 
-Deliverable: `compactChat` bails BEFORE touching `c.messages` when the summary call returns empty,
-and reports that plainly instead of silently slicing (0003); the compression history and
-`refreshLast` both route through `CogCore.contentText()` so attachment arrays are summarised as
-text rather than `[object Object]` (0026).
-Gate: a new suite pins the empty-summary case first (messages and `c.summary` both untouched,
-and the operator is told), plus the array-content case (the prompt contains the attachment's text)
-and the `refreshLast` render matching `msgHTML`'s guarded output. `compactChat` is currently called
-by NO test — the only match in `tests/frontend` is a comment — so this is the first suite for the
-whole rite; keep it that way. Remember the budget walk and the dangling-tool-result boundary are
-part of the same function. Done = no automatic rite (`maybeAutoCompact` fires at 85% of the
-context limit with no operator action) can lose the front of a conversation.
+Deliverable: `compactChat` bails BEFORE touching `c.messages` when the summary is unusable,
+and reports that plainly instead of silently slicing (0003); the compression history, both
+non-stream response returns and `refreshLast` all route through `CogCore.contentText()` so
+array/object content is never stringified (0026). Gate: a new suite pins the empty-summary
+case first (messages and `c.summary` both untouched, and the operator told), plus the
+array-content case and the `refreshLast` render matching `msgHTML`. `compactChat` was called
+by NO test before this phase — the only match in `tests/frontend` was a comment.
+Done = no automatic rite can lose the front of a conversation.
 
 ### Findings
+
+- **THE HEADLINE NUMBER, because it is what makes this phase's defect concrete: an empty
+  summary destroyed the front of a conversation and reported success.** Measured against
+  the pre-fix code with a tight budget: **82 messages -> 9, `c.summary` empty, notice read
+  "COMPACTION RITE COMPLETE"**. At the shipped 131072 default nothing is over budget, so a
+  naive reproduction shows nothing wrong — you must set `ctxLimit: 900` for the retention
+  walk to actually fire. **If you write a compaction test at the default context limit, it
+  will pass for the wrong reason.** This is the same trap as phase 9's array-blind `tok`.
+
+- **THE EMPTINESS CHECK TOOK THREE FORMS AND THE FIRST TWO HAD LIVE HOLES.** Read this
+  before "simplifying" `CogCore.summaryUsable`:
+  1. `!!res.trim()` — accepted ZWNJ/ZWJ/word-joiner/soft-hyphen/NUL. `String.prototype.trim`
+     removes only WhiteSpace + LineTerminator.
+  2. `/[^\s\p{Cf}\p{Cc}]/u` — accepted combining marks, variation selectors, lone surrogates.
+  Both measured 82 -> 9. Both are **deny-lists**, and a deny-list has to be complete.
+  The shipped rule is an **allow-list of meaning** (`[\p{L}\p{N}\p{P}\p{S}]`) PLUS a small
+  explicit deny-list for code points that are letters/symbols yet render BLANK — the Hangul
+  fillers (U+3164, U+115F, U+1160, U+FFA0), braille blank (U+2800), U+FFFD. An allow-list
+  fixes "a category we forgot"; the deny-list fixes "a glyph we forgot"; **neither is
+  complete alone**, so do not delete the deny-list as redundant.
+- **Do not "tighten" it to exclude `\p{M}`.** Devanagari, Thai, Hangul and Arabic build their
+  letters from combining marks; excluding marks rejects real summaries and turns this guard
+  into a NEW data-loss bug wearing the fix's clothes. `\p{L}` matches on the base letter.
+  The suite asserts ~20 real-script summaries are still accepted for exactly this reason.
+- **CR-0026 HAD FOUR INSTANCES, NOT ONE, AND THREE OF THEM WERE ON THE RESPONSE SIDE.** The
+  prompt-side `hist` loop was the one in the ticket. The others were
+  `[msg.reasoning_content||'', msg.content||''].filter(Boolean).join('\n')` in `callOpenAI`
+  and the `msg.thinking` twin in `callOllamaNative`. **Fixing one operand of a two-operand
+  expression leaves the other live** — this exact mistake was made, reviewed, "fixed", and
+  then caught again by R3. Both operands now go through `contentText`.
+- **`[object Object]` is a READABLE string, so no emptiness guard downstream can ever catch
+  it.** This is why the `summaryUsable` bail did nothing for the response-side instances and
+  why the CR-0003 bail alone would never have been sufficient. It is also why the fix has to
+  be at the renderer, not at a later check.
+- **`contentText` was WIDENED, and it is the highest-risk part of this phase.** It now
+  handles a bare object (`{text}`, `{content}`) and bare-string array elements, which it
+  previously turned into `[object Object]` and `''` respectively. Six of twenty shapes change
+  behaviour; every change replaces garbage with real text and every output is still a
+  string, which is what all six callers (`autoTitle`, `msgBody`, COPY, the `hist` loop, both
+  non-stream returns, `lastUserText`) require. If you touch it, re-diff old-vs-new across
+  those shapes — `tests/frontend/phase9_tok_copy.test.js` and `phase3_attachments` cover COPY
+  and the prompt side.
+- **MUTATION ORDER IS THE FIX, NOT JUST THE GUARD.** `c.summary` is COMPUTED before the
+  budget walk rather than assigned, so no throw can land between a mutation and its
+  persistence. And a throw AFTER the commit point is reported as a rendering failure, never
+  `COMPACTION RITE FAILED` — because a false failure invites an operator retry that appends a
+  second `[DEEPER PAST]` over an already-trimmed log. The comment at the commit point says
+  "past here the rite has succeeded"; the `committed` flag is what makes the catch agree.
+- **THE IN-FLIGHT LATCH HAS THREE SUBTLETIES, each of which was a bug first.** It must be
+  claimed at SCHEDULE time in `maybeAutoCompact`, not on entry to `compactChat` — the 600ms
+  deferral means a burst queues every timer before the first one starts, so an entry-time
+  check sees `false` for all of them and 6 calls go out. It records WHICH chat claimed it,
+  because `compactChat` re-reads `active()` 600ms later and would otherwise compact a chat
+  the operator switched to that never breached anything (measured: chat B 30 -> 7). And it
+  is released on EVERY exit including a failed schedule, via `done()` for the three early
+  returns — a claim that cannot be released silently kills automatic compaction for the
+  session with no error anywhere. Only the CLAIMANT clears it, so a manual run cannot steal
+  a queued automatic run's latch.
+- **ASSERT THE RULE, NOT THE INSTANCES. Round 2 proved this the hard way.** Its mutation M8
+  replaced `summaryUsable` with a strictly MORE CORRECT regex and the suite stayed green,
+  because the suite only drove `compactChat` with a handful of seeded values — so it pinned
+  those strings, not the rule. `summaryUsableRule()` now calls the function DIRECTLY against
+  a no-glyph table and a meaningful table it has never seen, and the equivalent mutation now
+  produces 58 failures. **A test that only exercises a guard through its caller cannot tell
+  a correct rule from a broken one.**
+- **A PASSING RENDERER TEST CAN BE VACUOUS.** Round 1's mutation made `refreshLastFor` a
+  complete no-op and the whole suite stayed green: the assertion compared a DOM node to
+  itself across a refresh, which cannot distinguish "re-rendered identically" from "rendered
+  nothing". `refreshLastActuallyRewritesTheNode` plants a changed model value, asserts the
+  node changed, then plants a second value to prove it tracks the model. The no-op mutation
+  is caught now; it was not before.
+- **TWO OF MY OWN FIXTURES PASSED FOR THE WRONG REASON, both caught only by reading the
+  failure message rather than the count.** (a) The tool-boundary fixture's assistant messages
+  never declared the tool calls their tool messages answered, so it reported 40 "orphans"
+  that were in the fixture before compaction ran; it now asserts the fixture starts
+  protocol-legal FIRST, so a future failure cannot be blamed on the product. (b) The
+  post-commit render-failure fixture put its numeric `content` on a message the budget walk
+  trimmed away AND on a TOOL message, which takes the `esc(contentText(...))` path and
+  cannot throw at all — `renderMd` is only reached for ASSISTANT content. It now asserts the
+  chosen message is an assistant message before relying on it. **When a case passes, confirm
+  it failed for the intended reason first; a green case that never went red proves nothing.**
+- **Verification at close:** `tests/frontend/phase20_compaction.test.js` -> **256 assertions,
+  0 failures**, green on 3 consecutive runs (and deliberately NOT green at the shipped
+  default `ctxLimit` for the retention cases — see the headline number). `npm run test:front`
+  ALL GREEN (23 files). `python3 test_e2e.py` -> **242 ok / 0 FAILURES**, unchanged from
+  phase 19. All guarantees mutation-tested against live mutant code, every mutant caught,
+  including an acceptance control (`compactChat` returning `false` unconditionally) that goes
+  red with 25 failures — so "always bail" cannot pass this suite.
+- **What is NOT proven, stated so nobody inherits it as a claim:** **no browser was involved
+  anywhere in this phase.** The invisible character classes are asserted from Unicode
+  categories, not from rendered pixels — a font that renders U+3164 visibly would not be
+  caught. Real SSE streaming, real font fallback, and real `localStorage` quota behaviour
+  under a failed `save()` (which is swallowed by its own try/catch) are untested. Whether a
+  real OpenAI-compatible proxy emits an array-valued `reasoning_content` is argued from the
+  shape this app itself SENDS, not from a captured incident. `lastUserText` and
+  `buildMessages` share the widened `contentText` and were checked by inspection, not driven
+  with the new shapes. **Concurrent tabs each hold their own `chats` array and last `save()`
+  wins — a separate front-loss path this phase did not touch**, and it is the most plausible
+  remaining way to lose a conversation's front.
+- **Left deliberately alone:** the budget walk and the dangling-tool-result boundary, which
+  are part of the same function and now have regression coverage rather than a change.
+  `msgAction`'s `if(a==='del'&&generating)return` guard from phase 17 R2 still applies.
 
 ---
 
