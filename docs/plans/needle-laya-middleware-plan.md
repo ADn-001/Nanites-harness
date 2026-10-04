@@ -31,7 +31,7 @@ inspect/modify a chosen project directory under operator control.
 | `appcore.js` | JS UMD (`window.CogCore` in browser, `module.exports` in Node) | pure, DOM-free, side-effect-free shared logic | 2083 lines |
 | `bridge.py` | Python 3 | local tool executor, jailed to a root; `/tools/execute` + `/health` | 542 lines |
 | `bridge_daemon.py` | Python 3 | supervisor: binds workdir, writes/spawns/scrubs bridge workers; `/status`, `/start`, `/stop`, `/set_workdir`, … | 620 lines |
-| `test_e2e.py` | Python 3 | HTTP e2e suite against bridge + daemon | 5010 lines |
+| `test_e2e.py` | Python 3 | HTTP e2e suite against bridge + daemon | 5017 lines |
 | `tests/frontend/*.test.js` | Node + jsdom | one suite per phase (count them: `ls tests/frontend/*.test.js \ | — |
 | `sw.js`, `manifest.webmanifest`, icons, GIFs | — | PWA shell + assets | — |
 

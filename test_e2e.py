@@ -4994,17 +4994,24 @@ check(_rme_defects == [],
 # The onboarding guard must still have teeth against the README as it stood when the
 # finding was filed. This is what makes the guard above a measurement rather than a
 # tautology: if the checker silently stopped detecting anything, this goes red.
-r = subprocess.run(['git', 'show', 'HEAD:README.txt'], capture_output=True, text=True,
-                   cwd=BASE)
+#
+# The fixture is pinned to a BLOB SHA, not `HEAD`. It used to read `HEAD:README.txt`,
+# which worked only until the very commit that fixed the README landed — then HEAD *was*
+# the fixed file, the control found 0 defects, and the suite went red on its own teeth.
+# A negative control whose fixture moves with the fix is not a control.
+_RME_ROT_BLOB = '66e670d81e08981921d5364e085aaf3ee806fb29'  # README.txt at a5282a8
+r = subprocess.run(['git', 'cat-file', '-p', _RME_ROT_BLOB], capture_output=True,
+                   text=True, cwd=BASE)
 _git_readme = r.stdout
-if _git_readme.strip():
+if _git_readme.strip() and 'Quick start on Windows 11' in _git_readme:
     check(len(_rme.check_readme(_git_readme)) > 0,
           'the README onboarding guard still detects the pre-phase-24 rot (it reports '
-          '%d defects against HEAD:README.txt, so a green run above is a real pass)'
-          % len(_rme.check_readme(_git_readme)))
+          '%d defects against blob %s, so a green run above is a real pass)'
+          % (len(_rme.check_readme(_git_readme)), _RME_ROT_BLOB[:12]))
 else:
-    check(False, 'could not read HEAD:README.txt, so the onboarding guard has no teeth '
-                 'control - a green run against the current README proves nothing')
+    check(False, 'could not read the pinned pre-phase-24 README (blob %s), so the '
+                 'onboarding guard has no teeth control - a green run against the '
+                 'current README proves nothing' % _RME_ROT_BLOB[:12])
 
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)

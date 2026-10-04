@@ -1,10 +1,16 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 24 — Docs: tell the truth about completion status, and make a fresh clone work**
-(Phase 23 is DONE in PR #10, which targets PR #9's branch (`fix/phase22-request-and-ledger-integrity`), NOT
-main. The chain is now #4 -> #5 -> #6 -> #7 -> #8 -> #9 -> #10, all seven unmerged: merge in that order.
-Phase 24 must branch from `fix/phase23-timeout-diagnostics` unless #10 has merged.
-`gh pr view 4 5 6 7 8 9 10` before starting.)
+Next phase to work on: **All phases complete** (Phases 0-24, the last of them by design)
+(Phase 24 is DONE in PR #11, which targets PR #10's branch
+(`fix/phase23-timeout-diagnostics`), NOT main. The chain is #4 -> #5 -> #6 -> #7 -> #8 ->
+#9 -> #10 -> #11, all eight unmerged: merge in that order. This is a deliberate terminal
+state, not a placeholder — Phase 24 was planned as the last phase because it documents
+work the earlier phases change. **Do not start a Phase 25.** You have no authority to
+create a phase: a phase is a promise to the user about what will change, and only they
+can make that promise. If the user hands over approved new work (a ticket id, a nightly
+approval, an idea they greenlit), planning its phase IS the job — that is provenance,
+not invention. Otherwise: report and stop.
+`gh pr view 4 5 6 7 8 9 10 11` before starting anything.)
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1941,7 +1947,7 @@ harder now); (3) `STREAM_BUDGET_MS` is not operator-configurable, so the timeout
 ---
 
 ## Phase 24 — Docs: tell the truth about completion status, and make a fresh clone work
-Status: **not started**
+Status: **DONE** (2026-10-04) — PR #11, merged only after #10
 Ticket: `TICKET-2026-10-01-docs-status-and-onboarding` (CR-Nanites-harness-0027 medium, 0028 medium)
 
 Deliverable: the plan document's line 3 corrected to DONE with its date and phases 10-14 given
@@ -1956,7 +1962,82 @@ another 9 phases. This is the LAST phase on purpose: it documents work the earli
 Done = a context-free session reading the plan header does not redo finished work or start a
 Phase 25 that does not exist.
 
+Gate evidence: `npm test` exit 0 (frontend jsdom ALL GREEN + `test_e2e.py` 0 FAILURES);
+`tools/test_gen_plan_status.py` 14 tests OK; `tools/test_readme_install.py` 14 tests OK;
+`tools/gen_plan_status.py --check` rc=0 on the real tree. Mutation harness 3/3 caught
+(the DONE rule reverted to a substring test, its negation check dropped, and multi-Status
+reverted to first-wins each turn the suite red). The fresh-clone seam — `git clone` →
+`npm install` → `npm test` in a clean temp copy — green 6/6 across two batches, which is
+the "a fresh clone works" claim no in-tree test can reach.
+
 ### Findings
+
+**Never hand-edit inside the `<!-- BEGIN/END GENERATED ... -->` markers** in
+`docs/plans/needle-laya-middleware-plan.md`. `tools/gen_plan_status.py` owns three
+regions: the document status header, one block per `### Phase N —` heading, and the §1
+file-inventory line counts. Status comes from `gatelog.md`; counts come from `wc -l` on
+the real files. To change a status or a count, edit `gatelog.md` or the file, then run
+`--write`; `--check` exits 1 naming what drifted. Same shape as `tools/gen_sw_cache.py`
+and `tools/gen_git_policy.py`. Paths are overridable via `GEN_PLAN_STATUS_ROOT` /
+`GEN_PLAN_STATUS_PLAN` / `GEN_PLAN_STATUS_GATELOG`, which is how the negative controls
+test drift without touching the working tree.
+
+- **The generator shipped with the exact rot it was written to prevent.** Its first cut
+  read `out[current]["done"] = "DONE" in status`, so `Status: **NOT DONE**` was published
+  as `**Status: DONE**` with a `**Status: COMPLETE**` header — while `--check` returned
+  rc=0 and all 11 tests passed. Verified by reproduction, not by reading: set phase 14's
+  gatelog line to `Status: **NOT DONE** — acceptance regressed`, run `--write`, and the
+  doc claimed COMPLETE. **A phase the gatelog says is unfinished was published as
+  shipped, silently, by the tool whose whole job is to stop that being silent.**
+  Fixed by `status_is_done()`: fail-closed on a leading explicit `DONE` token, with any
+  explicit negation (`NOT DONE`, `UN-DONE`, `REDONE`, `NOT COMPLETE`) winning.
+- **A guard that shares the bug it guards against is worse than no guard.** The suite
+  deliberately re-parses `gatelog.md` rather than importing the generator's parser, so it
+  cannot inherit the generator's opinion — but `NOT DONE` sailed through *because* both
+  copies carried the same substring bug, so they agreed and nothing went red.
+  Independence in code is not independence in semantics. `test_10` now asserts the two
+  implementations agree across a table of adversarial status lines; keep them as two
+  implementations, and keep that test, or a shared bug goes invisible again.
+- **A test fixture must actually reach the code it claims to exercise.** The pre-existing
+  negative controls flip *phase 12* by rewriting its literal fixture string, so a phase-12
+  mutation "fails" on fixture matching rather than on the rule. The new tests use **phase
+  14**, deliberately, and say so in their docstrings. A guard proven only against one
+  fixture string proves only that the fixture is fragile.
+- **The prior run's own guard test crashed and `test_e2e.py` reported `1 FAILURES`**:
+  `assertNotContains()` was called with a literal string where the haystack belonged, so it
+  asserted that `"a string that cannot be in the header"` did not contain its own message —
+  vacuously true. Fixed, then proved to have teeth by planting the stale wording in a copy
+  and confirming it goes red.
+- **Two more parser divergences, found and closed in this phase.** The generator reset
+  phase scope on any `#` line while the guard reset only on `## `; and the generator kept
+  the *first* `Status:` line while the guard kept the *last*. Either let `--check` and the
+  suite certify opposite verdicts for the same block. Latent on the real gatelog (no
+  phase has two `Status:` lines) but a live false-red the next time the wording changed.
+- **Multi-`Status:` phases are fail-closed, not first-wins.** Chosen on polarity: a stale
+  `DONE` followed by a corrective `NOT DONE` must read as not-done, because the cost of a
+  false DONE is publishing unfinished work as shipped. Asserted in both orders, since
+  first-wins vs last-wins was the original divergence.
+- **Still open: `--check` catching drift is not the same as `--check` being defended.**
+  Two mutations (`elif False:` on the header staleness comparison, and on the per-phase
+  one) left the whole suite green while a lying document passed `--check`. The MISSING
+  branches have negative controls; the STALENESS branches have none. A future phase should
+  add one that corrupts block *content* rather than deleting the block.
+- **`test_e2e.py` binds FIXED ports** (18930-18933, 18970-18973). Two concurrent runs
+  collide: a fresh-clone `npm test` red once with `URLError: Broken pipe` while another
+  suite held a port. Measured 0/4 and 0/2 red when run serially. **A red from this suite
+  means "did something else hold a port?", not "the deliverable is broken"** — check for a
+  concurrent run before investigating. Do not chase it as a product defect.
+- **Counts must match `wc -l`, NOT `sum(1 for _ in fh)`.** `index.html` and `appcore.js`
+  lack a trailing newline, so Python counts one line more than every other tool.
+- **The `Last synced:` date is never invented** — it comes from `git log -1 -- gatelog.md`
+  and reads `unknown` outside a checkout. Known wart, not fixed: copy the plan doc
+  elsewhere, run `--write`, and that date is silently replaced with `unknown` while
+  `--check` stays green.
+- **Grammar bug fixed in the generated header:** the verb keyed off how many phases were
+  *missing* while the subject was the whole phase list, rendering "phases 10, 11, 12, 13,
+  14, 15 ... **is** not recorded DONE" for one missing phase.
+- **PR #11 targets `fix/phase23-timeout-diagnostics` (PR #10), not main** — #10 was still
+  open. Merge order is unchanged: #4 → #5 → #6 → #7 → #8 → #9 → #10 → #11.
 
 ---
 
