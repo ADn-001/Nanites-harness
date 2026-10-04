@@ -5,7 +5,7 @@ suite is green**; failures are debugged and the suite re-run until green; status
 `gatelog.md`. Each phase also logs a *"info to know"* section in the gate log for the next
 agents. Work is delegated per-phase to subagents; the integrator reviews every diff.
 
-## Phase 0 — Readiness & frontend test rig
+## Phase 0 — Readiness & frontend test rig [DONE]
 No product features. Establishes the machinery every later phase depends on.
 - [x] 0.1 Split pure frontend logic into a shared `appcore.js` (UMD: browser `window.COG`
       + Node `module.exports`) so it is unit-testable without a browser.
@@ -16,7 +16,7 @@ No product features. Establishes the machinery every later phase depends on.
 - [x] 0.4 Keep `python3 test_e2e.py` green.
 Gate: `npm run test:front` passes AND `python3 test_e2e.py` == 0 FAILURES.
 
-## Phase 1 — Provider endpoint profiles
+## Phase 1 — Provider endpoint profiles [DONE]
 - [x] 1.1 `appcore.js`: `profileStore` (list/get/save/remove/activate/apply) over an injected
       storage adapter; profile shape `{id,name,backend,endpoint,model?}`.
 - [x] 1.2 `settings.profiles` + `settings.activeProfile` in the settings blob.
@@ -29,7 +29,7 @@ Gate: `npm run test:front` passes AND `python3 test_e2e.py` == 0 FAILURES.
       across a simulated reload.
 Gate: phase 1 suite green + regression green.
 
-## Phase 2 — Agentic system prompt + workdir context
+## Phase 2 — Agentic system prompt + workdir context [DONE]
 - [x] 2.1 `appcore.js`: `buildAgentSystemPrompt({workdir})` — short, precise, cheap for small
       contexts; states bridge jail = workdir, all paths relative to it, `list_dir(".")` = workdir
       contents, absolute host paths are refused.
@@ -44,7 +44,7 @@ Gate: phase 1 suite green + regression green.
       asserts the block.
 Gate: phase 2 suite green + phase 1 + regression green.
 
-## Phase 3 — Attachments (files / folders / images / from workdir)
+## Phase 3 — Attachments (files / folders / images / from workdir) [DONE]
 - [x] 3.1 Composer `[+]` ATTACH: attach files, attach folder, images, and "from workdir".
 - [x] 3.2 Attachment chips above the textarea with remove (×).
 - [x] 3.3 Text files/folders inlined as fenced, path-labelled blocks (size cap, binary skip).
@@ -55,7 +55,7 @@ Gate: phase 2 suite green + phase 1 + regression green.
       size cap, image `content` array shape, from-workdir flow, remove chip.
 Gate: phase 3 suite green + phases 1-2 + regression green. **COMPLETE.**
 
-## Phase 4 — Integration close-out
+## Phase 4 — Integration close-out [DONE]
 - [x] 4.1 Full frontend suite + full python suite in CI-style one command.
 - [x] 4.2 `gatelog.md` final pass; `REPORT.md`/`PLAN.md` statuses updated.
 - [x] 4.3 README updated for new features (profiles, agent prompt, attachments).
@@ -64,7 +64,7 @@ Gate: every plan checkbox above checked and all suites green. — **Satisfied: `
 
 ---
 
-## Phase 5 — Dynamic per-endpoint API key (bearer auth) [RECON DONE, NOT STARTED]
+## Phase 5 — Dynamic per-endpoint API key (bearer auth) [DONE]
 **Why:** Provider endpoint profiles have no way to carry a credential. OpenAI-compatible
 endpoints require an API key, but the profile shape is `{id,name,backend,endpoint,model}`
 and **every** request to the model sends only `Content-Type` — there is no
@@ -139,7 +139,7 @@ structured output reaches the system the harness runs on.
 Status: **DONE (all suites green — `npm test` ALL GREEN).**
 Gate: phase 7 suite green + phases 5-6 + regression green. — **Satisfied.**
 
-## Phase 8 — Codereview #1 fix + close-out [COMPLETE]
+## Phase 8 — Codereview #1 fix + close-out [DONE]
 **Why:** The most severe recorded issue is `index.html:707`
 `acc.content+=o.content||acc.content` — on the `chat.end` aggregate stream shape a
 content-less assistant message self-appends the accumulated buffer, duplicating the response.

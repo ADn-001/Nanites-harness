@@ -112,40 +112,66 @@ You can relax these controls with explicit flags, but only do so if you understa
 
 - Python 3.9+ recommended
 - A modern browser
-- Optional: Node.js if you want to syntax-check extracted frontend JavaScript manually
+- Node.js 20+ — the frontend suite needs the project's single npm dependency (`jsdom`), installed once by `npm install`
 
-## Quick start on Windows 11
+### About the interpreter name
 
-### 1. Put the files in one folder
+Every command in this file invokes the interpreter as `python3`, because plain
+`python` does not exist at all on many Linux distributions (`python: command not
+found`), while `package.json` runs its scripts as `python3` regardless.
 
-Example:
+On Windows the `python3` name is often missing from your PATH. Use the **Python
+launcher** there — it is the real equivalent, and it is not the same thing as
+plain `python`:
 
-```powershell
-C:\cogitator
+```text
+py -3 bridge.py
 ```
 
-At minimum, keep these together:
+So: everywhere this file says `python3 foo.py`, read it as `py -3 foo.py` on
+Windows. Nothing here should ever be typed as bare `python`.
 
-- `index.html`
-- `bridge.py`
-- `bridge_daemon.py`
-- `sw.js`
-- `manifest.webmanifest`
-- `icon.svg`
-- `test_e2e.py`
+## Quick start (Linux, macOS, Windows)
 
-If you want the full visual experience, also include your image assets:
+The commands below are identical on all three platforms. Throughout this file
+**`<repo-dir>`** is a placeholder for wherever you clone the repository to —
+substitute your own path the first time you see it, and keep using that
+directory for every command that follows.
 
-- `WH40KIDLE.gif`
-- `WH40KSpinAnimation.gif`
-- `icon.png`
-- `icon-192.png`
+### 1. Clone the repository
 
-### 2. Run the test suite
+```sh
+git clone https://github.com/ADn-001/Nanites-harness.git <repo-dir>
+cd <repo-dir>
+```
 
-```powershell
-cd C:\cogitator
-python test_e2e.py
+This gets you every file the harness needs — `index.html`, `bridge.py`,
+`bridge_daemon.py`, `sw.js`, `manifest.webmanifest`, `icon.svg`, `test_e2e.py`
+and the frontend suites under `tests/frontend/` — already laid out together in
+one folder, which is the only arrangement the app and the suites expect. The
+optional image assets (`WH40KIDLE.gif`, `WH40KSpinAnimation.gif`, `icon.png`,
+`icon-192.png`) come down with it too; they are for the full visual experience
+and nothing fails without them.
+
+### 2. Install the one dependency
+
+```sh
+npm install
+```
+
+This installs `jsdom`, the project's only npm dependency, and it is **REQUIRED**
+for the frontend suite — you cannot skip this step. Skip it and the first test
+run a newcomer does dies with `Cannot find module 'jsdom'`. The step needs Node.js
+20+, and it must happen *before* you run anything in step 3.
+
+(That is a different install from the one LOCAL CORTEX runs inside
+`localmodels/` for the Laya gate — that one really is skippable, and it is
+described further down.)
+
+### 3. Run the test suite
+
+```sh
+python3 test_e2e.py
 ```
 
 Expected result:
@@ -154,19 +180,30 @@ Expected result:
 0 FAILURES
 ```
 
-### 3. Optional syntax checks
+That is the Python bridge/daemon suite. To run **everything** — the full
+frontend suite, then the full Python suite — in the one command step 2 made
+possible:
 
-```powershell
-python -m py_compile bridge.py
-python -m py_compile bridge_daemon.py
+```sh
+npm test
 ```
 
-### 4. Start the app
+Expected: the frontend suite prints `ALL GREEN` and the Python suite prints
+`0 FAILURES`.
+
+### 4. Optional syntax checks
+
+```sh
+python3 -m py_compile bridge.py
+python3 -m py_compile bridge_daemon.py
+```
+
+### 5. Start the app
 
 Simple local server:
 
-```powershell
-python -m http.server 8080
+```sh
+python3 -m http.server 8080
 ```
 
 Then open:
@@ -175,13 +212,13 @@ Then open:
 http://localhost:8080/index.html
 ```
 
-### 5. Start the bridge daemon
+### 6. Start the bridge daemon
 
-In another PowerShell window:
+In another terminal window:
 
-```powershell
-cd C:\cogitator
-python bridge_daemon.py
+```sh
+cd <repo-dir>
+python3 bridge_daemon.py
 ```
 
 The daemon enforces the same Origin allow-list as the bridge on every route
@@ -202,14 +239,18 @@ Then in the app:
 
 If you do not want the daemon, you can run the bridge directly:
 
-```powershell
-python bridge.py
+```sh
+python3 bridge.py
 ```
 
-Or with options:
+Or with options — `--root PATH` takes any absolute path on your platform:
+
+```sh
+python3 bridge.py --root /home/you/projects/yourproject --port 8931
+```
 
 ```powershell
-python bridge.py --root C:\path\to\project --port 8931
+python3 bridge.py --root C:\path\to\project --port 8931
 ```
 
 Useful flags:
@@ -294,11 +335,16 @@ powershell -ExecutionPolicy Bypass -File localmodels\setup.ps1
 Both scripts create a virtualenv under `localmodels/`, install the Needle package, and
 really fetch the base weights plus the engine library into the package's own cache
 (`~/.cache/cactus-needle/…`). The download is idempotent — a cached file is skipped, so
-re-running the script is safe. Run the daemon with that venv's python:
+re-running the script is safe. Run the daemon with that venv's interpreter — the venv
+path differs by platform, so use the one matching your OS:
+
+Linux / macOS:
 
 ```bash
 localmodels/.venv/bin/python localmodels/local_models_daemon.py
 ```
+
+Windows:
 
 ```powershell
 localmodels\.venv\Scripts\python.exe localmodels\local_models_daemon.py
@@ -426,19 +472,28 @@ keeps working, exactly as if Laya were switched off.
 
 ## Autostart on Windows
 
+This one rite really is Windows-only: it registers a login item in the Windows
+Startup folder.
+
 Install:
 
 ```powershell
-python bridge_daemon.py --install-autostart
+py -3 bridge_daemon.py --install-autostart
 ```
 
 Remove:
 
 ```powershell
-python bridge_daemon.py --remove-autostart
+py -3 bridge_daemon.py --remove-autostart
 ```
 
-On Windows, the daemon prefers `pythonw.exe` for autostart to avoid a console window flash at login.
+On Windows, the daemon prefers `pythonw.exe` for autostart to avoid a console
+window flash at login.
+
+On Linux and macOS there is no equivalent built in — use whatever your session
+manager offers (a systemd user unit, or a `launchd` agent on macOS) and start
+`python3 bridge_daemon.py` the same way. The POSIX interpreter name is
+`python3`, spelled as shown in every other command in this file.
 
 ## Project layout
 
@@ -495,8 +550,8 @@ Check:
 ### The bridge chip says daemon offline
 Run:
 
-```powershell
-python bridge_daemon.py
+```sh
+python3 bridge_daemon.py
 ```
 
 ### Tool rites fail
@@ -541,8 +596,8 @@ This package includes an E2E suite covering:
 
 Run it with:
 
-```powershell
-python test_e2e.py
+```sh
+python3 test_e2e.py
 ```
 
 The frontend improvements (profiles, per-endpoint API key, agent prompt + structured
@@ -550,12 +605,14 @@ output validator, attachments, aggregate-stream parser) are covered by the Node/
 e2e suites in `tests/frontend/` (run with `node tests/frontend/run.js`). To run **everything**
 — the full frontend suite then the full Python bridge/daemon suite — in one command:
 
-```powershell
+```sh
 npm test
 ```
 
 Expected result: frontend suite prints `ALL GREEN` and the Python suite prints `0 FAILURES`.
-(Requires Node.js + `npm install` once for the jsdom dependency.)
+This command assumes `npm install` has already run — it is **step 2** of the
+Quick start above, and jsdom must be on disk before the frontend suite can start.
+Do not come straight here on a fresh clone.
 
 ## License / usage
 

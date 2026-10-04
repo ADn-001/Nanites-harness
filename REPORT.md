@@ -4,12 +4,26 @@ Date: 2026-09-18
 Scope: before any feature work, establish what exists, what is tested, and what the
        requested improvements require. This document feeds `PLAN.md`.
 
-## What exists today
+> **THIS IS A DATED SNAPSHOT, NOT A CURRENT INVENTORY.** It records the state of the
+> tree on 2026-09-18, before any phase landed. The line counts below are what the files
+> measured *on that date* and are deliberately NOT regenerated — refreshing them would
+> make a historical document describe a tree that never existed, and would quietly
+> destroy the before/after baseline this recon exists to provide.
+>
+> For the CURRENT file inventory, read the generated table in
+> `docs/plans/needle-laya-middleware-plan.md` §1, which `tools/gen_plan_status.py`
+> regenerates from the real files and `--check` fails on when it drifts.
+>
+> Completion status lives in `gatelog.md` and in `PLAN.md`'s per-phase header tags,
+> both of which are asserted against the gatelog by `tools/test_gen_plan_status.py`.
+> Do not read this file for status.
+
+## What existed on 2026-09-18
 
 Single-repo project of a WH40K-styled local chat frontend ("COGITATOR", aka Nanites-chat).
 Five runnable units:
 
-| File | Language | Role | Lines |
+| File | Language | Role | Lines (2026-09-18) |
 |------|----------|------|-------|
 | `index.html` | HTML/CSS/JS (one ~1140-line inline script) | Chat terminal UI + settings + agent loop | 1146 |
 | `bridge.py` | Python | Local tool executor (read/write/list/grep/git/run_command), jailed to a root | 293 |
