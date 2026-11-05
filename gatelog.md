@@ -1,6 +1,6 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **All phases complete** (0-15). Nothing left to work on in this plan.
+Next phase to work on: **Phase 18 — Sidecar: RLock the model lock, bound the pool, fence child teardown by generation**
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1081,8 +1081,433 @@ machine-specific changes; PR opened against `main`.
   it** — the plan called for a confirmation band and nothing implements it. Left as reserved;
   do not document it as working behaviour.
 
+# ===== AUDIT REMEDIATION — phases 16-24 (planned 2026-10-01 by nightly-support) =====
+
+Source: the 2026-09-30 `codebase-audit` ledger (`/home/user/codereview/Nanites-harness/`
+`sibling of projects/`), 28 entries the operator approved (`approved: true`, `status: new`),
+grouped into 9 tickets under `tickets/`. **Phases 10-15 are DONE and are not reopened** — this
+block is appended work, and phase numbering continues from 15 without renumbering anything.
+
+Every phase below follows this project's standing discipline, which is unchanged from phases
+1-15 and is not restated per phase: **implement → write the phase's own e2e suite → capture a
+RED run first → debug until green → only then mark done and fill in `### Findings`.** One phase
+per session/cron call. The regression gate is always `npm test` (frontend `ALL GREEN` **and**
+`python3 test_e2e.py` `0 FAILURES`) plus every earlier phase's suite.
+
+Phase order is by highest severity in the phase, so the phases that can lose data or execute
+outside the jail land before the diagnostics and docs work. Tickets are referenced by ID only
+(deliberately: absolute personal paths must never enter a tracked file — see the share-readiness
+rule and finding CR-Nanites-harness-0027).
+
+---
+
+## Phase 16 — Bridge jail: git flag audit, grep symlinks, one git policy
+Status: **DONE**
+Ticket: `TICKET-2026-10-01-bridge-jail-git-policy` (CR-Nanites-harness-0001 critical, 0002 high, 0009 medium)
+Supersedes: the plan below as written — the independent review found a **fourth** escape the
+  deliverable did not name (`git diff --no-index`), and it is closed here. Read the findings
+  before reusing the plan's flag list.
+
+Deliverable: `bridge.py` `_git_flag_audit` extended to EVERY `GIT_READ` subcommand (reject
+`--output`, `--exec-path`, `--output-indicator-new`; refuse `format-patch`/`archive` entirely),
+`t_grep` given the same per-file `jail()` check `t_read_file` already has plus explicit
+symlinked-dirname pruning, and the git read-only policy reduced to a single source the frontend
+consumes (so `isReadRite` cannot disagree with the bridge — 0009 is the structural cause of
+0001).
+Gate: `test_e2e.py` gains cases asserting `git log/diff/show/blame --output=<tmp>` is refused and
+writes no file outside `ROOT`, `format-patch` is refused, and a symlinked FILE is not matched by
+`grep` while `read_file`/`list_dir` still refuse it; a new frontend case drives the **real**
+`isReadRite` (never the phase-14 stub) and asserts false for `--output`/`--exec-path`/
+`format-patch`. Done = every existing suite still green AND a read subcommand with a file-writing
+flag cannot reach the bridge at all, in either layer.
+
+### Findings
+
+**Gate evidence.** `npm test` green end to end: `node tests/frontend/run.js` → `FRONTEND SUITE:
+ALL GREEN` (16 files, incl. the new `phase16_git_policy.test.js`), and `python3 test_e2e.py` →
+`0 FAILURES`. Mutation harness `tools/mutate_phase16.py`: 16 mutations, **14 caught, 0 real
+escapes, 2 documented equivalents** (M6 and M9 — findings 5 and 6). Re-run it after touching
+`bridge.py` or `isReadRite`; it is the only thing here that proves the new tests have teeth.
+
+1. **The ticket's flag list was INCOMPLETE, and the review caught it. Do not reuse it.**
+   The deliverable named `--output`, `--exec-path`, `--output-indicator-new` and the
+   `format-patch`/`archive` refusals. None of those is a *read* escape, so all three
+   subcommand-refusals were redundant where they were written — `format-patch` and `archive`
+   are not in `GIT_READ`, so the fall-through error already refused them. The independent
+   review found the escape that was actually reachable and unfixed:
+   **`git diff --no-index /etc/passwd /dev/null` reads any file on the box.** `--no-index`
+   makes diff compare two arbitrary paths instead of repo contents; it was permitted by the
+   bridge AND classified a read rite by the frontend, so with `autoApproveRead` defaulting
+   true it auto-ran with no operator prompt. Confirmed end-to-end by direct probe before the
+   fix (the bridge returned the contents of `/etc/passwd`; `isReadRite` returned `true`), and
+   re-probed after: refused in both layers. **It is now in `GIT_JAIL_FLAGS`.** Lesson for any
+   future "which flags can escape the jail" list: enumerate by *what the flag can reach* (a
+   path outside ROOT), not by *which subcommand is known to be dangerous today*.
+
+2. **`GIT_JAIL_FLAGS`, not `GIT_OUTPUT_FLAGS` — the name was wrong and hid the read side.**
+   The first version of this fix called the tuple `GIT_OUTPUT_FLAGS` and described it as "the
+   file-writing flags". `--no-index` is a *read* escape, so the name actively steered the
+   search away from it. Renamed, with the reasoning in the docstring. If you add a flag here,
+   ask "can this reach a path outside ROOT", not "does this write".
+
+3. **Deny-list, not allow-list, for the log/diff/show family — a considered choice, not
+   laziness.** CR-0001 suggested inverting to an allow-list of flags per read subcommand. It is
+   right for `branch`/`tag`/`stash` (already implemented that way) and wrong for the rest:
+   `log`/`diff`/`show` carry a large legitimate surface (`--oneline`, `-n`, `--since`,
+   `--author`, `-p`, `--stat`, `--no-color`, paths, revision ranges) and an allow-list that
+   omits one breaks ordinary use. **A security fix that breaks the tool gets worked around**,
+   which is worse than the bug. The per-subcommand allow-lists stay for the three that had
+   them; the out-of-jail flags are denied uniformly.
+
+4. **Check ORDER is load-bearing, and the "obviously right" order was wrong.** My first version
+   ran the generic flag check before the subcommand check, with a comment claiming that
+   ordering was a correctness property. It is not — both checks are independently sufficient,
+   so either order is *safe* — but the generic message then shadowed the specific one, and
+   `git archive --output=x` stopped naming `archive` in its refusal. The assertion that caught
+   this (`the file-writing refusal NAMES the subcommand`) was **RED while the rest of the
+   suite was green**, so a per-assertion grep over a filtered run would have missed it.
+   Most-specific-first is now the order, and mutation M4b pins it. **Lesson: a green summary
+   line is not evidence that every assertion ran — read the failure lines, not just the
+   total.** (I hit exactly this: a `head -10` on a grep hid the failure and I reported the
+   suite green. It was not.)
+
+5. **M9 is a DOCUMENTED EQUIVALENT mutation, not a test gap — proved, not assumed.** Dropping
+   the explicit `FRONT_GIT_REFUSED_WRITE.has(sub)` check leaves the suite green. That is
+   *correct*, and the reason is set disjointness: every member of `FRONT_GIT_REFUSED_WRITE` is
+   absent from `FRONT_GIT_READ` and is not one of the special-cased `branch`/`tag`/`stash`, so
+   `isReadRite` reaches `return FRONT_GIT_READ.has(sub)` and gets `false` anyway. No input
+   distinguishes the two guards, so no test could catch it. The layer is still pinned two
+   other ways: M9b (emptying the table IS caught) and the suite's explicit non-overlap
+   assertion, which is what would fire if a subcommand ever landed in both tables. **Do not
+   "fix" this by deleting the check** — it is defence in depth, and it becomes load-bearing
+   the day the sets intersect.
+
+6. **`t_grep` now jails every file it opens, and `os.walk` is called with `followlinks=False`
+   EXPLICITLY.** `os.walk`'s default already is `False`, so no behavioural test can tell the
+   kwarg from the default — the suite asserts the call *structurally* instead, and M6b
+   (flipping it to `True`) is caught. **M6 (deleting the `islink` prune) is a documented
+   equivalent**: while `followlinks=False` holds, no input distinguishes the prune from the
+   kwarg, so it is kept as the guard against a future edit flipping that kwarg rather than
+   pinned by a test. The per-file check is a `realpath`
+   containment test, **skipped not raised**, so one escaping symlink does not fail the whole
+   grep. The realpath-then-open TOCTOU window remains open (a full fix needs
+   `O_NOFOLLOW`/`openat`), and hardlinks inside ROOT are indistinguishable by path — both are
+   limitations `t_read_file` already has, so this is not a regression. Flagged, not fixed.
+
+7. **The frontend policy is GENERATED, not copied — and the generator is checked in the
+   suite.** `tools/gen_git_policy.py` imports `bridge.py` and emits the `FRONT_GIT_*` block
+   between two markers in `index.html`; `test_e2e.py` runs it with `--check` and fails if the
+   committed block has drifted, plus asserts the emitted block really carries the bridge's
+   subcommands and flags. Guard verified to have teeth by planting `format-patch` into the
+   generated `FRONT_GIT_READ`: `--check` exited 1 *and* the frontend suite went red. **After
+   editing any `GIT_*` table in `bridge.py`, run `python3 tools/gen_git_policy.py --write`.**
+   M11 covers the drift case.
+
+8. **The frontend tokenizer KEEPS quotes, so the flag check must strip them.** `parts` comes
+   from a regex that preserves `"..."`, so `"--output=/tmp/x"` matched neither the exact nor
+   the `flag=` prefix test and was reported a READ while the bridge (`shlex.split`) refused the
+   same call. The bridge was the backstop so there was no write, **but the two layers
+   disagreed on classification** — the operator would be shown a read the bridge then refuses.
+   `isReadRite` now maps `parts` through a quote-strip before any comparison; M7b pins it.
+   **This is the general shape of 0009: the layers must agree on the DECISION, not merely
+   reach the same outcome by different routes.**
+
+9. **A top-level `const` in a classic script is NOT a window property.** The phase-16 frontend
+   suite reads `FRONT_GIT_READ` via `win.eval(...)`, not `win.FRONT_GIT_READ` — the latter is
+   `undefined`, which would have made every single-source assertion **vacuously skip** and
+   report green. The suite asserts the lookup succeeded (non-null, correct shape) before
+   trusting it, so the guard cannot pass by finding nothing. Same class of bug as finding 10.
+
+10. **`bridge_daemon.log` is a TRACKED file that every test run dirties.** It appeared as an
+    unstaged modification after each suite run. It was clean at session start, so it is
+    restored (`git checkout -- bridge_daemon.log`) before committing and **must not be swept
+    into a phase commit**. A tracked runtime log is itself a finding — CR-Nanites-harness-0008
+    records that it leaks a personal absolute path. The durable fix is to untrack and
+    gitignore it, which is out of scope here and left to whoever owns 0008.
+
+11. **Run the independent review BEFORE committing, not after.** The `--no-index` escape existed
+    in the very code this phase was written to fix, was reachable, and appeared in neither the
+    ticket nor the plan. It was found by a reviewer reading the diff. Both of its load-bearing
+    claims verified true on direct probe — one a real security hole, one a real red suite that
+    contradicted a run I had just watched report green. The review is not a formality here.
+
+---
+
+## Phase 17 — Agent turn: bind its own message, well-formed tool protocol, teardown on every exit
+Status: **DONE** (after two review rounds: R1 and R2 — see Findings)
+Ticket: `TICKET-2026-10-01-agent-turn-stream-integrity` (CR-Nanites-harness-0011 critical, 0012 critical, 0015 high, 0013 high, 0014 high)
+
+Deliverable: the SSE pump and `refreshLast` bind the message they were handed instead of
+re-deriving `active().messages[length-1]` (0011); dispatcher results are pushed so the first
+request is protocol-legal — either a synthesised assistant `tool_calls` precedes each `tool`
+message, or the pre-router result is injected as a plain observation (0012);
+`mergeToolDelta` compacts once, at hand-off, not inside the delta loop (0015); `halt()` settles
+**every** resolver including `proposalResolve` (0013); and the stream teardown moves into a
+`finally` so nothing thrown inside the `catch` can leave `generating` stuck (0014), with
+`clearActive`/`deleteChat`/wipe guarded by `if(generating)return;`.
+Gate: new frontend suite asserts (a) deltas land on the message the turn created even when a tool
+message is appended mid-stream, (b) every `tool` message in every outbound request is preceded by
+an assistant declaring that `tool_call_id` — `tool_call_id` currently has 0 occurrences across
+`tests/frontend`, which is exactly why both bugs shipped, (c) STOP from every modal state clears
+`generating` and restores the send button, (d) a `finally` survives a throwing `catch`, and (e)
+`mergeToolDelta` fed two index-less fragments — and index 1 before index 0 — yields ONE coherent
+call each. Count `modelDispatches` (bridge bodies minus the workdir-listing signature), never raw
+bridge POSTs — the Phase 11 landmine still applies. Done = no path leaves the app permanently
+busy, and no outbound request can be rejected by a strict OpenAI-compatible server.
+
+### Findings
+
+**The gate was met, but only after two review rounds — and the harness was lying the whole time.**
+
+Five CRs (0011/0012/0013/0014/0015) are fixed and pinned. What the record must carry forward:
+
+- **`tools/mutate_phase17.py` was a SyntaxError and had NEVER RUN.** M10c shipped as a
+  multi-line plain `"..."` literal (Python cannot span a plain string across lines), so the
+  whole harness died at import. Phase 17 looked fully instrumented — 21 mutation tuples, three
+  carefully documented equivalents — while having produced *zero* mutation evidence. If you add
+  a mutation, RUN the harness; "it exists" is not "it executed". A harness is code: `ast.parse`
+  it before believing it.
+
+- **A harness pointed at the wrong suite invents findings.** M7b and M10c target assertions in
+  the R1 file, but the harness only ever ran `phase17_agent_turn.test.js`. Scored there they
+  report ESCAPED — a hole that does not exist. Measured, not assumed: each was run against BOTH
+  files and lands green on one, red on the other. There are now three suite constants
+  (`JS`/`JS_R1`/`JS_R2`) and which one scores a mutation is a measurement, not a guess.
+
+- **The harness could never exit 0.** `expect_red=None` (a documented equivalent) was scored
+  `ESCAPED`, so three permanent equivalents made the exit code always 1 and a real regression
+  was indistinguishable from baseline. Equivalents now get their own `equivalent` verdict and
+  are excluded from the exit code. Three remain, all proved unobservable by reachability:
+  M3, M3b, M10.
+
+- **R2-A (CR-0011 was incomplete):** `runAgentLoop` mints a FRESH assistant message every
+  iteration but never rebound `streamTarget`, so from iteration 1 the pump wrote into the turn's
+  FIRST assistant bubble. The defect was *relocated*, not fixed — same user symptom (the live
+  bubble empty), different message. **Lesson: when a fix binds a target, every site that
+  REBINDS that target must rebind it too. Follow the ownership when it moves.**
+
+- **R2-B (CR-0012 was incomplete):** `buildMessages`' budget trim `break`s on the first
+  over-budget message with no dangling-tool guard, so it could keep a `tool` message while
+  dropping the assistant that declared its `tool_call_id` — the exact illegality `declareRites`
+  was added to remove, re-created by the trim. `compactChat` had this guard all along; port it
+  rather than invent a second shape.
+
+- **R2-C (CR-0015 introduced a crash):** `compactToolCalls` REBOUND `acc.toolCalls` to a
+  `filter(Boolean)` result, but the pump assigns `m.toolCalls = acc.toolCalls` BY REFERENCE.
+  The message therefore kept the hole-bearing array, `ctxTokens`' `for...of` yields `undefined`
+  for holes, and `tok(t.args)` threw out of `renderMessages` — message rendering broken until
+  reload, with the throw silently swallowed by pumpSSE's `catch(e){}`. Now compacts IN PLACE.
+  **The distinguishing input is a PERMANENT hole** (a skipped/truncated index). If every index
+  eventually arrives the array ends up dense and the defect is invisible — my first fixture sent
+  {2,0,1} and passed *vacuously*. **Also: `some`/`map`/`filter` SKIP holes; `for...of` does not.**
+  A sparse array can look clean to every assertion built on the skipping methods.
+
+- **R2-D:** `msgAction('del')` — the per-message purge — was not guarded by `generating`.
+  Deleting the streaming message makes the bound target vanish, `refreshLast`'s
+  `indexOf(...)!==-1` check fails, and it SILENTLY falls back to `messages[length-1]`: CR-0011
+  returning through the back door. **When you guard one purge path, enumerate ALL of them** —
+  `clearActive`, `deleteChat` and `msgAction('del')` are three, and only two were guarded.
+
+- **R2-E (CR-0014 was incomplete twice):** R1 moved four preamble statements inside the `try`
+  but LEFT `generating=true; abortCtl=...; const sig=streamSignal();` above it, reasoning that
+  those "cannot throw". `streamSignal()` calls `AbortSignal.timeout`/`any` and CAN throw, so the
+  last uncovered window sat one line above the fix claiming to close it. **Rule now written into
+  the code: nothing that can throw may live above the `try{`.** `sig` is declared with `target`
+  and `m` before the try, because a binding declared inside a try is out of scope in its own
+  `finally` — which would make the teardown itself throw.
+
+- **Do NOT run the mutation harness concurrently with anything that reads `index.html`.** It
+  mutates that file in place. A review subagent reading it during a sweep sees three different
+  hashes and its line references may point at mutated code. Serialise them, or copy the tree.
+
+- **`buildMessages` is async and reads `active()`** — it takes no chat argument. A probe that
+  calls it synchronously gets a Promise, and `active()` is `undefined` until a chat exists (send
+  one turn first). Two of my first three R2 fixtures were broken probes, not product defects.
+
+- `bridge_daemon.log` is TRACKED and carries runtime noise. It was already tracked before this
+  phase; it is excluded from phase commits rather than untracked here (a phase does not
+  silently change repo conventions).
+
+Evidence: `npm test` -> FRONTEND SUITE: ALL GREEN (20 files) + `0 FAILURES` from
+`test_e2e.py`. `python3 tools/mutate_phase17.py` -> 26 mutations, 22 caught, 0 escaped,
+3 documented equivalents, 0 stale.
+
+---
+
+## Phase 18 — Sidecar: RLock the model lock, bound the pool, fence child teardown by generation
+Status: **not started**
+Ticket: `TICKET-2026-10-01-sidecar-concurrency-deadlock` (CR-Nanites-harness-0010 critical, 0019 high, 0020 high)
+
+Deliverable: `localmodels/needle_backend.py` `_LOCK` becomes `threading.RLock()` (0010);
+`MODEL_POOL` gains a queue bound plus `future.cancel()` on the timeout path so a stale work item
+cannot occupy the single worker forever (0019); `_read_stdout`'s teardown carries the child's
+identity (a monotonically increasing generation id) and `_fail_pending` is a no-op unless the
+dying child is still the registered current one (0020).
+Gate: a `test_e2e.py` case sets `NEEDLE_WEIGHTS` to an existing file, calls `/repair` and asserts
+it RETURNS rather than hanging — **with a timeout, so the deadlock fails instead of stalling the
+suite**; a saturation case asserts the (N+1)th concurrent call is refused rather than queued; a
+deterministic case registers a pending request against a NEW child, fires the OLD child's teardown,
+and asserts the pending request survives. `NEEDLE_WEIGHTS` has 0 occurrences in the suite today,
+which is precisely why a guaranteed deadlock shipped green. Done = the documented tuned-weights
+configuration serves a first `/repair` and a child reap cannot fail the live child's work.
+
+### Findings
+
+---
+
+## Phase 19 — Daemon auth: per-install token on privileged routes, provenance-checked atomic start
+Status: **not started**
+Ticket: `TICKET-2026-10-01-daemon-auth-and-lifecycle` (CR-Nanites-harness-0017 high, 0016 high, 0023 medium, 0024 medium)
+
+Deliverable: a per-install token generated at daemon start, required in a header on every
+privileged route across all three servers, with the Host header pinned to a loopback name as a
+second check; "absent Origin" stops meaning "allowed" (0017). `_cors` stops emitting
+`Access-Control-Allow-Origin: *` on refusals. `start_bridge()` re-writes `bridge.py` from
+`read_bridge_source()` (or verifies its marker/hash and refuses on mismatch) so an agent cannot
+get its own code executed by a more privileged process (0016); `_lock` is taken in
+`start_bridge`/`stop_bridge` so the rebind atomicity its comment claims is real (0023);
+`write_bridge` writes tmp + `os.replace` with `BRIDGE_MARKER` on line 1 (0024).
+Gate: `test_e2e.py` keeps its existing Origin matrix (that work is genuinely good — do not
+weaken it) and ADDS the untested half: a privileged route with no token is refused even from
+`localhost`, a foreign `Host` is refused, a tampered planted `bridge.py` is not spawned, and a
+`/set_workdir` racing a `/start` cannot end up bound to one directory while serving another.
+**This phase changes the behaviour the Phase 9 gate log deliberately left open** ("a request with
+no Origin header is still allowed") — that note becomes stale and must be updated in this phase's
+findings, not silently contradicted. Probe the daemon only on a COPY in a temp dir with spare
+ports; never in-place in the repo (it writes its pid/log next to itself, finding 0008). Done = no
+local unauthenticated client reaches a privileged route, and the daemon never spawns a file it did
+not write.
+
+### Findings
+
+---
+
+## Phase 20 — Compaction: never discard the transcript on an empty summary, never stringify array content
+Status: **not started**
+Ticket: `TICKET-2026-10-01-compaction-data-loss` (CR-Nanites-harness-0003 high, 0026 medium)
+
+Deliverable: `compactChat` bails BEFORE touching `c.messages` when the summary call returns empty,
+and reports that plainly instead of silently slicing (0003); the compression history and
+`refreshLast` both route through `CogCore.contentText()` so attachment arrays are summarised as
+text rather than `[object Object]` (0026).
+Gate: a new suite pins the empty-summary case first (messages and `c.summary` both untouched,
+and the operator is told), plus the array-content case (the prompt contains the attachment's text)
+and the `refreshLast` render matching `msgHTML`'s guarded output. `compactChat` is currently called
+by NO test — the only match in `tests/frontend` is a comment — so this is the first suite for the
+whole rite; keep it that way. Remember the budget walk and the dangling-tool-result boundary are
+part of the same function. Done = no automatic rite (`maybeAutoCompact` fires at 85% of the
+context limit with no operator action) can lose the front of a conversation.
+
+### Findings
+
+---
+
+## Phase 21 — Service worker: an offline load cannot serve HTML as the app bundle
+Status: **not started**
+Ticket: `TICKET-2026-10-01-sw-offline-and-cache` (CR-Nanites-harness-0018 high, 0007 medium)
+
+Deliverable: `./appcore.js` added to `SHELL`, and the navigation fallback restricted to
+`e.request.mode === 'navigate'` / `destination === 'document'` so a script request can never be
+answered with the HTML document (0018); `CACHE` derived from a version constant the app assets also
+carry, so one bump invalidates the cache atomically instead of relying on a human remembering one
+line (0007).
+Gate: static assertions only — jsdom has no ServiceWorker/container APIs, so the achievable guards
+are "every same-origin script referenced by `index.html` appears in `SHELL`" and "the `CACHE`
+string changed when any SHELL asset changed". Offline support currently makes the app STRICTLY
+WORSE than no offline support (a white screen, no message); the mode guard is what makes the
+failure honest, so do not ship only the `SHELL` addition. Done = a failed script fetch surfaces
+as an honest error, never as a parse-failure death.
+
+### Findings
+
+---
+
+## Phase 22 — Sidecar request path and ledger: contain malformed input, bound growth, actually redact
+Status: **not started**
+Ticket: `TICKET-2026-10-01-sidecar-request-and-ledger-integrity` (CR-Nanites-harness-0021, 0022, 0025, 0006, 0004)
+
+Deliverable: the `n <= 0 or n > MAX` body form used in all three servers, the `int()` parse
+wrapped to return 400, and a byte cap during the read — a lying length is the whole attack, so
+declared length alone is not a bound (0021); candidate name extraction normalised to accept both
+the nested and flattened `function` shapes, with the ledger append in its own `try/except` so
+telemetry can never affect the response path (0022); `action` validated server-side against
+`_LEDGER_ACTIONS` so the daemon and `tools/tune_thresholds.py` cannot disagree (0006); size-based
+rotation in `append_record` with the size surfaced in `/health` (0006); `_ledger_tail` bounded by
+BYTES as well as lines, seeking backward from EOF (0025); the configured provider key actually
+passed to the redaction call, or the docstring corrected to stop asserting a rule no code path
+provides (0004).
+Gate: `test_e2e.py` asserts a negative and a non-numeric `Content-Length` are refused rather than
+read or dropped, a candidate with `{"function":"read_file"}` gets a clean response, an action
+outside the vocabulary is refused, an injected unknown action word does NOT land in the measured
+acceptance rate, rotation bounds the file, and a ~10-fat-record ledger does not defeat the
+`/health` read bound. **Order matters: this phase must land AFTER Phase 19**, which moves the same
+servers' request handling and already touches `bridge.py`/`bridge_daemon.py` body parsing — two
+agents must not edit those lines. Done = no malformed request hangs, drops or 500s a handler, and
+the acceptance rate Phase 15's tuning rests on cannot be silently depressed.
+
+### Findings
+
+---
+
+## Phase 23 — Report a stream timeout as a timeout, and send the auth header the LM Studio probe omits
+Status: **not started**
+Ticket: `TICKET-2026-10-01-frontend-probe-and-timeout-diagnostics` (CR-Nanites-harness-0005 medium, 0029 medium)
+
+Deliverable: `stream()`'s catch distinguishes the two abort causes (`TimeoutError` vs the
+operator's own `abortCtl`), reports a timeout as a timeout, and does NOT fire the LM Studio
+soul-load retry on one — that retry is a second 120 s model load on top of a turn that already ran
+180 s (0005); the agent loop's budget becomes per-iteration while the operator's `abortCtl` stays
+the loop-wide kill switch (0005); `fetchLMSLoaded()` passes `authHeaders()` like all five sibling
+probes (0029).
+Gate: a new frontend suite must first INJECT a fake `AbortSignal`/timer — jsdom here DOES supply
+`AbortSignal.timeout` via Node 24, so the Phase 5 gatelog's claim that it does not is wrong and
+must not be relied on; delete the static and assert the defensive path still resolves. Assert the
+timeout message is not `VERIFY ENDPOINT LINK`, that no retry fires on a timeout, that an operator
+abort still reads as a halt, and that every probe hitting `/api/v0/models` carries the header.
+Stubbing an endpoint without inspecting request headers cannot catch 0029 — every frontend fetch in
+this project is tested for "does it get a 200" and not for "does it send the right headers". Done =
+the operator is sent to debug the component that is actually wrong.
+
+### Findings
+
+---
+
+## Phase 24 — Docs: tell the truth about completion status, and make a fresh clone work
+Status: **not started**
+Ticket: `TICKET-2026-10-01-docs-status-and-onboarding` (CR-Nanites-harness-0027 medium, 0028 medium)
+
+Deliverable: the plan document's line 3 corrected to DONE with its date and phases 10-14 given
+explicit status lines, `PLAN.md`'s self-contradictory Phase 5 header fixed against its own
+checkboxes, and the stale file-size tables regenerated or deleted (0027); `README.txt` install flow
+gains `git clone` and `npm install` as numbered steps, becomes platform-neutral, and uses `python3`
+consistently with `package.json` (0028).
+Gate: a cheap CI assertion that every gatelog phase marked DONE has a plan file whose status line
+agrees — the rot here is invisible precisely because nothing reads these files. Prefer GENERATING
+the status line and file inventory from `gatelog.md` and `wc -l` over hand-maintaining them across
+another 9 phases. This is the LAST phase on purpose: it documents work the earlier phases change.
+Done = a context-free session reading the plan header does not redo finished work or start a
+Phase 25 that does not exist.
+
+### Findings
+
+---
+
 ## Notes
 
+- **2026-10-01 (nightly-support, hand-started session): phases 16-24 appended; the 2026-09-26
+  "all phases complete" state was real and is deliberately NOT reopened.** A prior run of this
+  pass wrote all 9 tickets (dated 2026-10-01) and then died before its Step 4 and Step 5 — so the
+  tickets were on disk with the ledger still entirely `status: new` and **no phase planned for any
+  of them**. That is exactly the "correct files, zero progress, reports success" failure the skill
+  warns about, and the plan-complete flag was doing its job in the meantime. This run verified the
+  tickets cover all 28 approved+new findings exactly once (0008, 0030, 0031 are `approved: false`
+  and correctly excluded), then wrote phases 16-24 and marked the ledger `ticketed`. No cron was
+  created: the shared `dev-sprint-auto` + `queue-enqueuer-auto` pair owns scheduling.
+- The 9 tickets group the 28 approved findings by subsystem, not one-per-finding. `Phase 16..24`
+  map 1:1 onto those tickets; the ordering is by highest severity, and Phase 22 is sequenced after
+  Phase 19 on purpose because both edit the servers' body-parsing lines.
+- `REPO PATH` (unchanged): phases 10-15 live on `main` via merged PR #2; the checkout is still on
+  `feat/local-cortex-needle-laya`. The merge is not to be undone and no new PR is opened for it.
 - **Repo path (2026-09-26, no-op cron call).** The cron job's prompt still names
   `/home/user/Nanites-harness`, which **no longer exists**. The checkout lives at
   `/home/user/projects/Nanites-harness` (the `projects/` layout the dev-sprint skill mandates).
