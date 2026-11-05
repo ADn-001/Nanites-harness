@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json, os, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request, urllib.error
+import inspect, re
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 fails = []
@@ -3629,6 +3630,1279 @@ finally:
             os.remove(p19_autostart_entry)
         except OSError:
             pass
+
+# ---------------- PHASE 22 workstream B: sidecar ledger integrity ----------------
+# CR-Nanites-harness-0022 (candidate shape + telemetry isolation), 0006 (action
+# vocabulary + unbounded growth), 0025 (byte-bounded tail), 0004 (a docstring rule no
+# code path provides).
+#
+# The sidecar is started ONCE for this phase, in its own temp dir, with stderr
+# captured to a FILE: two of these cases assert that a traceback never reaches
+# stderr, which DEVNULL cannot show.
+P22_DIR = tempfile.mkdtemp(prefix='cogp22-')
+P22_LEDGER = os.path.join(P22_DIR, 'local-models.jsonl')
+P22_STDERR = os.path.join(P22_DIR, 'stderr.log')
+P22_PORT = 18980
+
+P22_SUSPECT = {'name': 'raed_file', 'arguments': '{"path": "main.py"}'}
+# The three candidate shapes a caller may legitimately send. The FLAT one is the
+# bug: `(c.get('function') or {}).get('name')` assumes function is a dict, and a
+# plain string raises AttributeError in the ledger-record argument expression -
+# i.e. in the HTTP handler, before append_record's own try/except ever runs.
+P22_NESTED = {'type': 'function',
+              'function': {'name': 'read_file', 'description': 'Read a file from disk.',
+                           'parameters': {'type': 'object',
+                                          'properties': {'path': {'type': 'string'}},
+                                          'required': ['path']}}}
+# The flattened shape, `function` already being the name. Carries read_file here so
+# case C reads exactly the shape in the finding; case D builds its own copy carrying
+# list_dir so the three shapes are checked against three DIFFERENT names.
+P22_FLAT_FUNCTION = {'type': 'function', 'function': 'read_file'}
+P22_FLAT_NAME = {'name': 'grep', 'description': 'Search a directory.',
+                 'parameters': {'type': 'object',
+                                'properties': {'pattern': {'type': 'string'}}}}
+
+
+def p22_daemon(port, ledger_path, extra=(), env=None):
+    """Start the sidecar with stderr captured to a file, in the phase-22 temp dir."""
+    errf = open(P22_STDERR, 'ab')
+    try:
+        p = subprocess.Popen([sys.executable, os.path.join(BASE, 'localmodels',
+                                                            'local_models_daemon.py'),
+                              '--port', str(port), '--ledger', ledger_path] + list(extra),
+                             stdout=subprocess.DEVNULL, stderr=errf, cwd=P22_DIR,
+                             env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1', **(env or {})))
+    finally:
+        errf.close()
+    register_port_token(port, read_server_token(os.path.join(BASE, 'localmodels',
+                                                             '.cogitator-token')))
+    return p
+
+
+def p22_stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def p22_ledger_lines(path=P22_LEDGER):
+    if not os.path.isfile(path):
+        return []
+    return [json.loads(ln) for ln in open(path, encoding='utf-8') if ln.strip()]
+
+
+def p22_raw_post(port, path, header_lines, body, timeout=10, half_close=False):
+    """POST with HAND-WRITTEN header lines; return (status_code, body_text).
+
+    urllib will not emit `Content-Length: -1` or `Content-Length: banana`, so the
+    two malformed-length cases can only be written on a raw socket - the same
+    technique `req_absent_host` and `req_non_ascii_token` already use above, copied
+    rather than imported. The body comes back too because a status code alone
+    cannot tell a Content-Length refusal from any other 400.
+
+    `half_close=True` sends `shutdown(SHUT_WR)` after the payload, which is what a
+    client that was cut off mid-body does. It is REQUIRED for the short-body case:
+    the server's `self.rfile.read(n)` only returns fewer than `n` bytes when the
+    peer half-closes, so without it a truncated request would just block until the
+    timeout instead of reproducing anything.
+    """
+    lines = ['POST %s HTTP/1.1' % path,
+             'Host: 127.0.0.1:%d' % port,
+             'Origin: %s' % P19_ORIGIN,
+             'X-Cogitator-Token: %s' % PORT_TOKENS[port],
+             'Content-Type: application/json',
+             'Connection: close'] + list(header_lines)
+    wire = ('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1') + body
+    sock = socket.create_connection(('127.0.0.1', port), timeout=timeout)
+    try:
+        sock.sendall(wire)
+        if half_close:
+            sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            part = sock.recv(65536)
+            if not part:
+                break
+            chunks.append(part)
+    finally:
+        sock.close()
+    raw = b''.join(chunks)
+    head, _, rest = raw.partition(b'\r\n\r\n')
+    first = head.split(b'\r\n', 1)[0].decode('latin-1')
+    try:
+        status = int(first.split()[1])
+    except (IndexError, ValueError):
+        return -1, raw.decode('latin-1', 'replace')   # no status line: the handler died
+    return status, rest.decode('utf-8', 'replace')
+
+
+def p22_stderr_text():
+    return open(P22_STDERR, encoding='utf-8', errors='replace').read() \
+        if os.path.isfile(P22_STDERR) else ''
+
+
+p22_proc = p22_daemon(P22_PORT, P22_LEDGER, ['--no-needle', '--no-laya'])
+time.sleep(1.0)
+try:
+    # ---- A: a negative Content-Length is REFUSED, not read ----
+    # `if n > MAX_JSON_BYTES` does not reject n < 0, and `self.rfile.read(-1)`
+    # reads until EOF: an unbounded read of whatever the client keeps sending, on
+    # a route whose size cap is supposed to be the thing that stops it. The
+    # timeout here is short on purpose - a hang IS the symptom.
+    #
+    # /repair is the route used for both length cases because it is the one that
+    # answers 200 on an EMPTY body (degraded:true), so a dropped body is visible
+    # as a success rather than hidden behind the route's own 400.
+    def p22_negative_content_length():
+        body = json.dumps({'suspect': P22_SUSPECT,
+                           'candidates': [P22_NESTED]}).encode()
+        t0 = time.time()
+        st, _ = p22_raw_post(P22_PORT, '/repair', ['Content-Length: -1'], body, timeout=6)
+        dt = time.time() - t0
+        if st != 400:
+            print('   Content-Length: -1 => %s after %.1fs (want 400; read(-1) reads to '
+                  'EOF, so this HANGS while the client holds the socket open)' % (st, dt))
+        return st == 400
+    lm_probe('phase22 sidecar: a NEGATIVE Content-Length is refused with 400, not read '
+             '(rfile.read(-1) would read to EOF)', p22_negative_content_length)
+
+    # ---- B: a non-numeric Content-Length is REFUSED, not DROPPED ----
+    # "Dropped" is load-bearing: the old code caught the ValueError, set n = 0 and
+    # returned ({}, None), so /repair answered 200 {ok:false, degraded:true} for a
+    # request whose body was never read - a success-shaped answer for a request
+    # that did not arrive. The status alone is not enough to tell a length refusal
+    # from any other 400, so the error text is asserted too.
+    def p22_non_numeric_content_length():
+        body = json.dumps({'suspect': P22_SUSPECT,
+                           'candidates': [P22_NESTED]}).encode()
+        st, resp = p22_raw_post(P22_PORT, '/repair', ['Content-Length: banana'], body)
+        s, j = req(P22_PORT, '/repair', {'suspect': P22_SUSPECT, 'candidates': [P22_NESTED]})
+        if st != 400 or 'content-length' not in resp.lower():
+            print('   Content-Length: banana => %s %r (want 400 naming the Content-Length; '
+                  'the old path answered 200 on an empty {} body, and the well-formed '
+                  'control answered %s %r)' % (st, resp, s, j))
+        return st == 400 and 'content-length' in resp.lower()
+    lm_probe('phase22 sidecar: a NON-NUMERIC Content-Length is refused with 400 naming the '
+             'length, not dropped into an empty {} body that /repair answers 200 on',
+             p22_non_numeric_content_length)
+
+    # The positive half, or "refuse everything" would pass both cases above: an
+    # absent Content-Length and a well-formed one must both still be served.
+    def p22_content_length_positive():
+        before = len(p22_ledger_lines())
+        s, j = req(P22_PORT, '/ledger', {'trace_id': 'tr_p22_ok', 'action': 'accepted'})
+        after = p22_ledger_lines()
+        return (s == 200 and j.get('ok') is True and len(after) == before + 1
+                and after[-1].get('trace_id') == 'tr_p22_ok')
+    lm_probe('phase22 sidecar: a well-formed POST /ledger still answers 200 and writes '
+             'its line (the refusals above are not a blanket ban)', p22_content_length_positive)
+
+    # ---- B2: a SHORT body under a VALID positive Content-Length is REFUSED ----
+    # The third length case, and the one the suite was structurally unable to catch:
+    # every length case above exercises a length value that is UNUSABLE (negative,
+    # non-numeric), never one that is perfectly valid but whose bytes never arrive.
+    # `_read_body` mapped `not raw` - a read of n > 0 bytes that came back short, and
+    # a read that RAISED - onto the same value as a legitimately empty body, ({}, None),
+    # so /repair proceeded and answered 200 {"ok": false, "degraded": true, ...} AND
+    # wrote a full op:'repair' ledger record for a request whose body was never read.
+    # That is precisely the defect this phase exists to close, so the status alone is
+    # not enough: the LEDGER FILE is asserted too, because a refusal that still writes
+    # an audit record is not a refusal.
+    #
+    # `half_close=True` is what makes this reproducible: `self.rfile.read(n)` only
+    # returns fewer than n bytes once the peer shuts down its write side, which is
+    # what a client cut off mid-flight does. /repair is the route on purpose - it is
+    # the one that answers 200 on an empty body, so a dropped body is visible as a
+    # SUCCESS rather than hidden behind the route's own 400.
+    def p22_short_body_refused():
+        full = json.dumps({'suspect': P22_SUSPECT,
+                           'candidates': [P22_NESTED]}).encode()
+        # Three shapes of "the bytes never arrived", because they fail differently:
+        # nothing at all, a complete JSON payload whose declared length was larger,
+        # and a payload cut in the middle of an object.
+        shapes = (('Content-Length: 107, zero body bytes sent', 107, b''),
+                  ('declared %d, sent %d (a COMPLETE JSON body)' % (len(full) + 50, len(full)),
+                   len(full) + 50, full),
+                  ('declared 107, sent %d (cut mid-object)' % min(20, len(full)),
+                   107, full[:20]))
+        problems = []
+        for label, declared, sent in shapes:
+            before = p22_ledger_lines()
+            st, resp = p22_raw_post(P22_PORT, '/repair',
+                                    ['Content-Length: %d' % declared], sent,
+                                    timeout=6, half_close=True)
+            grew = p22_ledger_lines()[len(before):]
+            if st == 200:
+                problems.append('%s => 200 %s (a success-shaped answer for a body that '
+                                'never arrived)' % (label, resp[:100]))
+            if grew:
+                problems.append('%s => %d ledger record(s) written anyway: %r'
+                                % (label, len(grew), grew[:1]))
+            # A framing failure and a malformed payload are different diagnoses, and
+            # "invalid JSON body" is the wrong one here: the JSON may be perfectly
+            # well formed and merely INCOMPLETE, so say so.
+            if 'truncat' not in resp.lower():
+                problems.append('%s => %s %r (want a 400 naming the truncated body, so '
+                                'the caller can tell framing from payload)'
+                                % (label, st, resp[:100]))
+        if problems:
+            print('   ' + '\n   '.join(problems))
+            return False
+        return True
+    lm_probe('phase22 sidecar: a body SHORTER than a valid positive Content-Length is a '
+             '400, not a success - for zero bytes, a complete-but-short body, and one '
+             'cut mid-object, and NONE of them writes a ledger record',
+             p22_short_body_refused)
+
+    # ---- B3: the control - a length that MATCHES the bytes is still served ----
+    # Without this, a `_read_body` that refuses every positive length passes B2 and
+    # the whole phase-22 block above. Same raw socket, same route, same hand-written
+    # header: only the arithmetic differs.
+    def p22_matching_length_still_served():
+        payload = json.dumps({'suspect': P22_SUSPECT,
+                              'candidates': [P22_NESTED]}).encode()
+        before = p22_ledger_lines()
+        st, resp = p22_raw_post(P22_PORT, '/repair',
+                                ['Content-Length: %d' % len(payload)], payload, timeout=6)
+        after = p22_ledger_lines()
+        grew = after[len(before):]
+        problems = []
+        if st != 200:
+            problems.append('a body whose declared length MATCHES got %s %r (want 200)'
+                            % (st, resp[:120]))
+        if len(grew) != 1:
+            problems.append('...and wrote %d ledger record(s), want 1: %r'
+                            % (len(grew), grew[:1]))
+        elif grew[0].get('op') != 'repair':
+            problems.append('...and wrote the wrong record: %r' % grew[0])
+        if problems:
+            print('   ' + '; '.join(problems))
+            return False
+        return True
+    lm_probe('phase22 sidecar: the CONTROL - a raw-socket POST whose declared length '
+             'matches the bytes sent is still served with 200 and its ledger record '
+             '(the short-body refusal is not a blanket ban)', p22_matching_length_still_served)
+
+    # ---- C: a FLAT candidate shape gets a CLEAN response, not a 500 ----
+    # CR-0022. `(c.get('function') or {}).get('name')` assumes `function` is a dict.
+    # The flattened OpenAI-ish {"function": "read_file"} raises AttributeError ON THE
+    # STRING - and it raises in the ARGUMENT EXPRESSION of append_record, which is
+    # evaluated BEFORE the call, so append_record's own blanket except never sees it
+    # and the exception escapes into the HTTP handler.
+    def p22_flat_function_candidate_clean():
+        before_err = p22_stderr_text()
+        s, j = req(P22_PORT, '/repair', {'suspect': P22_SUSPECT,
+                                         'candidates': [P22_FLAT_FUNCTION],
+                                         'trace_id': 'tr_p22_flat'})
+        new_err = p22_stderr_text()[len(before_err):]
+        if s != 200:
+            print('   flat candidate POST /repair => %s %r' % (s, j))
+            print('   stderr: %s' % new_err.strip()[-400:])
+            return False
+        # "Clean" means three things: the same envelope shape a nested candidate
+        # gets, no traceback in stderr, and a ledger record that carries the name.
+        envelope = (j.get('ok') is False and j.get('degraded') is True
+                    and j.get('reason') == 'disabled' and j.get('calls') == []
+                    and isinstance(j.get('latency_ms'), int)
+                    and j.get('trace_id') == 'tr_p22_flat'
+                    and 'confidence' in j and 'reasoning' in j)
+        rec = [r for r in p22_ledger_lines()
+               if r.get('trace_id') == 'tr_p22_flat' and r.get('op') == 'repair']
+        if 'Traceback' in new_err:
+            print('   flat candidate wrote a traceback to stderr: %s'
+                  % new_err.strip()[-400:])
+            return False
+        if not envelope:
+            print('   flat candidate envelope wrong: %r' % j)
+            return False
+        if len(rec) != 1:
+            print('   flat candidate wrote %d ledger records, want 1: %r' % (len(rec), rec))
+            return False
+        if rec[0].get('request', {}).get('candidates') != ['read_file']:
+            print('   flat candidate name was not extracted: %r'
+                  % rec[0].get('request'))
+            return False
+        return True
+    lm_probe('phase22 sidecar [CR-0022]: a candidate {"function": "read_file"} gets a CLEAN '
+             '200 - no 500, no traceback, and its name still reaches the ledger',
+             p22_flat_function_candidate_clean)
+
+    # ---- D: the POSITIVE direction of the extractor ----
+    # Without this, a helper that returned None for EVERY shape passes case C. Both
+    # shapes a real caller sends must still yield their name.
+    def p22_nested_and_flat_name_candidates():
+        # The expected name is paired with the shape that CARRIES it - the nested
+        # schema is read_file, the flat {"name":...} is grep, and the flattened
+        # {"function": "<name>"} is list_dir, so each shape is checked against a
+        # different name and a helper that returned the first candidate's name for
+        # all three cannot pass.
+        shapes = ((P22_NESTED, 'read_file'), (P22_FLAT_NAME, 'grep'),
+                  ({'type': 'function', 'function': 'list_dir'}, 'list_dir'))
+        out = {}
+        for i, (cand, want) in enumerate(shapes):
+            tid = 'tr_p22_shape%d' % i
+            s, j = req(P22_PORT, '/repair', {'suspect': P22_SUSPECT,
+                                             'candidates': [cand], 'trace_id': tid})
+            rec = [r for r in p22_ledger_lines()
+                   if r.get('trace_id') == tid and r.get('op') == 'repair']
+            out[want] = (s, rec[0].get('request', {}).get('candidates')
+                         if len(rec) == 1 else None)
+        bad = {k: v for k, v in out.items() if v != (200, [k])}
+        if bad:
+            print('   candidate shapes that did not yield their name: %r (all: %r)' % (bad, out))
+        return not bad
+    lm_probe('phase22 sidecar [CR-0022]: the nested {"function":{"name":...}}, the flat '
+             '{"name":...} and the flat {"function":"..."} shapes ALL still extract their '
+             'name', p22_nested_and_flat_name_candidates)
+
+    # ---- E: an unusable candidate shape is None, never an exception ----
+    # The helper's contract in isolation: whatever nonsense arrives, it returns
+    # None rather than raising, because the caller builds a ledger record from it.
+    def p22_candidate_extractor_never_raises():
+        sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+        import local_models_daemon as lmd22
+        if not hasattr(lmd22, '_candidate_name'):
+            print('   local_models_daemon has no _candidate_name helper')
+            return False
+        cases = [({'function': 42}, None), ({'function': ['read_file']}, None),
+                 ({'function': None, 'name': 'grep'}, 'grep'),
+                 ({'function': {'name': ''}}, None), ({'function': {}}, None),
+                 ({}, None), ({'name': 'write_file'}, 'write_file'),
+                 ({'function': {'name': 'nested'}}, 'nested'),
+                 ({'function': 'flat'}, 'flat')]
+        bad = []
+        for cand, want in cases:
+            try:
+                got = lmd22._candidate_name(cand)
+            except Exception as e:
+                bad.append('%r raised %s: %s' % (cand, type(e).__name__, e))
+                continue
+            if got != want:
+                bad.append('%r => %r, want %r' % (cand, got, want))
+        if bad:
+            print('   ' + '; '.join(bad))
+        return not bad
+    lm_probe('phase22 sidecar [CR-0022]: _candidate_name returns None for every unusable '
+             'candidate shape instead of raising (the value the ledger record is built from)',
+             p22_candidate_extractor_never_raises)
+
+    # ---- F: ONE extractor, used at EVERY call site ----
+    # A helper that exists and is not called is a dormant guard: the code keeps
+    # raising and every helper-level test still passes.
+    def p22_every_extraction_site_uses_the_helper():
+        # Tokenise rather than grep the raw text: the helper's own docstring QUOTES
+        # the old expression to explain why it exists, and a text grep would report
+        # the fix as unfinished forever. `tokenize` sees CODE - it drops comments and
+        # every string literal, including docstrings - so what is left is exactly the
+        # expressions that actually run. There is no raw-text fallback, because any
+        # such fallback would match the prose this comment is talking about.
+        import tokenize
+        path = os.path.join(BASE, 'localmodels', 'local_models_daemon.py')
+        offenders = []
+        with open(path, 'rb') as f:
+            for tok in tokenize.tokenize(f.readline):
+                if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                    continue
+                if "get('function')" in tok.string and '_candidate_name' not in tok.string:
+                    offenders.append((tok.start[0], tok.string))
+        if offenders:
+            print('   candidate-extraction sites still inline the shape assumption: %r'
+                  % offenders)
+        return not offenders
+    lm_probe('phase22 sidecar [CR-0022]: no candidate-extraction call site inlines '
+             "get('function') any more - one helper, used everywhere", p22_every_extraction_site_uses_the_helper)
+
+    # ---- G: an action OUTSIDE the vocabulary is refused AND not written ----
+    # CR-0006. The old gate was `isinstance(action, str) and action`, so "accepted "
+    # (a trailing space) and "ACCEPTED" both landed in the ledger. `_ledger_counts`
+    # ignores them, but tools/tune_thresholds.py has its OWN copy of the vocabulary
+    # and this is the acceptance rate Phase 15's tuning rests on.
+    #
+    # Both the status AND the file are asserted: a refusal that still writes is not a
+    # refusal, and that is exactly the failure mode a status-only check cannot see.
+    P22_BAD_ACTIONS = ('accepted ', 'ACCEPTED', 'Accept', 'nope', 'accepted_by_opeRator',
+                       'accepted\n', ' ignore')
+
+    def p22_out_of_vocabulary_refused():
+        before = p22_ledger_lines()
+        seen = {}
+        for i, act in enumerate(P22_BAD_ACTIONS):
+            s, j = req(P22_PORT, '/ledger', {'trace_id': 'tr_p22_bad%d' % i, 'action': act})
+            seen[act] = (s, j)
+        after = p22_ledger_lines()
+        wrote = [r for r in after[len(before):]]
+        bad = {k: v for k, v in seen.items() if v[0] != 400}
+        if bad or wrote:
+            print('   out-of-vocabulary actions: %r' % bad)
+            print('   ledger grew by %d line(s) despite the refusals: %r'
+                  % (len(wrote), wrote))
+            return False
+        # The refusal must be a vocabulary refusal, not some unrelated 400.
+        s, j = req(P22_PORT, '/ledger', {'trace_id': 'tr_p22_badv', 'action': 'ACCEPTED'})
+        return s == 400 and 'action' in str(j).lower() and j.get('ok') is False
+    lm_probe('phase22 sidecar [CR-0006]: every action outside _LEDGER_ACTIONS is refused '
+             'with 400 AND writes nothing to the ledger file', p22_out_of_vocabulary_refused)
+
+    # ---- H: the positive direction - every key in the vocabulary still works ----
+    # "Refuse everything" passes case G. Each real action word must still be accepted,
+    # written, and counted - including both accepted aliases, which fold to one bucket.
+    def p22_every_known_action_accepted():
+        sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+        import local_models_daemon as lmd22
+        bad = []
+        before = p22_ledger_lines()
+        # The /health counters are CUMULATIVE over the whole file, and earlier cases
+        # in this phase have already written lines - so the assertion is a DELTA.
+        base = dict(req(P22_PORT, '/health')[1]['ledger']['counts'])
+        for i, act in enumerate(sorted(lmd22._LEDGER_ACTIONS)):
+            tid = 'tr_p22_known_%d' % i
+            s, j = req(P22_PORT, '/ledger', {'trace_id': tid, 'action': act})
+            rec = [r for r in p22_ledger_lines()
+                   if r.get('trace_id') == tid and r.get('op') is None]
+            if s != 200 or j.get('ok') is not True or len(rec) != 1 or rec[0].get('action') != act:
+                bad.append('%r => %s %r, %d record(s)' % (act, s, j, len(rec)))
+        counts = req(P22_PORT, '/health')[1]['ledger']['counts']
+        grew = p22_ledger_lines()[len(before):]
+        # By hand: the two accepted aliases fold to ONE 'accepted' counter, so the
+        # delta must be 2 for accepted and 1 for each of the other three keys.
+        want_delta = {}
+        for key, val in lmd22._LEDGER_ACTIONS.items():
+            want_delta[val] = want_delta.get(val, 0) + 1
+        delta = {k: counts.get(k, 0) - base.get(k, 0) for k in set(counts) | set(base)}
+        delta = {k: v for k, v in delta.items() if v}
+        if delta != want_delta:
+            bad.append('health counter delta %r, want %r' % (delta, want_delta))
+        if len(grew) != len(lmd22._LEDGER_ACTIONS):
+            bad.append('%d lines written for %d valid actions'
+                       % (len(grew), len(lmd22._LEDGER_ACTIONS)))
+        if bad:
+            print('   ' + '; '.join(bad))
+        return not bad
+    lm_probe('phase22 sidecar [CR-0006]: every action in the vocabulary is still accepted, '
+             'written, and counted by /health (the refusal is not a blanket ban)',
+             p22_every_known_action_accepted)
+
+    # ---- I: the daemon and tools/tune_thresholds.py agree on the vocabulary ----
+    # The CR-0006 assertion itself. Asserted in BOTH directions and on the FOLD map,
+    # because a reader that silently disagrees with the daemon's own /health counters
+    # is worse than useless for threshold tuning. `action` is the whole finding: the
+    # daemon now REFUSES anything outside its keys, so if this set were ever smaller
+    # than the tool's, the daemon would reject a word the tool counts, and if it were
+    # larger, the daemon would accept a word the tool ignores.
+    def p22_vocabularies_agree():
+        sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+        sys.path.insert(0, os.path.join(BASE, 'tools'))
+        import local_models_daemon as lmd22
+        import tune_thresholds as tt22
+        daemon_keys = set(lmd22._LEDGER_ACTIONS)
+        tool_keys = set(tt22.KNOWN_ACTIONS)
+        problems = []
+        if daemon_keys != tool_keys:
+            problems.append('daemon-only=%r tool-only=%r'
+                            % (sorted(daemon_keys - tool_keys), sorted(tool_keys - daemon_keys)))
+        if lmd22._LEDGER_ACTIONS != tt22.ACTION_FOLDER:
+            problems.append('fold maps differ: daemon=%r tool=%r'
+                            % (lmd22._LEDGER_ACTIONS, tt22.ACTION_FOLDER))
+        accepted = set(tt22.ACCEPTED_ACTIONS)
+        if {k for k, v in lmd22._LEDGER_ACTIONS.items() if v == 'accepted'} != accepted:
+            problems.append('the daemon folds %r into "accepted" but the tool counts %r'
+                            % (sorted(k for k, v in lmd22._LEDGER_ACTIONS.items()
+                                      if v == 'accepted'), sorted(accepted)))
+        # The direction that actually matters, asserted by behaviour and not by
+        # set arithmetic: anything the daemon ACCEPTS is a word the tool folds in.
+        for act in sorted(daemon_keys):
+            if tt22.ACTION_FOLDER.get(act) != lmd22._LEDGER_ACTIONS[act]:
+                problems.append('%r folds to %r in the tool but %r in the daemon'
+                                % (act, tt22.ACTION_FOLDER.get(act), lmd22._LEDGER_ACTIONS[act]))
+        if problems:
+            print('   ' + '; '.join(problems))
+        return not problems
+    lm_probe('phase22 sidecar [CR-0006]: _LEDGER_ACTIONS and tools/tune_thresholds.py '
+             'KNOWN_ACTIONS are the SAME set, fold the same way, and agree on which '
+             'actions count as accepted', p22_vocabularies_agree)
+
+    # ---- J: an injected unknown action word does NOT move the measured rate ----
+    # The end-to-end claim behind CR-0006. The tool is driven over a ledger written
+    # BY HAND - a proposal plus a mix of real actions plus the injected typos - so the
+    # daemon's 400 is not what is being tested here; the measurement is. The assertion
+    # is the measured number, not the exit code.
+    def p22_injected_action_not_in_rate():
+        led = os.path.join(P22_DIR, 'injected.jsonl')
+        rows = [tune_line('repair', 'tr_i1', ['read_file'], tune_call('read_file'), 0.9, 10),
+                tune_line('repair', 'tr_i2', ['read_file'], tune_call('read_file'), 0.9, 10),
+                tune_line('repair', 'tr_i3', ['read_file'], tune_call('read_file'), 0.9, 10),
+                # Two real outcomes and three injected words that are NOT in the
+                # vocabulary: a trailing space, a case variant, and a near-miss alias.
+                tune_outcome('tr_i1', 'accepted'),
+                tune_outcome('tr_i2', 'rejected'),
+                tune_outcome('tr_i3', 'accepted '),          # trailing space
+                tune_outcome('tr_i1', 'ACCEPTED'),           # case variant
+                tune_outcome('tr_i2', 'accepted_by_opeRator')]  # near-miss alias
+        with open(led, 'w', encoding='utf-8') as f:
+            for row in rows:
+                f.write(json.dumps(row) + '\n')
+        r, j = tune_json(led, cwd=BASE)
+        if j is None:
+            print('   tune_thresholds produced no JSON: rc=%s stderr=%r'
+                  % (r.returncode, r.stderr[-300:]))
+            return False
+        rep = (j.get('repair') or {})
+        acc = rep.get('acceptance') or {}
+        # By hand: 3 op records, all three carry an outcome line, exactly ONE of them
+        # carries a REAL accepted word. So 1/3, and the three injected words must
+        # appear in no counter at all.
+        if acc.get('accepted') != 1 or acc.get('denominator') != 3 or acc.get('rate') != round(1/3, 6):
+            print('   acceptance measured as %r, want accepted=1 denominator=3 rate=%r'
+                  % (acc, round(1 / 3, 6)))
+            return False
+        outcomes = rep.get('outcomes') or {}
+        for word in ('accepted ', 'ACCEPTED', 'accepted_by_opeRator'):
+            if word in outcomes:
+                print('   the injected word %r landed in the measured outcomes: %r'
+                      % (word, outcomes))
+                return False
+        if set(outcomes) != {'accepted', 'rejected'}:
+            print('   measured outcomes are %r, want exactly accepted + rejected' % (outcomes,))
+            return False
+        if (rep.get('outcomes_folded') or {}) != {'accepted': 1, 'rejected': 1}:
+            print('   folded outcomes are %r, want accepted=1 rejected=1'
+                  % (rep.get('outcomes_folded'),))
+            return False
+        return True
+    lm_probe('phase22 [CR-0006]: an injected unknown action word does NOT land in the '
+             'measured acceptance rate (1/3 here, and no injected word in any counter)',
+             p22_injected_action_not_in_rate)
+
+    # ---- K: the daemon REFUSES the words the tool would ignore ----
+    # Ties the two halves together: the same three injected words, posted to the
+    # live daemon, must each be a 400 and add no line.
+    def p22_daemon_refuses_the_injected_words():
+        before = len(p22_ledger_lines())
+        for i, word in enumerate(('accepted ', 'ACCEPTED', 'accepted_by_opeRator')):
+            s, j = req(P22_PORT, '/ledger', {'trace_id': 'tr_p22_inj%d' % i, 'action': word})
+            if s != 400:
+                print('   the daemon ACCEPTED the injected word %r => %s %r' % (word, s, j))
+                return False
+        return len(p22_ledger_lines()) == before
+    lm_probe('phase22 sidecar [CR-0006]: the daemon itself refuses the exact words the '
+             'tuning tool ignores, and writes nothing for them', p22_daemon_refuses_the_injected_words)
+finally:
+    p22_stop(p22_proc)
+
+# ---- PHASE 22, the pure-helper half: rotation and the byte-bounded tail ----
+# These need no live daemon: they are about `ledger.append_record` and
+# `_ledger_tail`, both pure with respect to the filesystem. Asserting them directly
+# is what makes "the bound holds" a fact about the code rather than about one
+# request's timing.
+sys.path.insert(0, os.path.join(BASE, 'localmodels'))
+import local_models_daemon as P22_LMD   # noqa: E402
+import ledger as P22_LEDGER             # noqa: E402
+
+# ---- L: size-based rotation keeps the file bounded and the NEWEST content ----
+# CR-0006. `append_record` appended forever and nothing rotated. The direction that
+# matters: rotating must DISCARD THE OLDEST and keep the most recent, because a
+# rotation that keeps the oldest data and throws the new away is worse than no
+# rotation at all - it silently destroys the records the operator just made.
+P22_ROT_DIR = tempfile.mkdtemp(prefix='cogp22-rot-')
+P22_ROT_LIMIT = 64 * 1024
+
+
+def p22_rotation_bounded():
+    path = os.path.join(P22_ROT_DIR, 'rot.jsonl')
+    fat = 'x' * 4096
+    # Append well past the limit, tagging every line with its ordinal so "which data
+    # survived" is a fact and not an inference from file size.
+    for i in range(60):
+        if not P22_LEDGER.append_record(
+                {'trace_id': 'tr_rot_%03d' % i, 'op': 'select', 'blob': fat},
+                path=path, max_bytes=P22_ROT_LIMIT):
+            print('   append %d returned False' % i)
+            return False
+    size = os.path.getsize(path)
+    recs = P22_LEDGER.read_records(path) if hasattr(P22_LEDGER, 'read_records') else None
+    lines = [json.loads(ln) for ln in open(path, encoding='utf-8') if ln.strip()]
+    tids = [r.get('trace_id') for r in lines]
+    problems = []
+    if size > P22_ROT_LIMIT:
+        problems.append('the file is %d bytes after rotation, limit is %d' % (size, P22_ROT_LIMIT))
+    if tids != sorted(tids):
+        problems.append('the surviving lines are not in append order')
+    # The MOST RECENT record must be there; the very first must be gone.
+    if 'tr_rot_059' not in tids:
+        problems.append('the newest record tr_rot_059 was rotated away (%r ... %r)'
+                        % (tids[:2], tids[-2:]))
+    if 'tr_rot_000' in tids:
+        problems.append('the oldest record tr_rot_000 survived; rotation kept the wrong end')
+    if len(tids) >= 60:
+        problems.append('nothing was rotated at all (%d lines retained)' % len(tids))
+    if problems:
+        print('   ' + '; '.join(problems))
+        return False
+    return True
+
+
+def p22_rotation_keeps_append_working():
+    """After a rotation the ledger is still a valid append target and /health's size
+    report tracks the file. A rotation that leaves a truncated or unreadable file
+    would pass the bound check and break every write after it."""
+    path = os.path.join(P22_ROT_DIR, 'rot2.jsonl')
+    for i in range(40):
+        P22_LEDGER.append_record({'trace_id': 'tr_r2_%02d' % i, 'blob': 'y' * 4096},
+                                 path=path, max_bytes=32 * 1024)
+    ok = P22_LEDGER.append_record({'trace_id': 'tr_r2_final'}, path=path,
+                                  max_bytes=32 * 1024)
+    lines = [json.loads(ln) for ln in open(path, encoding='utf-8') if ln.strip()]
+    if not ok or not lines or lines[-1].get('trace_id') != 'tr_r2_final':
+        print('   after rotation: append ok=%r, last line=%r'
+              % (ok, lines[-1] if lines else None))
+        return False
+    return os.path.getsize(path) <= 32 * 1024
+
+
+def p22_rotation_no_stray_files():
+    # The existing phase-10 case `lm_no_stray_files` allows exactly
+    # {local-models.jsonl, local-models-2.jsonl} in the daemon's own directory, so
+    # rotation must NOT create a third filename. This asserts that directly on the
+    # rotation directory, which is otherwise the only place a rotation artefact could
+    # show up unnoticed.
+    #
+    # It runs its OWN rotation first rather than depending on the cases above having
+    # already created files - a case that passes because the directory happens to be
+    # empty has proved nothing.
+    path = os.path.join(P22_ROT_DIR, 'stray.jsonl')
+    for i in range(40):
+        P22_LEDGER.append_record({'trace_id': 'tr_st_%02d' % i, 'blob': 'z' * 4096},
+                                 path=path, max_bytes=32 * 1024)
+    if not os.path.isfile(path):
+        print('   the stray-file probe never wrote %s' % path)
+        return False
+    files = set(os.listdir(P22_ROT_DIR))
+    allowed = {'rot.jsonl', 'rot2.jsonl', 'stray.jsonl', 'fat.jsonl', 'normal.jsonl'}
+    extra = files - allowed
+    if extra:
+        print('   rotation left extra files behind: %r (allowed: %r)'
+              % (sorted(extra), sorted(allowed)))
+        return False
+    return True
+
+
+def p22_health_reports_size():
+    """`/health`'s ledger block must surface the size, so an operator can see a ledger
+    approaching its bound without reading the file. Asserted on the pure helper the
+    daemon calls, and on the live shape."""
+    block = {'path': 'var/local-models.jsonl', 'writable': True,
+             'bytes': P22_LMD.ledger_size(os.path.join(P22_ROT_DIR, 'rot.jsonl')),
+             'max_bytes': P22_LEDGER.MAX_BYTES, 'counts': {}}
+    size = block['bytes']
+    if size != os.path.getsize(os.path.join(P22_ROT_DIR, 'rot.jsonl')):
+        print('   ledger_size reported %r, the file is %d'
+              % (size, os.path.getsize(os.path.join(P22_ROT_DIR, 'rot.jsonl'))))
+        return False
+    if not isinstance(size, int) or size <= 0:
+        print('   ledger_size must be a positive int, got %r' % (size,))
+        return False
+    return 'bytes' in block and 'max_bytes' in block
+
+
+lm_probe('phase22 ledger [CR-0006]: size rotation bounds the file AND keeps the MOST '
+         'RECENT records (the oldest are the ones dropped)', p22_rotation_bounded)
+lm_probe('phase22 ledger [CR-0006]: after a rotation the ledger is still appendable and '
+         'its last line is the newest record', p22_rotation_keeps_append_working)
+lm_probe('phase22 ledger [CR-0006]: rotation introduces NO third filename (the phase-10 '
+         'two-file set must keep holding)', p22_rotation_no_stray_files)
+lm_probe('phase22 ledger [CR-0006]: the ledger size is surfaced for /health, as a real '
+         'byte count of the active file', p22_health_reports_size)
+
+# ---- M: a ~10-fat-record ledger does not defeat the /health read bound ----
+# CR-0025. `_ledger_tail` doubled its 64 KiB window without limit until it held 2000
+# lines, so 10 fat records (100 KB each) walked the window up over a megabyte.
+# The bound is asserted two ways, because either alone is weak: the returned tail
+# must be no bigger than the ceiling, AND the read must TERMINATE (measured, not
+# assumed - the old loop was unbounded, so a test that only checked the answer would
+# have passed against an implementation that spent ten seconds getting there).
+P22_FAT_RECORDS = 10
+P22_FAT_BYTES = 100 * 1024
+P22_TAIL_TIME_BUDGET_S = 3.0
+
+
+def p22_fat_ledger_tail_bounded():
+    path = os.path.join(P22_ROT_DIR, 'fat.jsonl')
+    with open(path, 'w', encoding='utf-8') as f:
+        for i in range(P22_FAT_RECORDS):
+            f.write(json.dumps({'op': 'select', 'trace_id': 'fat_%02d' % i,
+                                'action': None, 'note': 'z' * P22_FAT_BYTES}) + '\n')
+    total = os.path.getsize(path)
+    ceiling = P22_LMD.LEDGER_TAIL_MAX_BYTES
+    if not isinstance(ceiling, int) or ceiling <= 0:
+        print('   LEDGER_TAIL_MAX_BYTES is not a positive int: %r' % (ceiling,))
+        return False
+    t0 = time.time()
+    tail = P22_LMD._ledger_tail(path)
+    dt = time.time() - t0
+    read_bytes = sum(len(ln.encode('utf-8')) + 1 for ln in tail)
+    problems = []
+    if dt > P22_TAIL_TIME_BUDGET_S:
+        problems.append('_ledger_tail took %.2fs (budget %.1fs)' % (dt, P22_TAIL_TIME_BUDGET_S))
+    # The ceiling, plus the one partial line the window necessarily starts mid-way on.
+    if read_bytes > ceiling + P22_FAT_BYTES:
+        problems.append('read %d bytes, ceiling is %d (+one %d-byte line tolerance)'
+                        % (read_bytes, ceiling, P22_FAT_BYTES))
+    if total <= ceiling:
+        problems.append('the fixture is only %d bytes - it never exceeded the %d ceiling, '
+                        'so this case proved nothing' % (total, ceiling))
+    # It must be the MOST RECENT lines and it must not be empty.
+    if not tail:
+        problems.append('_ledger_tail returned [] on a %d-byte ledger' % total)
+    elif 'fat_%02d' % (P22_FAT_RECORDS - 1) not in tail[-1]:
+        problems.append('the newest line is not last: %r' % tail[-1][:80])
+    if problems:
+        print('   ' + '; '.join(problems))
+        print('   (ledger %d bytes, read %d, %d lines, %.3fs)'
+              % (total, read_bytes, len(tail), dt))
+        return False
+    return True
+
+
+def p22_fat_ledger_counts_terminate():
+    """The same bound through `_ledger_counts`, which is what /health actually calls,
+    plus the counts still being sane rather than all-zero."""
+    path = os.path.join(P22_ROT_DIR, 'fat.jsonl')
+    t0 = time.time()
+    counts = P22_LMD._ledger_counts(path)
+    dt = time.time() - t0
+    if dt > P22_TAIL_TIME_BUDGET_S:
+        print('   _ledger_counts took %.2fs on a fat ledger (budget %.1fs)'
+              % (dt, P22_TAIL_TIME_BUDGET_S))
+        return False
+    # 10 records, all op:'select' -> proposals. The byte ceiling may cut the window,
+    # so only "some real number, not a fabrication" is asserted here; the tail case
+    # above pins the exact bound.
+    if not isinstance(counts.get('proposals'), int) or counts['proposals'] <= 0:
+        print('   _ledger_counts on a 10-record ledger gave %r' % (counts,))
+        return False
+    return True
+
+
+def p22_tail_bound_does_not_under_report():
+    """The byte ceiling must not silently under-report a NORMAL ledger.
+
+    This is the regression the original doubling loop was written to avoid (a fixed
+    64 KiB window held only 1489 of 2000 lines). A byte ceiling that broke the
+    phase-14 guarantee would make the ceiling a second version of the same bug, so
+    the existing 2000-line property is re-asserted against the bounded helper."""
+    path = os.path.join(P22_ROT_DIR, 'normal.jsonl')
+    with open(path, 'w', encoding='utf-8') as f:
+        for i in range(2500):
+            f.write(json.dumps({'op': 'select', 'trace_id': 'p%d' % i}) + '\n')
+        for i in range(2500):
+            f.write(json.dumps({'action': 'accepted', 'trace_id': 'a%d' % i,
+                                'note': 'x' * 60}) + '\n')
+    size = os.path.getsize(path)
+    ceiling = P22_LMD.LEDGER_TAIL_MAX_BYTES
+    t0 = time.time()
+    counts = P22_LMD._ledger_counts(path)
+    dt = time.time() - t0
+    # This fixture is deliberately UNDER the ceiling: the point is that an ordinary
+    # ledger is served entirely by the LINE bound, untouched by the byte backstop. So
+    # the assertion is the phase-14 answer, not that the ceiling was reached - a guard
+    # demanding this fixture exceed the ceiling would be asserting the opposite of what
+    # the case is for.
+    if not (counts.get('accepted') == 2000 and counts.get('proposals') == 0):
+        print('   bounded tail changed the phase-14 answer: %r (%.2fs, %d-byte file, '
+              'ceiling %d)' % (counts, dt, size, ceiling))
+        return False
+    if size > ceiling:
+        print('   the normal fixture (%d bytes) is now OVER the %d ceiling, so this case '
+              'no longer proves the ordinary path is unaffected' % (size, ceiling))
+        return False
+    return dt <= P22_TAIL_TIME_BUDGET_S
+
+
+def p22_tail_bound_documented():
+    """The ceiling must be a NAMED, DOCUMENTED constant and the behaviour at the
+    ceiling must be stated - not left for a reader to infer from the code."""
+    if not hasattr(P22_LMD, 'LEDGER_TAIL_MAX_BYTES'):
+        print('   no LEDGER_TAIL_MAX_BYTES constant')
+        return False
+    src = inspect.getsource(P22_LMD._ledger_tail)
+    problems = []
+    if 'LEDGER_TAIL_MAX_BYTES' not in src:
+        problems.append('_ledger_tail does not mention the ceiling by name')
+    low = src.lower()
+    if 'most recent' not in low:
+        problems.append('_ledger_tail does not document that it returns the MOST RECENT '
+                        'lines when the ceiling is hit first')
+    if 'truncat' not in low and 'ceil' not in low:
+        problems.append('_ledger_tail does not document what happens at the ceiling')
+    if problems:
+        print('   ' + '; '.join(problems))
+        return False
+    return True
+
+
+lm_probe('phase22 sidecar [CR-0025]: a %d-record x %d KB ledger does NOT defeat the '
+         '/health read bound - the tail is capped at LEDGER_TAIL_MAX_BYTES and '
+         'terminates inside %.1fs'
+         % (P22_FAT_RECORDS, P22_FAT_BYTES // 1024, P22_TAIL_TIME_BUDGET_S),
+         p22_fat_ledger_tail_bounded)
+lm_probe('phase22 sidecar [CR-0025]: _ledger_counts - what /health actually calls - '
+         'terminates on the same fat ledger and reports real counts',
+         p22_fat_ledger_counts_terminate)
+lm_probe('phase22 sidecar [CR-0025]: the byte ceiling does NOT under-report a NORMAL '
+         'ledger (the phase-14 "exactly the last 2000 lines" guarantee still holds)',
+         p22_tail_bound_does_not_under_report)
+lm_probe('phase22 sidecar [CR-0025]: the ceiling is a NAMED constant and its '
+         'truncate-and-terminate behaviour is documented in _ledger_tail',
+         p22_tail_bound_documented)
+
+# ---- N: the CR-0004 resolution, asserted ----
+# The finding: ledger.py's docstring promised "the configured provider API key is
+# replaced with '[REDACTED-KEY]'", but no production call site ever passes `api_key`.
+# Investigation (recorded in the report): the frontend holds the key in
+# `settings.apiKey` and builds `Authorization: Bearer` headers for the PROVIDER
+# endpoint only (index.html `authHeaders()`); appcore.js states outright that the
+# `/repair` and `/ledger` requests "carry NO Authorization header and never the
+# provider API key"; and `grep -n "api_key" localmodels/local_models_daemon.py` returns
+# nothing. There is no env var, no CLI flag, no request field and no config file that
+# carries a provider key to the sidecar.
+#
+# So the honest resolution is (b): correct the docstring so it stops asserting a rule
+# no code path provides - and say the guarantee is ABSENT rather than deleting the line,
+# because a reader must be able to tell "not implemented" from "not mentioned".
+#
+# These cases assert the DOCSTRING and the CODE agree, in the direction that matters:
+# if a future change really does wire a key through, the docstring must claim it again.
+def p22_docstring_does_not_overclaim():
+    """The docstring must not state rule 1 as a rule IN FORCE.
+
+    Scoped to the SENTENCE carrying the claim, deliberately. A window of surrounding
+    characters is not enough: the original docstring contains the word "never" in
+    "never leave the machine" three lines above the claim, so a context-window check
+    passes the overclaim it exists to catch. That was measured, not assumed - see the
+    report - so the check here is a single sentence or list item.
+    """
+    doc = P22_LEDGER.__doc__ or ''
+    problems = []
+    claims = ('the configured provider api key is replaced',
+              'the configured provider api key is redacted')
+    negations = ('not ', 'never', 'no code path', 'absent', 'does not', "isn't",
+                 'unavailable', 'cannot', 'not enforced', 'not provided')
+    # Split into sentence-ish units: a numbered rule, or a line of prose.
+    units = re.split(r'(?:\n\s*(?:\d+\.\s*)?)|\.\s+', doc)
+    for unit in units:
+        low = unit.lower()
+        if not any(c in low for c in claims):
+            continue
+        if not any(neg in low for neg in negations):
+            problems.append('states %r as a rule in force, with no negation in the '
+                            'same sentence: %r' % (unit.strip()[:90], unit.strip()[:120]))
+    if problems:
+        print('   ' + '; '.join(problems))
+    return not problems
+
+
+def p22_docstring_documents_the_absence():
+    doc = (P22_LEDGER.__doc__ or '')
+    low = doc.lower()
+    problems = []
+    # It must name the rule (so a reader can see what is missing) AND say it is absent.
+    if 'api key' not in low:
+        problems.append('the docstring no longer mentions the api key at all, so the '
+                        'absence of that guarantee is invisible')
+    if not any(neg in low for neg in ('not ', 'never', 'no code path', 'absent',
+                                      'does not', "isn't", 'unavailable', 'cannot')):
+        problems.append('the docstring does not state that any guarantee is absent')
+    if problems:
+        print('   ' + '; '.join(problems))
+        return False
+    return True
+
+
+def p22_no_production_call_site_passes_a_key():
+    """The code half of the same claim: if the docstring says no code path supplies a
+    key, then no production call site may supply one either. Tokenised, so the
+    docstring's own prose about this cannot satisfy or break the assertion."""
+    import tokenize
+    path = os.path.join(BASE, 'localmodels', 'local_models_daemon.py')
+    offenders = []
+    with open(path, 'rb') as f:
+        for tok in tokenize.tokenize(f.readline):
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                continue
+            if tok.string == 'api_key' or tok.string == 'API_KEY':
+                offenders.append((tok.start[0], tok.string))
+    if offenders:
+        print('   local_models_daemon.py references a provider key at %r - if that is now '
+              'a REAL configuration path, the docstring must claim the guarantee again'
+              % (offenders,))
+        return False
+    return True
+
+
+def p22_redaction_still_works_when_a_key_is_supplied():
+    """The mechanism itself must be intact: `api_key=` still redacts when a caller
+    passes one. Correcting a docstring must not quietly break the capability the
+    docstring used to describe."""
+    out = P22_LEDGER.redact({'note': 'the key is supersecretvalue123 in this string'},
+                            api_key='supersecretvalue123')
+    return (P22_LEDGER.REDACTED_KEY in out['note']
+            and 'supersecretvalue123' not in out['note'])
+
+
+lm_probe('phase22 ledger [CR-0004]: the docstring does NOT assert the provider-key '
+         'redaction as a rule in force (it was provided by no code path)',
+         p22_docstring_does_not_overclaim)
+lm_probe('phase22 ledger [CR-0004]: the docstring still NAMES the provider-key rule and '
+         'states plainly that the guarantee is ABSENT, so a reader can tell it is '
+         'unimplemented rather than merely unmentioned', p22_docstring_documents_the_absence)
+lm_probe('phase22 ledger [CR-0004]: no production call site in local_models_daemon.py '
+         'passes an api_key - the docstring and the code agree on the absence',
+         p22_no_production_call_site_passes_a_key)
+lm_probe('phase22 ledger [CR-0004]: api_key= redaction still WORKS when a caller does '
+         'pass one (the capability was corrected in the docstring, not removed)',
+         p22_redaction_still_works_when_a_key_is_supplied)
+
+# ---- O: a read that RAISES is a refusal, not an empty body (LE-1) ----
+# The socket-level case above is the primary evidence; this one covers the sibling
+# path in the same function that a socket cannot easily reach. `_read_body` did
+#   except Exception: raw = b''
+# and then returned ({}, None) for `not raw` - so a socket error was indistinguishable
+# from "this route accepts an empty body", which is a 200 and a ledger record for a
+# body that was never read. Driven through the unbound method with a double for
+# `rfile`, because Handler.__init__ wants a real connection.
+def p22_read_exception_is_refused():
+    problems = []
+
+    class _RFile:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def read(self, n):
+            raise self._exc
+
+    class _Self:
+        # `_read_body` only ever touches self.headers.get() and self.rfile.read(),
+        # so this double needs nothing else. Declared (rather than assigned in
+        # __init__) so the attributes exist on the type, not just the instance.
+        headers = {}
+        rfile = object()
+
+    for label, exc in (('ConnectionResetError', ConnectionResetError('peer reset')),
+                       ('OSError', OSError('connection broken')),
+                       ('TimeoutError', TimeoutError('read timed out'))):
+        me = _Self()
+        me.headers = {'Content-Length': '107'}
+        me.rfile = _RFile(exc)
+        try:
+            got = P22_LMD.Handler._read_body(me)
+        except Exception as e:
+            problems.append('a read raising %s ESCAPED _read_body as %s: %s'
+                            % (label, type(e).__name__, e))
+            continue
+        if got == ({}, None):
+            problems.append('a read raising %s => ({}, None) - the same value as a '
+                            'legitimately empty body, so the route answers 200'
+                            % label)
+        elif not (got[0] is None and got[1]):
+            problems.append('a read raising %s => %r, want (None, <error code>)'
+                            % (label, got))
+
+    # The control, same double, same declared length: a read that returns FEWER bytes
+    # than declared is refused for the same reason, and one that returns exactly n is
+    # not. Without this a `_read_body` that refused every read would pass the above.
+    class _ShortRFile:
+        def __init__(self, data):
+            self._data = data
+
+        def read(self, n):
+            return self._data[:n]
+
+    good = json.dumps({'suspect': 'x', 'candidates': []}).encode()
+    for label, declared, data, want_refused in (
+            ('exactly n bytes', len(good), good, False),
+            ('n - 1 bytes', len(good), good[:-1], True),
+            ('zero bytes under a positive length', 107, b'', True)):
+        me = _Self()
+        me.headers = {'Content-Length': str(declared)}
+        me.rfile = _ShortRFile(data)
+        got = P22_LMD.Handler._read_body(me)
+        refused = got[0] is None and bool(got[1])
+        if refused != want_refused:
+            problems.append('%s => %r, want %s' % (label, got,
+                                                   'a refusal' if want_refused else 'a body'))
+    if problems:
+        print('   ' + '\n   '.join(problems))
+        return False
+    return True
+
+
+lm_probe('phase22 sidecar [LE-1]: a read that RAISES is a 400 refusal, not an empty '
+         'body - and, on the same doubles, a read that returns exactly n bytes is still '
+         'a body while one that returns fewer is refused',
+         p22_read_exception_is_refused)
+
+# ---- P: concurrent appends + rotation lose NOTHING (LE-2) ----
+# `append_record` took no lock and then called `_rotate_if_oversize`, which does
+# read-size -> seek -> read a window -> write target+'.rotating' -> os.replace. Any
+# record another thread appended between that size read and the os.replace was
+# DISCARDED, because the replace swaps in a file that does not contain it; two
+# concurrent rotations also shared one temp path, so one os.replace consumed the
+# other's file and raised FileNotFoundError into a blanket except. `append_record`
+# returned True either way: a record reported as written, absent from the audit trail.
+# The daemon is a ThreadingHTTPServer, so this is reachable in production.
+#
+# The CONTROL ARM is the point of the whole case. Rotation disabled (a huge max_bytes)
+# must lose exactly nothing; if it did, the harness - not rotation - would be the
+# thing under suspicion, and a with-rotation failure could not be told from flakiness.
+# Both numbers are printed on every run.
+P22_CONC_DIR = tempfile.mkdtemp(prefix='cogp22-conc-')
+P22_CONC_THREADS = 8
+P22_CONC_PER_THREAD = 25
+#: Small enough that the seeded ledger is over it, so rotation is armed from the very
+#: first append and stays armed on every one after (a compaction leaves the file at
+#: ~max_bytes, which is still not <= max_bytes).
+P22_CONC_MAX_BYTES = 64 * 1024
+#: The control's limit: large enough that rotation can never fire.
+P22_CONC_CONTROL_MAX_BYTES = 512 * 1024 * 1024
+#: Seed size, chosen so the retained window always covers EVERY concurrent record.
+#:
+#: This is the whole design constraint, and getting it wrong produces a test that
+#: fails for the right reason on the wrong code: rotation is SUPPOSED to drop the
+#: oldest lines, so if the concurrent records together exceed max_bytes then losing
+#: them is correct behaviour, not silent loss. The seed is therefore fat enough to
+#: arm rotation and is always the OLDER content, while the concurrent records
+#: (~90 bytes each, ~18 KB total) all sit inside the newest 64 KB window and so must
+#: survive. The seed records are never asserted on: their disappearance is the
+#: documented direction of rotation.
+P22_CONC_SEED_LINES = 150
+P22_CONC_SEED_FAT = 512
+
+
+def _p22_concurrent_arm(name, max_bytes):
+    """One arm: seed an oversize ledger, append N*N unique records concurrently.
+
+    Each arm gets its OWN directory. Sharing one would make the "no stray temp file"
+    assertion meaningless - the control arm would see the armed arm's ledger and
+    report a stray that is not its own - and the two arms would also be able to
+    disturb each other's rotation.
+
+    Returns (missing_markers, all_returned_true, strays).
+    """
+    arm_dir = os.path.join(P22_CONC_DIR, name)
+    os.makedirs(arm_dir, exist_ok=True)
+    path = os.path.join(arm_dir, name + '.jsonl')
+    # Seed PAST the limit so rotation is armed from the very first append; a ledger
+    # that has to grow to the limit first would let most of the run finish unrotated.
+    fat = 'p' * P22_CONC_SEED_FAT
+    with open(path, 'w', encoding='utf-8') as f:
+        for i in range(P22_CONC_SEED_LINES):
+            f.write(json.dumps({'trace_id': 'seed_%03d' % i, 'blob': fat}) + '\n')
+    seeded_bytes = os.path.getsize(path)
+    if seeded_bytes <= P22_CONC_MAX_BYTES:
+        # Loudly, because an unarmed arm passes trivially and would make the whole
+        # case vacuous - the reviewer's control arm is the armed one in miniature.
+        raise AssertionError('the %s arm was never armed: the seed is %d bytes and the '
+                             'limit is %d' % (name, seeded_bytes, P22_CONC_MAX_BYTES))
+    small = 'q' * 32
+    want = set()
+    for t in range(P22_CONC_THREADS):
+        for i in range(P22_CONC_PER_THREAD):
+            want.add('conc_%d_%03d' % (t, i))
+    results = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(P22_CONC_THREADS)
+
+    def worker(tid):
+        # The barrier makes the appends genuinely simultaneous rather than staggered
+        # by thread start-up, which is what opens the rotation window at all.
+        barrier.wait()
+        local = [P22_LEDGER.append_record(
+            {'trace_id': 'conc_%d_%03d' % (tid, i), 'blob': small},
+            path=path, max_bytes=max_bytes)
+            for i in range(P22_CONC_PER_THREAD)]
+        with lock:
+            results.extend(local)
+
+    threads = [threading.Thread(target=worker, args=(t,))
+               for t in range(P22_CONC_THREADS)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+    alive = [th for th in threads if th.is_alive()]
+    if alive:
+        return None, False, ['%d thread(s) did not finish' % len(alive)]
+    with open(path, encoding='utf-8') as f:
+        got = set()
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                got.add(json.loads(ln).get('trace_id'))
+            except ValueError:
+                pass
+    strays = sorted(set(os.listdir(arm_dir)) - {name + '.jsonl'})
+    return sorted(want - got), all(results), strays
+
+
+def p22_concurrent_rotation_loses_nothing():
+    """With rotation ARMED: every concurrently appended record must survive, every
+    call must have returned True, and no temp file may be left behind."""
+    missing, all_true, strays = _p22_concurrent_arm('armed', P22_CONC_MAX_BYTES)
+    print('   [LE-2] with rotation ARMED (max_bytes=%d, %d threads x %d appends): '
+          '%d of %d records LOST, append_record returned True for all: %s, strays: %r'
+          % (P22_CONC_MAX_BYTES, P22_CONC_THREADS, P22_CONC_PER_THREAD,
+             len(missing) if missing is not None else -1,
+             P22_CONC_THREADS * P22_CONC_PER_THREAD, all_true, strays))
+    problems = []
+    if missing is None:
+        return False
+    if missing:
+        problems.append('%d of %d records were REPORTED WRITTEN (append_record returned '
+                        'True) but are ABSENT from the ledger: %r'
+                        % (len(missing), P22_CONC_THREADS * P22_CONC_PER_THREAD,
+                           missing[:8]))
+    if not all_true:
+        problems.append('at least one append_record returned False')
+    if strays:
+        problems.append('a rotation temp file survived the run: %r' % (strays,))
+    if problems:
+        print('   ' + '\n   '.join(problems))
+        return False
+    return True
+
+
+def p22_concurrent_control_arm_loses_nothing():
+    """Rotation DISABLED: the same harness must lose nothing either.
+
+    This is the arm that makes the case above mean something. Without it, a loss
+    observed with rotation on could be the harness's fault, and a pass could be
+    luck. It is asserted, not merely printed: if the harness ever starts losing
+    records on its own, this case fails loudly rather than quietly discredited.
+    """
+    missing, all_true, strays = _p22_concurrent_arm('control', P22_CONC_CONTROL_MAX_BYTES)
+    print('   [LE-2] CONTROL arm, rotation DISABLED (max_bytes=%d, %d threads x %d '
+          'appends): %d of %d records LOST, append_record returned True for all: %s'
+          % (P22_CONC_CONTROL_MAX_BYTES, P22_CONC_THREADS, P22_CONC_PER_THREAD,
+             len(missing) if missing is not None else -1,
+             P22_CONC_THREADS * P22_CONC_PER_THREAD, all_true))
+    problems = []
+    if missing is None:
+        return False
+    if missing:
+        problems.append('the CONTROL arm lost %d record(s) with rotation unable to fire '
+                        '- so the harness itself is lossy and the armed arm proves '
+                        'nothing: %r' % (len(missing), missing[:8]))
+    if not all_true:
+        problems.append('the CONTROL arm had an append_record return False')
+    if strays:
+        problems.append('the CONTROL arm left stray files: %r' % (strays,))
+    if problems:
+        print('   ' + '\n   '.join(problems))
+        return False
+    return True
+
+
+lm_probe('phase22 ledger [LE-2]: %d threads x %d appends onto an ALREADY-oversize '
+         'ledger lose ZERO records with rotation armed - every call returned True, and '
+         'no temp file survives'
+         % (P22_CONC_THREADS, P22_CONC_PER_THREAD),
+         p22_concurrent_rotation_loses_nothing)
+lm_probe('phase22 ledger [LE-2]: the CONTROL arm - identical harness, rotation DISABLED '
+         '(max_bytes=512 MiB) - also loses zero records, so a loss in the armed arm '
+         'would be rotation and not the test', p22_concurrent_control_arm_loses_nothing)
+
+# ---- Q: the docstring must not claim rotation introduces NO filename (LE-3) ----
+# `append_record` justified in-place compaction on the grounds that it "introduces no
+# filename at all", citing the phase-10 `lm_no_stray_files` invariant. `_rotate_if_
+# oversize` then wrote `target + '.rotating'` IN THAT SAME DIRECTORY, and the
+# neighbouring comment - "the temp name is removed by the rename itself, so no extra
+# file survives" - is true only if os.replace runs. The window between open(tmp,'w')
+# and os.replace is exactly the crash window, and in it the third filename survives.
+# The existing p22_rotation_no_stray_files cannot see this: it only inspects the
+# directory after SUCCESSFUL rotations.
+#
+# Sentence-scoped, like the CR-0004 docstring case above: the word "never" occurs
+# elsewhere in this docstring ("never raises"), so a context window would both pass
+# the overclaim it exists to catch and break on unrelated prose.
+def p22_rotation_docstring_does_not_overclaim():
+    doc = inspect.getdoc(P22_LEDGER.append_record) or ''
+    units = re.split(r'(?:\n\s*(?:\*\s*)?|\.\s+)', doc)
+    # Negations are checked in the SAME sentence unit, for the same reason the CR-0004
+    # case above checks them there: a window of context would let the word "never"
+    # elsewhere in this docstring ("never raises") satisfy the check, and the honest
+    # replacement has to be able to QUOTE the claim in order to retract it.
+    negations = ('not true', 'never', 'not ', 'no code path', 'absent', 'does not',
+                 "isn't", 'used to say', 'but it is not', 'wrong')
+    overclaim = []
+    for unit in units:
+        low = unit.lower()
+        if 'no filename' not in low:
+            continue
+        if not any(neg in low for neg in negations):
+            overclaim.append(unit.strip())
+    problems = []
+    for unit in overclaim:
+        problems.append('claims %r with no retraction in the same sentence; rotation DOES '
+                        'create one short-lived temp file in the same directory'
+                        % unit[:110])
+    # ...and the honest replacement must actually be there, or the claim has merely
+    # been deleted: a reader must be able to see what happens during a crash.
+    low = doc.lower()
+    if 'short-lived' not in low and 'short lived' not in low:
+        problems.append('the docstring no longer says the temp file is short-lived')
+    if 'finally' not in low:
+        problems.append('the docstring does not say the temp file is removed in a '
+                        'finally, which is the only thing that makes it short-lived')
+    if 'crash' not in low:
+        problems.append('the docstring no longer names the crash window in which the '
+                        'temp file CAN survive - the honest version has to admit it')
+    if problems:
+        print('   ' + '\n   '.join(problems))
+        return False
+    return True
+
+
+def p22_stale_rotating_file_is_cleaned_up():
+    """A crash between open(tmp) and os.replace leaves the temp name behind, and
+    `lm_no_stray_files` then fails permanently for that install. With per-rotation
+    unique names the leftover is unpredictable, so ANY stale `target + '.rotating*'`
+    must be swept on the next append - the old fixed name included, because that is
+    the shape a crash from the PREVIOUS build leaves."""
+    path = os.path.join(P22_CONC_DIR, 'stale', 'stale.jsonl')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    seeds = [path + '.rotating',                      # the old fixed name
+             path + '.rotating.31337-1',              # a unique-temp name
+             path + '.rotating.31337-2']
+    for p_ in seeds:
+        with open(p_, 'w', encoding='utf-8') as f:
+            f.write('{"trace_id": "half-written compaction"}\n')
+    ok = P22_LEDGER.append_record({'trace_id': 'tr_after_stale'}, path=path,
+                                  max_bytes=P22_CONC_CONTROL_MAX_BYTES)
+    left = sorted(p_ for p_ in seeds if os.path.exists(p_))
+    problems = []
+    if not ok:
+        problems.append('the append after a crash left-over returned False')
+    if left:
+        problems.append('stale temp file(s) survived the next append: %r' % (left,))
+    if not os.path.isfile(path):
+        problems.append('the ledger itself was not written')
+    if problems:
+        print('   ' + '\n   '.join(problems))
+        return False
+    return True
+
+
+lm_probe('phase22 ledger [LE-3]: the rotation docstring does NOT claim that compaction '
+         'introduces "no filename at all" - it states the short-lived temp file and its '
+         'removal instead', p22_rotation_docstring_does_not_overclaim)
+lm_probe('phase22 ledger [LE-3]: a stale .rotating temp file left by a crash - both the '
+         'old fixed name and a per-rotation unique one - is swept by the next append, so '
+         'lm_no_stray_files recovers instead of failing forever',
+         p22_stale_rotating_file_is_cleaned_up)
 
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)
