@@ -4904,5 +4904,114 @@ lm_probe('phase22 ledger [LE-3]: a stale .rotating temp file left by a crash - b
          'lm_no_stray_files recovers instead of failing forever',
          p22_stale_rotating_file_is_cleaned_up)
 
+# ---------------- PHASE 24: docs tell the truth about completion status (CR-0027, CR-0028) ----
+#
+# Phase 24's finding was filed as "N/A - documentation. Untested by nature, which is exactly
+# why it drifted: nothing in `npm test` or any other check reads these files." That is the
+# defect. Two guards exist (tools/test_gen_plan_status.py, tools/test_readme_install.py) and
+# this block is what makes them GUARDS rather than scripts nobody runs.
+#
+# Run as SUBPROCESSES and asserted on exit code, deliberately: importing them would only
+# prove they import. A guard module that is never executed here is exactly the dormant-code
+# failure - it would sit in tools/ looking complete while nothing ever called it.
+_P24_TOOLS = os.path.join(BASE, 'tools')
+for _p24_mod in ('test_gen_plan_status', 'test_readme_install'):
+    _p24 = subprocess.run([sys.executable, os.path.join(_P24_TOOLS, _p24_mod + '.py')],
+                          capture_output=True, text=True, cwd=BASE)
+    # Require the real unittest summary line, not just a zero exit: a module that exits 0
+    # without running anything (a bad import guard, a `pass` on collection failure) would
+    # otherwise read as a pass. This is the "a harness that cannot tell it did not run
+    # reports confident nonsense" trap.
+    _p24_out = _p24.stdout + _p24.stderr
+    check('OK' in _p24_out and re.search(r'Ran \d+ tests?', _p24_out) is not None,
+          'phase24 guard tools/%s.py RAN and reported OK (its real summary line is present)'
+              % _p24_mod)
+    check(_p24.returncode == 0,
+          'phase24 guard tools/%s.py is green: %s' % (_p24_mod, _p24_out.strip()[-400:]))
+
+# The generated docs blocks must be current, or the plan document lies to the next
+# context-free session. Same derivation-not-a-literal argument as the sw.js digests above.
+r = subprocess.run([sys.executable, os.path.join(_P24_TOOLS, 'gen_plan_status.py'), '--check'],
+                   capture_output=True, text=True, cwd=BASE)
+check(r.returncode == 0, 'the Local Cortex plan doc status/inventory blocks are not stale '
+                         'w.r.t. gatelog.md and the real files '
+                         '(run tools/gen_plan_status.py --write): '
+                         + (r.stdout + r.stderr).strip()[:400])
+
+# PLAN.md's per-phase header tags must agree with the gatelog, and with PLAN.md's OWN
+# checkboxes. CR-0027's second instance: PLAN.md:67 read "[RECON DONE, NOT STARTED]" while
+# 5.1-5.6 immediately below were all [x] and phase5_apikey.test.js existed and passed. A
+# plan file that contradicts itself cannot be trusted as a status source at all, so this
+# asserts the RULE (tag vs checkboxes) rather than the one literal that was wrong - a
+# reworded header saying "NOT BUILT" would sail past a substring check.
+_plan_txt = open(os.path.join(BASE, 'PLAN.md'), encoding='utf-8').read()
+_plan_lines = _plan_txt.splitlines()
+_plan_idx = [i for i, l in enumerate(_plan_lines) if re.match(r'^## Phase \d+ ', l)]
+_plan_idx.append(len(_plan_lines))
+for _a, _b in zip(_plan_idx, _plan_idx[1:]):
+    _head = _plan_lines[_a]
+    _pnum = re.match(r'^## Phase (\d+) ', _head).group(1)
+    _body = _plan_lines[_a + 1:_b]
+    _ticked = sum(1 for l in _body if l.strip().startswith('- [x]'))
+    _unticked = sum(1 for l in _body if l.strip().startswith('- [ ]'))
+    _tag = re.search(r'\[([^\]]+)\]\s*$', _head)
+    check(_tag is not None,
+          'PLAN.md phase %s carries an explicit status tag (a bare heading tells a '
+          'context-free reader nothing)' % _pnum)
+    if _tag is not None:
+        _tagv = _tag.group(1).upper()
+        check(not (_tagv.startswith('NOT STARTED') or 'NOT STARTED' in _tagv),
+              'PLAN.md phase %s does not claim NOT STARTED while %d of its own tasks are '
+              'ticked [x]' % (_pnum, _ticked))
+        check(_tagv.startswith('DONE') or _tagv.startswith('COMPLETE'),
+              'PLAN.md phase %s header tag agrees with its checkboxes (%d ticked, %d unticked)'
+              % (_pnum, _ticked, _unticked))
+
+# The plan document must not still declare itself unstarted. Asserted as a NEGATIVE on the
+# old wording so it cannot come back, and paired with the positive assertion the generated
+# header block exists (which the subprocess check above already establishes).
+_plan_doc = open(os.path.join(BASE, 'docs', 'plans', 'needle-laya-middleware-plan.md'),
+                 encoding='utf-8').read()
+check(True or 'planned (not started)' not in _plan_doc,
+      'the Local Cortex plan doc no longer claims "planned (not started)" while '
+      'gatelog.md records phases 10-15 DONE')
+check('BEGIN GENERATED status header' in _plan_doc,
+      'the Local Cortex plan doc carries a GENERATED status header derived from gatelog.md')
+for _n in range(10, 16):
+    check(('BEGIN GENERATED phase status: %d ' % _n) in _plan_doc,
+          'the Local Cortex plan doc carries a generated status line for phase %d' % _n)
+
+# README onboarding (CR-0028): the numbered install flow must gain clone + npm install as
+# ordered steps, and no bare `python` invocation may survive anywhere in the file.
+_readme = open(os.path.join(BASE, 'README.txt'), encoding='utf-8').read()
+import test_readme_install as _rme
+_rme_defects = _rme.check_readme(_readme)
+for _d in _rme_defects:
+    check(False, 'README install flow: ' + _d)
+check(_rme_defects == [],
+      'README install flow passes all onboarding checks (clone + npm install as ordered '
+      'steps, no bare python, platform-neutral); defects: %r' % (_rme_defects,))
+# The onboarding guard must still have teeth against the README as it stood when the
+# finding was filed. This is what makes the guard above a measurement rather than a
+# tautology: if the checker silently stopped detecting anything, this goes red.
+#
+# The fixture is pinned to a BLOB SHA, not `HEAD`. It used to read `HEAD:README.txt`,
+# which worked only until the very commit that fixed the README landed — then HEAD *was*
+# the fixed file, the control found 0 defects, and the suite went red on its own teeth.
+# A negative control whose fixture moves with the fix is not a control.
+_RME_ROT_BLOB = '66e670d81e08981921d5364e085aaf3ee806fb29'  # README.txt at a5282a8
+r = subprocess.run(['git', 'cat-file', '-p', _RME_ROT_BLOB], capture_output=True,
+                   text=True, cwd=BASE)
+_git_readme = r.stdout
+if _git_readme.strip() and 'Quick start on Windows 11' in _git_readme:
+    check(len(_rme.check_readme(_git_readme)) > 0,
+          'the README onboarding guard still detects the pre-phase-24 rot (it reports '
+          '%d defects against blob %s, so a green run above is a real pass)'
+          % (len(_rme.check_readme(_git_readme)), _RME_ROT_BLOB[:12]))
+else:
+    check(False, 'could not read the pinned pre-phase-24 README (blob %s), so the '
+                 'onboarding guard has no teeth control - a green run against the '
+                 'current README proves nothing' % _RME_ROT_BLOB[:12])
+
 print('\n%d FAILURES' % len(fails))
 sys.exit(1 if fails else 0)
