@@ -783,9 +783,15 @@
       /* Per-call bounded timeouts (ms). Overridable with opts.timeoutMs. */
       TIMEOUTS: { health: 1500, repair: 800, decide: 500, select: 800, outcome: 1500 },
 
-      client: function (base, fetchImpl, clock) {
+      /* `token` (optional, 4th arg) is the sidecar's per-install token. Phase 19 made
+         every sidecar POST privileged, so without it /repair, /select, /decide and
+         /ledger are all refused. It is passed IN, never read from a global: this file
+         must not know where a secret lives, and the caller owns its lifecycle. */
+      client: function (base, fetchImpl, clock, token) {
         var b = '';
         try { b = String(base == null ? '' : base).replace(/\/+$/, ''); } catch (e) { b = ''; }
+        var tok = '';
+        try { tok = String(token == null ? '' : token).trim(); } catch (e) { tok = ''; }
 
         var doFetch = (typeof fetchImpl === 'function') ? fetchImpl
           : ((root && typeof root.fetch === 'function') ? function () { return root.fetch.apply(root, arguments); } : null);
@@ -812,6 +818,8 @@
           if (!doFetch) return Promise.resolve(degraded('no fetch implementation available'));
           var url = b + path;
           var init = { method: method, headers: { 'Content-Type': 'application/json' } };
+          /* The token rides as a HEADER only - never in the URL, never logged. */
+          if (tok) init.headers['X-Cogitator-Token'] = tok;
           if (method !== 'GET') {
             var bodyText = '{}';
             try { bodyText = JSON.stringify(payload || {}); } catch (e) { bodyText = '{}'; }

@@ -1,10 +1,9 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 19 — Daemon auth: per-install token on privileged routes, provenance-checked atomic start**
-(Phase 18 is DONE but sits in PR #5, which targets PR #4's branch, NOT main — if #4 and #5 are
-still unmerged when the next run starts, Phase 19 will conflict with both. Check `gh pr view 4 5`
-before starting, and branch from `feat/phase16-bridge-jail` unless #4 has merged, in which case
-branch from main.)
+Next phase to work on: **Phase 20 — Compaction: never discard the transcript on an empty summary, never stringify array content**
+(Phase 19 is DONE but sits in PR #6, which targets PR #5's branch, NOT main. The chain is now
+#4 -> #5 -> #6, all three unmerged: merge #4 (into main), then #5, then #6. Phase 20 must branch
+from `feat/phase19-daemon-auth` unless #6 has merged. `gh pr view 4 5 6` before starting.)
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1431,29 +1430,100 @@ configuration serves a first `/repair` and a child reap cannot fail the live chi
 ---
 
 ## Phase 19 — Daemon auth: per-install token on privileged routes, provenance-checked atomic start
-Status: **not started**
+Status: **DONE**
 Ticket: `TICKET-2026-10-01-daemon-auth-and-lifecycle` (CR-Nanites-harness-0017 high, 0016 high, 0023 medium, 0024 medium)
+PR: **#6** — https://github.com/ADn-001/Nanites-harness/pull/6
+**Targets `feat/phase18-sidecar-fence` (PR #5), NOT main. Chain is #4 -> #5 -> #6; merge in that
+order.** One commit on top of #5; all three edit the same three files, so none merges alone.
 
-Deliverable: a per-install token generated at daemon start, required in a header on every
-privileged route across all three servers, with the Host header pinned to a loopback name as a
-second check; "absent Origin" stops meaning "allowed" (0017). `_cors` stops emitting
-`Access-Control-Allow-Origin: *` on refusals. `start_bridge()` re-writes `bridge.py` from
-`read_bridge_source()` (or verifies its marker/hash and refuses on mismatch) so an agent cannot
-get its own code executed by a more privileged process (0016); `_lock` is taken in
-`start_bridge`/`stop_bridge` so the rebind atomicity its comment claims is real (0023);
-`write_bridge` writes tmp + `os.replace` with `BRIDGE_MARKER` on line 1 (0024).
-Gate: `test_e2e.py` keeps its existing Origin matrix (that work is genuinely good — do not
-weaken it) and ADDS the untested half: a privileged route with no token is refused even from
-`localhost`, a foreign `Host` is refused, a tampered planted `bridge.py` is not spawned, and a
-`/set_workdir` racing a `/start` cannot end up bound to one directory while serving another.
-**This phase changes the behaviour the Phase 9 gate log deliberately left open** ("a request with
-no Origin header is still allowed") — that note becomes stale and must be updated in this phase's
-findings, not silently contradicted. Probe the daemon only on a COPY in a temp dir with spare
-ports; never in-place in the repo (it writes its pid/log next to itself, finding 0008). Done = no
-local unauthenticated client reaches a privileged route, and the daemon never spawns a file it did
-not write.
+Deliverable: a per-install token (`secrets.token_urlsafe(32)`, persisted `0600`) required in
+`X-Cogitator-Token` on every privileged route across all three servers, with `Host` pinned to
+loopback as a second check, and **absent Origin no longer meaning allowed** (0017) — the single
+line `if not origin: return True` was the hole. `_cors` reflects the specific origin instead of
+`*` and sends no ACAO at all on a refusal. `start_bridge()` verifies the on-disk `bridge.py`
+against the daemon's own source and re-plants it on mismatch, backing up what it finds and never
+destroying it (0016); `_lock` is now taken in `start_bridge`/`stop_bridge` so `set_workdir`'s
+atomicity comment is true (0023); `write_bridge` is tmp + `fsync` + `os.replace` with
+`BRIDGE_MARKER` on line 1 (0024).
 
 ### Findings
+
+- **THE PHASE-9 NOTE IS NOW STALE, AS THE PLAN PREDICTED.** Phase 9 deliberately recorded "a
+  request with no Origin header is still allowed". That was the CR-0017 hole and this phase
+  inverted it: on a privileged route, absent Origin is **refused**. `/health` and `/status` stay
+  open so the UI's status chip works pre-pair. If you find an old comment or test asserting
+  "missing Origin allowed", it is describing the old contract — `/health` still honours it, and
+  that is the only reason that case survived.
+- **61 pre-existing e2e cases went red on landing, and none of them were wrong.** They test git
+  policy, jail escapes, needle salvage and Laya gates — not auth — and they POST to privileged
+  routes with no token and no Origin. The fix is **not** to edit 61 call sites and **not** to
+  weaken them: `_send()` now takes an `AMBIENT` sentinel that resolves a per-port registered
+  token *and* an allowed Origin, and each server registers its own token read from its own token
+  file the moment it launches. Passing `token=None` explicitly still sends nothing, which is how
+  the phase-19 negatives stay genuinely negative. **Registering a phase-19 port would silently
+  make all 14 auth negatives vacuous while everything stayed green** — that is the trap in this
+  design, and it is why the phase-19 block deliberately does not register 18970-18972.
+- **A port collision hid inside the phase's own block, silently.** The phase-19 servers originally
+  used 18940/18941/18942 — which phase 13/14 (`laya_port_f`, `laya_port_g`, `sel_port_a`) already
+  own. The phase-19 sidecar never bound; `p19_wait_port` saw a *leftover phase-14 daemon* answer
+  `/health` and reported success, so every case was silently testing the wrong program. Two cases
+  only surfaced when an unrelated edit shifted timing. Now 18970-18972, and `p19_assert_ports_free()`
+  **fails loudly** if a port is already held before launch. A leftover process on your port is not
+  a test failure you will notice; it is a suite that passes for the wrong reason.
+- **The auth gate CRASHED on a malformed token, and the suite was green throughout.** The compare
+  was `hmac.compare_digest(sent, TOKEN)` on the raw header value; that raises `TypeError` on any
+  byte `>= 0x80`, and `http.server` decodes header bytes as **latin-1**. One such byte meant the
+  gate raised, the handler died, and the client got **no response at all** instead of a 403 —
+  20/20 requests on all three servers. Not a bypass (nothing was served), but an unauthenticated
+  caller could drop connections, and a guard that crashes is not a guard that refuses. Fixed by
+  comparing `.encode()`d forms. The regression asserts the **status line**, because `-1` (no
+  status line) is how the crash reports itself — `req_non_ascii_token()` writes a raw socket
+  because `urllib` cannot put a non-UTF-8 byte in a header.
+  **This is the phase-18 lesson again, one level up: the review pass found what the harness
+  could not, and the harness was 100% green when it found it. Spawn the review pass even when
+  everything is green — especially then.**
+- **`LOOPBACK_HOSTS` was dead code in all three servers, with a comment describing a check the
+  code did not perform.** The constant said "compared against the *whole* value" while
+  `_host_allowed` hardcoded a second, divergent `('localhost', '127.0.0.1')` literal. Nothing read
+  the constant, so the comment described an intent nobody implemented — and the next reader who
+  "fixed" `_host_allowed` to use it would have introduced a prefix-match bug. It is now the thing
+  the check actually uses. **Remember: a definition with no caller is a claim about intent, and a
+  comment on a definition nobody reads is worse than no comment.**
+- **CR-0016's re-plant means a user-edited daemon-written bridge.py is backed up, every rebind.**
+  That is deliberate and it is the price of "never spawn a file we did not write": the user's edit
+  cannot be preserved *and* spawned. It accumulates `.cogitator-bakN`. `scrub_old_bridge`'s log
+  line still says "no daemon marker — not ours", which now means "differs from our source" —
+  wording to fix when that file is next touched.
+- **413 now sits BEHIND the auth gate.** The gate runs before the body is read, so an oversized
+  *unauthenticated* POST gets 403, not 413. Verified both ways: no token → 403, right token → 413
+  (the cap is intact). The `lm_413` cases now carry a token. Anyone adding a size-cap case must
+  send one or it will "prove" the wrong status.
+- **The daemon has no `--bridge-port` flag** (`BRIDGE_PORT = 8931` is a module constant), so the
+  CR-0023 race case cannot move the worker off the default and risks colliding with a real
+  bridge. Probes patched their own temp copy. Worth a flag — flagged for a future phase, not done
+  here (it is not in this phase's scope and no ticket covers it).
+- **The UI seam was the thing no test could see, and it is complete.** All five loopback call
+  sites carry the token: four `tools/execute` fetches + `daemonRPC` via `cogHeaders()`, and the
+  three `CogCore.localModels.client(...)` sites pass `lmToken()`. There are **two** settings keys,
+  not one: `cogToken` (daemon + bridge worker) and `lmToken` (sidecar), because the sidecar owns
+  a *different* token file. `console.log` count in index.html is 0, both inputs are
+  `type="password"`, and the token is never placed in a URL. **A missed call site would have made
+  the shipped app unable to talk to the shipped server with no test failing** — grep every
+  `fetch(`/`sendBeacon(` when you touch this file.
+- **`sendBeacon('/stop')` on `beforeunload` is now refused** (it cannot carry headers). Accepted
+  and documented in-code: the daemon owns the worker's lifetime anyway. Do not "fix" it by moving
+  the token into a query string — that puts a credential in a URL.
+- **Verification at close:** `python3 test_e2e.py` -> **242 ok / 0 FAILURES** (was 195; 47 new
+  phase-19 cases), run green 5x. `npm run test:front` ALL GREEN. An independent adversarial review
+  mutation-tested all six guarantees against live mutant servers — every mutant caught, including
+  the CR-0023 unlock mutant, which produced "cold: NO LIVE WORKER". Reviewer could NOT break the
+  `Host` pin with 25 hostile values, nor the token gate with prefix/case/encoding variants, nor
+  find any method or path-shape bypass.
+- **What the review did NOT check, and neither did we:** no browser was involved. The UI seam was
+  verified by reading code and grepping call sites, not by pairing a token in the real page, and
+  the CORS preflight was never exercised by a real browser. `--allow-any-origin` /
+  `--allow-file-origin` were only reasoned about, not probed. `pick_directory` was never
+  exercised (it opens a Tk dialog). Treat the browser round-trip as untested.
 
 ---
 

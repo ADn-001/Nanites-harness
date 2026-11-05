@@ -42,7 +42,7 @@ serialised by the module lock (the package keeps ONE active instance per generat
 process-wide) and NEVER wedges the server: a timeout or a missing model answers
 {ok:false, degraded:true} - never a 500.
 """
-import argparse, atexit, collections, json, os, shutil, signal, subprocess, sys, threading, time
+import argparse, atexit, collections, hmac, json, os, secrets, shutil, signal, subprocess, sys, threading, time
 from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -75,6 +75,38 @@ LAYA_NODE = os.environ.get('LAYA_NODE') or 'node'
 LEDGER_PATH = ledger.default_path()
 ALLOW_ANY_ORIGIN = False
 ALLOW_FILE_ORIGIN = False
+#: The Host header must name loopback. The whole value is split on the last
+#: colon and the NAME must equal one of these exactly, so neither
+#: "localhost.evil.example" nor "127.0.0.1.evil.example" can pass as
+#: "localhost". A missing Host is refused: HTTP/1.1 requires one, so its
+#: absence means a crafted request rather than a browser. The bracketed IPv6
+#: literal "[::1]" is handled separately in _host_allowed, because it carries
+#: its port inside the brackets and would not survive a naive split on ":".
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1")
+#: The per-install token, next to THIS script. The sidecar owns its own token; it
+#: does not share the bridge daemon's, because it is a separate install surface.
+TOKEN_PATH = os.path.join(DAEMON_DIR, '.cogitator-token')
+TOKEN = ''
+
+
+def load_or_create_token(path):
+    """Per-install token, 0600. Read-or-create so the operator pastes it into the UI once."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(tok + '\n')
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return tok
 
 BACKEND = needle_backend.NeedleBackend(generation=NEEDLE_GENERATION)
 # /repair runs the (possibly slow) model call on this single worker so the HTTP handler
@@ -808,13 +840,51 @@ def _laya_decide(state, questions, timeout_ms, trace_id):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _host_allowed(self):
+        """The Host header must name loopback, with or without a port."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            # HTTP/1.1 requires a Host; its absence means a crafted request, not a browser.
+            return False
+        if host.startswith("["):
+            if host == "[::1]":
+                return True
+            return host.startswith("[::1]:") and host[6:].isdigit()
+        name, sep, port = host.partition(":")
+        if name not in LOOPBACK_HOSTS:
+            return False
+        return not sep or port.isdigit()
+
+    def _token_ok(self):
+        """Constant-time compare of X-Cogitator-Token against the per-install token.
+
+        Compare the ASCII-safe form: hmac.compare_digest raises TypeError on any
+        str holding a byte >= 0x80, and http.server decodes header bytes as
+        latin-1, so a malformed token would crash the gate instead of being
+        refused with a 403. See bridge.py for the full note.
+        """
+        sent = self.headers.get("X-Cogitator-Token") or ""
+        if not sent or not TOKEN:
+            return False
+        try:
+            return hmac.compare_digest(sent.encode("utf-8"), TOKEN.encode("utf-8"))
+        except (UnicodeError, TypeError):
+            return False
+
+    def _privileged(self):
+        """Every POST on the sidecar is privileged; GET /health is not."""
+        return self.command == "POST"
+
     def _origin_allowed(self):
         if ALLOW_ANY_ORIGIN:
             return True
         origin = self.headers.get("Origin")
         if not origin:
-            # curl / native callers send no Origin at all.
-            return True
+            # Absent Origin on a PRIVILEGED route is refused (CR-Nanites-harness-0017):
+            # only curl and native callers send none, and they must carry the token.
+            # GET /health keeps treating it as allowed, so the settings panel's status
+            # line is alive before the operator has paired.
+            return not self._privileged()
         if origin == "null":
             # A browser sends "null" for a sandboxed iframe, a data:/blob:
             # document, or a file:// page - i.e. any hostile page can get an
@@ -823,28 +893,63 @@ class Handler(BaseHTTPRequestHandler):
         low = origin.lower()
         return low.startswith("http://localhost:") or low.startswith("http://127.0.0.1:") or low in ("http://localhost", "http://127.0.0.1")
 
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    def _auth_gate(self):
+        """Return an error string when the request must be refused, else None.
 
-    def _json(self, code, obj):
+        The three checks are ANDed on a privileged route: a correct token never
+        buys a past a foreign Origin, and a local Origin never buys a past a
+        missing token.
+        """
+        if not self._host_allowed():
+            return "host not permitted"
+        if self._privileged() and not self._token_ok():
+            return "X-Cogitator-Token required"
+        if not self._origin_allowed():
+            return "origin not permitted"
+        return None
+
+    def _cors(self, reflect=True):
+        """Reflect the SPECIFIC request Origin. Never `*`.
+
+        `reflect=False` on a refusal: a wildcard ACAO on a 403 is part of what
+        CR-Nanites-harness-0017 calls out, so no ACAO is emitted at all then.
+        ALLOW-Methods/ALLOW-HEADERS stay unconditional - they leak nothing and
+        the preflight needs them (X-Cogitator-Token especially, or the browser
+        refuses the real request and the UI breaks silently).
+        """
+        if reflect:
+            origin = self.headers.get("Origin")
+            if origin and self._origin_allowed():
+                self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Cogitator-Token")
+
+    def _json(self, code, obj, cors=True):
         body = json.dumps(obj).encode()
-        self.send_response(code); self._cors()
+        self.send_response(code); self._cors(cors)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self.send_response(204); self._cors(); self.end_headers()
+        # A preflight cannot carry the token's VALUE, so the token check is not
+        # performed here - the real request is where it is enforced. The Host and
+        # Origin checks still gate the 204.
+        if not self._host_allowed():
+            self._json(403, {"ok": False, "error": "host not permitted"}, cors=False); return
+        if not self._origin_allowed():
+            self._json(403, {"ok": False, "error": "origin not permitted"}, cors=False); return
+        self.send_response(204); self._cors(True); self.end_headers()
 
     def _route(self):
         return self.path.split('?', 1)[0].rstrip('/') or '/'
 
     def do_GET(self):
-        # Origin guard FIRST (Phase 10 invariant): foreign Origin => 403, not 404.
-        if not self._origin_allowed():
-            self._json(403, {"ok": False, "error": "origin not permitted"}); return
+        # Host + token + Origin gate FIRST (Phase 10 invariant): a foreign Origin
+        # or a missing token => 403, not 404.
+        denied = self._auth_gate()
+        if denied:
+            self._json(403, {"ok": False, "error": denied}, cors=False); return
         if self._route() == '/health':
             self._json(200, health_obj())
         else:
@@ -871,9 +976,11 @@ class Handler(BaseHTTPRequestHandler):
             return None, 400
 
     def do_POST(self):
-        # Origin guard FIRST (Phase 10 invariant): foreign Origin => 403, not 404.
-        if not self._origin_allowed():
-            self._json(403, {"ok": False, "error": "origin not permitted"}); return
+        # Host + token + Origin gate FIRST (Phase 10 invariant): a foreign Origin
+        # or a missing token => 403, not 404.
+        denied = self._auth_gate()
+        if denied:
+            self._json(403, {"ok": False, "error": denied}, cors=False); return
         body, err = self._read_body()
         if err == 413:
             self._json(413, {"ok": False, "error": "request exceeds %d byte limit" % MAX_JSON_BYTES}); return
@@ -976,6 +1083,7 @@ def _shutdown_laya(*_args):
 
 def main():
     global PORT, NEEDLE_ENABLED, LAYA_ENABLED, LEDGER_PATH, LAYA
+    global TOKEN, TOKEN_PATH
     global ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN, NEEDLE_TIMEOUT_MS, NEEDLE_SELECT_TIMEOUT_MS
     global LAYA_TIMEOUT_MS, LAYA_IDLE_S, LAYA_CHILD_PATH
     ap = argparse.ArgumentParser(description="LOCAL CORTEX sidecar (Needle + Laya)")
@@ -1012,6 +1120,7 @@ def main():
     LEDGER_PATH = a.ledger or ledger.default_path()
     ALLOW_ANY_ORIGIN = a.allow_any_origin
     ALLOW_FILE_ORIGIN = a.allow_file_origin
+    TOKEN = load_or_create_token(TOKEN_PATH)
     if a.preload_needle and NEEDLE_ENABLED:
         # Background (never blocks boot): the engine's first load is the slow part.
         def _preload():
@@ -1050,6 +1159,9 @@ def main():
               % (LAYA_TIMEOUT_MS, LAYA_IDLE_S))
         print("   laya cache : %s" % laya_cache_path())
     print("   origins    : %s" % origins_desc())
+    # Never the token itself - only the path to read it from.
+    print("   token file : %s" % TOKEN_PATH)
+    print("   paste      : cat \"%s\"" % TOKEN_PATH)
     print("   ledger     : %s" % os.path.abspath(LEDGER_PATH))
     print("   telemetry  : NEEDLE_TELEMETRY=%s (nothing leaves the machine)"
           % os.environ.get('NEEDLE_TELEMETRY'))

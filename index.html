@@ -348,11 +348,19 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
         <button class="tbtn" id="stop-bridge-btn" style="color:var(--danger);border-color:rgba(255,59,59,.5)">&#9632; STOP</button>
       </div>
       <div class="field chk" style="margin-top:8px"><input id="auto-bridge" type="checkbox" checked><label for="auto-bridge" style="margin:0">AUTO-MANAGE BRIDGE LIFECYCLE (START ON BIND/OPEN — SEVER ON CLOSE)</label></div>
+      <div style="margin-top:10px">
+        <label style="font-size:9.5px;color:var(--phos-dim);letter-spacing:.14em">BRIDGE DAEMON TOKEN (PHASE 19 — REQUIRED FOR EVERY WRITE RITE)</label>
+        <input id="cog-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste: cat .cogitator-token">
+      </div>
       <div id="workdir-result" style="font-size:10px;margin-top:4px;letter-spacing:.15em"></div>
       <div style="font-size:9.5px;color:var(--phos-dim);letter-spacing:.12em;line-height:1.8;margin-top:6px">
         REQUIRES bridge_daemon.py AWAKE ON THIS MACHINE (PORT 8930) — KEEP bridge.py IN THE SAME FOLDER AS THE DAEMON.
         BINDING WRITES bridge.py INTO THE CHOSEN DIR AND SPAWNS IT; REBINDING ELSEWHERE SCRUBS THE OLD COPY FIRST
         (A bridge.py YOU WROTE YOURSELF IS BACKED UP, NEVER DESTROYED).
+        <br><br>THE TOKEN: bridge_daemon.py AND local_models_daemon.py EACH KEEP THEIR OWN .cogitator-token BESIDE THEMSELVES
+        (MODE 0600). READ ONE WITH <span style="color:var(--phos)">cat .cogitator-token</span> AND PASTE IT HERE.
+        IT IS A SECRET — STORED IN THIS BROWSER'S SETTINGS, NEVER LOGGED, NEVER PUT IN A URL. THE DAEMON SPAWNS ITS
+        WORKER WITH THE SAME TOKEN, SO ONE PASTE COVERS BOTH.
       </div>
     </div>
     <div class="field">
@@ -387,6 +395,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
       <div class="field"><label>DISPATCHER TIMEOUT (MS)</label><input id="set-lm-dispatcher-timeout" type="number" min="50" step="50" value="800"></div>
       <div class="field"><label>LOCAL CORTEX SIDECAR PORT (127.0.0.1 ONLY)</label><input id="set-lm-port" type="number" min="1" max="65535" value="8932"></div>
       <div class="field"><label>LOCAL CORTEX LEDGER (APPEND-ONLY JSONL PATH, RELATIVE TO THE REPO)</label><input id="set-lm-ledger" type="text" value="var/local-models.jsonl"></div>
+      <div class="field"><label>LOCAL CORTEX SIDECAR TOKEN (PHASE 19 — REQUIRED FOR /repair, /select, /decide, /ledger)</label><input id="set-lm-token" type="password" autocomplete="off" spellcheck="false" placeholder="paste: cat localmodels/.cogitator-token"></div>
       <div id="lm-status" style="font-size:10px;margin-top:6px;letter-spacing:.15em;color:var(--phos-dim)">LOCAL CORTEX: DISABLED</div>
       <button class="tbtn" id="test-cortex" style="margin-top:6px">&#9881; PROBE LOCAL CORTEX</button>
     </div>
@@ -461,7 +470,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;background:var(--phos
 const LS_CHATS='cogitator.chats', LS_SET='cogitator.settings', LS_ACTIVE='cogitator.active';
 const DEF_SETTINGS={endpoint:'',model:'',system:'',backend:'auto',
   temperature:0.7,topP:0.9,presence:0,frequency:0,ctxLimit:131072,compactAt:70,autoCompact:true,
-  flashAttention:false,kvOffload:false,workdir:null,autoBridge:true,
+  flashAttention:false,kvOffload:false,workdir:null,autoBridge:true,cogToken:'',lmToken:'',
   agent:false,autoApproveRead:true,bridgePort:8931,profiles:[],activeProfile:'',apiKey:'',
   localModels:{enabled:false,
   needle:{enabled:false,minConfidence:0.75,confirmBand:[0.5,0.75],timeoutMs:800},
@@ -499,6 +508,16 @@ let abortCtl=null, generating=false, sidebarOpen=false, backendType='unknown';
 const $=id=>document.getElementById(id);
 const api=path=>{let e=(settings.endpoint||'').trim().replace(/\/+$/,'');return e+path;};
 const authHeaders=()=>{const k=(settings.apiKey||'').trim();return k?{'Authorization':'Bearer '+k}:{};};
+/* PHASE 19: the daemon's per-install token. Sent on every request to
+   127.0.0.1:8930 and to the bridge worker, because a privileged route now
+   requires it. It is a SECRET: held in settings (localStorage), never logged,
+   never put in a URL, and never sent to a foreign origin - `cogHeaders` is only
+   ever called with the two loopback bases below. */
+const cogHeaders=()=>{const t=(settings.cogToken||'').trim();return t?{'X-Cogitator-Token':t}:{};};
+/* local_models_daemon.py keeps its OWN token (beside local_models_daemon.py), so it
+   is a separate paste from the bridge daemon's. Empty means "not paired yet": the
+   sidecar's POSTs degrade rather than break the page. */
+const lmToken=()=>(settings.lmToken||'').trim();
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const tok=s=>CogCore.tok(s);
 const fmtK=n=>n<1000?String(Math.round(n)):(n/1000).toFixed(1)+'k';
@@ -688,7 +707,7 @@ function refreshLastFor(c,m){
 async function getWorkdirListing(){
   if(!settings.workdir)return null;
   try{
-    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(8000),body:JSON.stringify({name:'list_dir',arguments:{path:'.'}})});
+    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json',...cogHeaders()},signal:apiSig(8000),body:JSON.stringify({name:'list_dir',arguments:{path:'.'}})});
     const j=await r.json().catch(()=>({}));
     if(!r.ok||j.ok===false)return null;
     return String(j.result??'');
@@ -1234,7 +1253,7 @@ async function runCortexDispatch(c,m,iter){
   const lm=normLocalModels(settings.localModels);
   if(!(settings.agent&&lm.enabled&&lm.dispatcher.enabled&&CogCore.cortexDispatch))return null;
   let client=null;
-  try{client=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch);}catch(e){client=null;}
+  try{client=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch,null,lmToken());}catch(e){client=null;}
   if(!client)return null;
   let d=null;
   try{
@@ -1318,7 +1337,7 @@ async function executeTool(tc){
   const approved=await approveToolCall(tc);
   if(!approved)return '[RITE COUNTERMANDED BY OPERATOR — the machine-spirit must choose another path]';
   try{
-    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(30000),body:JSON.stringify({name:tc.name,arguments:args})});
+    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json',...cogHeaders()},signal:apiSig(30000),body:JSON.stringify({name:tc.name,arguments:args})});
     const j=await r.json().catch(()=>({}));
     if(!r.ok||j.ok===false)return '[RITE REFUSED: '+((j.error||('HTTP '+r.status)))+']';
     return String(j.result??'');
@@ -1355,7 +1374,7 @@ async function runAgentLoop(c,m,sig){
     try{
       /* ONE client per turn, built only when the operator opted in — with enabled:false the page
          makes ZERO requests to the sidecar port. */
-      if(lm.enabled)cortexClient=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch);
+      if(lm.enabled)cortexClient=CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch,null,lmToken());
     }catch(e){cortexClient=null;}
     /* PHASE 15 — open the turn's single-probe holder BEFORE the model call, so the stream pump
        can start the ONE repair probe mid-flight. The latch it carries is shared with the
@@ -1540,7 +1559,7 @@ async function openWorkdirPicker(){
   if($('wd-picker'))$('wd-picker').classList.add('open');
   list.innerHTML='<div class="wd-empty">SUMMONING THE ARCHIVE&hellip;</div>';
   try{
-    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(8000),body:JSON.stringify({name:'list_dir',arguments:{path:'.'}})});
+    const r=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json',...cogHeaders()},signal:apiSig(8000),body:JSON.stringify({name:'list_dir',arguments:{path:'.'}})});
     const j=await r.json().catch(()=>({}));
     if(!r.ok||j.ok===false){list.innerHTML='<div class="wd-empty">&#10007; BRIDGE REFUSED THE LISTING</div>';return;}
     const entries=parseWorkingList(String(j.result??'')).filter(e=>e.tag==='f');
@@ -1550,7 +1569,7 @@ async function openWorkdirPicker(){
       const name=btn.dataset.name;
       btn.disabled=true;btn.textContent='READING '+name+'&hellip;';
       try{
-        const rr=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json'},signal:apiSig(8000),body:JSON.stringify({name:'read_file',arguments:{path:name}})});
+        const rr=await fetch('http://127.0.0.1:'+(settings.bridgePort||8931)+'/tools/execute',{method:'POST',headers:{'Content-Type':'application/json',...cogHeaders()},signal:apiSig(8000),body:JSON.stringify({name:'read_file',arguments:{path:name}})});
         const jj=await rr.json().catch(()=>({}));
         if(!rr.ok||jj.ok===false){btn.disabled=false;btn.textContent='&#10007; READ REFUSED';return;}
         addAttachment(name,'text',String(jj.result??''),(String(jj.result??'').length>ATTACH_CAP?'TRUNCATED':''));
@@ -1678,7 +1697,7 @@ function halt(){
 /* ================= WORKDIR / BRIDGE DAEMON SUBSYSTEM ================= */
 const DAEMON_URL='http://127.0.0.1:8930';
 async function daemonRPC(path,payload){
-  const o=payload===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)};
+  const o=payload===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json',...cogHeaders()},body:JSON.stringify(payload)};
   const r=await fetch(DAEMON_URL+path,o);return r.json();
 }
 async function daemonStatus(){try{const s=await daemonRPC('/status');return s.ok?s:null;}catch(e){return null;}}
@@ -1695,6 +1714,9 @@ async function refreshBridgeChip(){
 function refreshWorkdirUI(){
   $('workdir-input').value=settings.workdir||'';
   $('auto-bridge').checked=settings.autoBridge!==false;
+  /* A password-type input is not shoulder-readable, and the token is a SECRET:
+     it is written to the settings blob and nowhere else - never a URL, never a log. */
+  if($('cog-token'))$('cog-token').value=settings.cogToken||'';
   $('workdir-result').innerHTML=settings.workdir
     ?'<span style="color:var(--phos-dim)">BOUND: '+esc(settings.workdir)+'</span>'
     :'<span style="color:var(--phos-dim)">NO WORKING DIRECTORY BOUND</span>';
@@ -1812,6 +1834,7 @@ function restoreCortexFields(){
   if($('set-lm-dispatcher-timeout'))$('set-lm-dispatcher-timeout').value=lm.dispatcher.timeoutMs;
   if($('set-lm-port'))$('set-lm-port').value=lm.port;
   if($('set-lm-ledger'))$('set-lm-ledger').value=lm.ledger;
+  if($('set-lm-token'))$('set-lm-token').value=settings.lmToken||'';
 }
 function writeCortexFields(){
   const d=DEF_SETTINGS.localModels;
@@ -1846,7 +1869,7 @@ async function refreshCortexStatus(){
     let r=null;
     try{
       if(!(window.CogCore&&CogCore.localModels&&CogCore.localModels.client))throw new Error('client unavailable');
-      r=await CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/').health();
+      r=await CogCore.localModels.client('http://127.0.0.1:'+(lm.port||8932)+'/',window.fetch,null,lmToken()).health();
     }catch(e){r={ok:false,degraded:true,error:String((e&&e.message)||e)};}
     if(!el)return;
     if(!r||r.ok===false){
@@ -1940,6 +1963,8 @@ $('save-settings').onclick=()=>{
   if($('set-kv-offload'))settings.kvOffload=$('set-kv-offload').checked;
   settings.system=$('set-sys').value;
   settings.autoBridge=$('auto-bridge').checked;
+  if($('cog-token'))settings.cogToken=$('cog-token').value.trim();
+  if($('set-lm-token'))settings.lmToken=$('set-lm-token').value.trim();
   settings.temperature=parseFloat($('set-temp').value);
   settings.topP=parseFloat($('set-topp').value);
   settings.presence=parseFloat($('set-pres').value);
@@ -1958,6 +1983,12 @@ $('bind-workdir-btn').onclick=bindWorkdir;
 $('start-bridge-btn').onclick=()=>bridgeStart(false);
 $('stop-bridge-btn').onclick=bridgeStop;
 $('auto-bridge').onchange=e=>{settings.autoBridge=e.target.checked;saveSet();};
+/* The token is paired once, so persist it on change rather than demanding a full
+   SAVE-settings round trip. It goes into the settings blob and nothing else. */
+$('cog-token').onchange=e=>{settings.cogToken=e.target.value.trim();saveSet();refreshBridgeChip();};
+/* Same rule for the sidecar's own token: paired once, persisted immediately, and
+   stored in the settings blob like every other setting - never logged, never in a URL. */
+$('set-lm-token').onchange=e=>{settings.lmToken=e.target.value.trim();saveSet();};
 
 function syncAgentToggle(){const b=$('agent-toggle');if(!b)return;b.classList.toggle('on',!!settings.agent);
   b.title=settings.agent?'Agent rites ENABLED — every transmission may invoke bridge tools':'Agent rites disabled';}
@@ -2010,6 +2041,12 @@ renderAll();boot();startSkullCycle();testConnection(true);autosize();
 refreshWorkdirUI();refreshBridgeChip();
 setInterval(refreshBridgeChip,3000);
 if(settings.workdir&&settings.autoBridge!==false)bridgeStart(true);
+/* PHASE 19: this beacon CANNOT carry the X-Cogitator-Token header - sendBeacon takes
+   only a URL and a body, so /stop will now be refused and the worker survives the
+   unload. That is ACCEPTED, not a bug to "fix": the daemon owns the worker's
+   lifetime, the operator's START button still works, and smuggling the token into
+   the URL or the body to force this through would put a secret in a place the rest
+   of the design deliberately keeps it out of. Do not add ?token= here. */
 window.addEventListener('beforeunload',()=>{if(settings.autoBridge!==false){try{navigator.sendBeacon(DAEMON_URL+'/stop');}catch(e){}}});
 if('serviceWorker'in navigator&&location.protocol.startsWith('http')){
   navigator.serviceWorker.register('sw.js').catch(()=>{});}

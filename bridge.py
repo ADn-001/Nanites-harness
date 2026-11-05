@@ -10,11 +10,12 @@ Run this INSIDE the project directory you want the agent to operate on:
     python bridge.py --allow-exec        # permit run_command (DANGEROUS)
     python bridge.py --allow-any-origin  # disable the Origin guard entirely
     python bridge.py --allow-file-origin # trust a null Origin (file:// page)
+    python bridge.py --token-file PATH    # use an existing install token (daemon-spawned)
 
 The frontend sends {name, arguments} to POST /tools/execute and gets back
 {ok: true, result: "..."} or {ok: false, error: "..."}.
 """
-import argparse, json, os, re, shlex, subprocess, sys
+import argparse, hmac, json, os, re, secrets, shlex, subprocess, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_READ   = 512 * 1024
@@ -62,6 +63,15 @@ GIT_REFUSED_WRITE = {"format-patch", "archive", "bundle", "fast-export", "worktr
 #: out-of-jail flags are denied uniformly, which is the whole of the escape surface.
 GIT_JAIL_FLAGS = ("--output", "--output-indicator-new", "--exec-path", "--no-index")
 
+#: The Host header must name loopback. The whole value is split on the last
+#: colon and the NAME must equal one of these exactly, so neither
+#: "localhost.evil.example" nor "127.0.0.1.evil.example" can pass as
+#: "localhost". A missing Host is refused: HTTP/1.1 requires one, so its
+#: absence means a crafted request rather than a browser. The bracketed IPv6
+#: literal "[::1]" is handled separately in _host_allowed, because it carries
+#: its port inside the brackets and would not survive a naive split on ":".
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1")
+
 
 ROOT = os.path.abspath(os.getcwd())
 ALLOW_EXEC = False
@@ -69,6 +79,28 @@ ALLOW_GIT_WRITE = False
 ALLOW_ANY_ORIGIN = False
 ALLOW_FILE_ORIGIN = False
 PORT = 8931
+TOKEN = ''
+TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cogitator-token')
+
+
+def load_or_create_token(path):
+    """Per-install token, 0600. Read-or-create so the operator pastes it into the UI once."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(tok + '\n')
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return tok
 
 def origins_desc():
     if ALLOW_ANY_ORIGIN:
@@ -284,13 +316,49 @@ TOOLS = {
 }
 
 class Handler(BaseHTTPRequestHandler):
+    def _host_allowed(self):
+        """The Host header must name loopback, with or without a port."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            # HTTP/1.1 requires a Host; its absence means a crafted request, not a browser.
+            return False
+        if host.startswith("["):
+            # Bracketed IPv6 literal: [::1] or [::1]:PORT, and nothing else.
+            if host == "[::1]":
+                return True
+            return host.startswith("[::1]:") and host[6:].isdigit()
+        name, sep, port = host.partition(":")
+        if name not in LOOPBACK_HOSTS:
+            return False
+        return not sep or port.isdigit()
+
+    def _token_ok(self):
+        """Constant-time compare of X-Cogitator-Token against the per-install token.
+
+        Compare the ASCII-safe form, not the raw header. hmac.compare_digest
+        raises TypeError on any str containing a byte >= 0x80, and http.server
+        decodes header bytes as latin-1, so one such byte in the token crashed
+        the gate: the request was not served, but the client got NO RESPONSE at
+        all instead of a 403. A malformed token must be REFUSED, not fatal.
+        """
+        sent = self.headers.get("X-Cogitator-Token") or ""
+        if not sent or not TOKEN:
+            return False
+        try:
+            return hmac.compare_digest(sent.encode("utf-8"), TOKEN.encode("utf-8"))
+        except (UnicodeError, TypeError):
+            return False
+
     def _origin_allowed(self):
         if ALLOW_ANY_ORIGIN:
             return True
         origin = self.headers.get("Origin")
         if not origin:
-            # curl / native callers send no Origin at all.
-            return True
+            # Absent Origin on a PRIVILEGED route is refused (CR-Nanites-harness-0017):
+            # only curl and native callers send none, and they must carry the token.
+            # Read-only routes keep treating it as allowed, so the UI's status chip
+            # works before the operator has paired.
+            return not self._privileged()
         if origin == "null":
             # A browser sends "null" for a sandboxed iframe, a data:/blob:
             # document, or a file:// page — i.e. any hostile page can get an
@@ -299,21 +367,60 @@ class Handler(BaseHTTPRequestHandler):
         low = origin.lower()
         return low.startswith("http://localhost:") or low.startswith("http://127.0.0.1:") or low in ("http://localhost", "http://127.0.0.1")
 
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+    def _privileged(self):
+        """POST /tools/execute is the only privileged route on the bridge worker."""
+        return (self.command == "POST"
+                and self.path.rstrip("/").endswith("tools/execute"))
+
+    def _auth_gate(self):
+        """Return an error string when the request must be refused, else None.
+
+        Order is Host, then token, then Origin, and the three are ANDed on a
+        privileged route: a correct token never buys a past a foreign Origin and
+        a local Origin never buys a past a missing token.
+        """
+        if not self._host_allowed():
+            return "host not permitted"
+        if self._privileged() and not self._token_ok():
+            return "X-Cogitator-Token required"
+        if not self._origin_allowed():
+            return "origin not permitted"
+        return None
+
+    def _cors(self, reflect=True):
+        """Reflect the SPECIFIC request Origin. Never `*`.
+
+        `reflect=False` on a refusal: a wildcard ACAO on a 403 is part of what
+        CR-Nanites-harness-0017 calls out, so no ACAO is emitted at all then.
+        ALLOW-Methods/ALLOW-HEADERS stay unconditional - they leak nothing and
+        the preflight needs them (X-Cogitator-Token especially, or the browser
+        refuses the real request and the UI breaks silently).
+        """
+        if reflect:
+            origin = self.headers.get("Origin")
+            if origin and self._origin_allowed():
+                self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-    def _json(self, code, obj):
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Cogitator-Token")
+    def _json(self, code, obj, cors=True):
         body = json.dumps(obj).encode()
-        self.send_response(code); self._cors()
+        self.send_response(code); self._cors(cors)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
     def do_OPTIONS(self):
-        self.send_response(204); self._cors(); self.end_headers()
-    def do_GET(self):
+        # A preflight cannot carry the token's VALUE, so the token check is not
+        # performed here - the real request is where it is enforced. The Host and
+        # Origin checks still gate the 204.
+        if not self._host_allowed():
+            self._json(403, {"ok": False, "error": "host not permitted"}, cors=False); return
         if not self._origin_allowed():
-            self._json(403, {"ok": False, "error": "origin not permitted"}); return
+            self._json(403, {"ok": False, "error": "origin not permitted"}, cors=False); return
+        self.send_response(204); self._cors(True); self.end_headers()
+    def do_GET(self):
+        denied = self._auth_gate()
+        if denied:
+            self._json(403, {"ok": False, "error": denied}, cors=False); return
         if self.path.rstrip("/").endswith("health"):
             self._json(200, {"ok": True, "root": ROOT, "port": PORT,
                              "allow_exec": ALLOW_EXEC, "allow_git_write": ALLOW_GIT_WRITE,
@@ -322,8 +429,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"ok": False, "error": "unknown rite"})
     def do_POST(self):
-        if not self._origin_allowed():
-            self._json(403, {"ok": False, "error": "origin not permitted"}); return
+        denied = self._auth_gate()
+        if denied:
+            self._json(403, {"ok": False, "error": denied}, cors=False); return
         if not self.path.rstrip("/").endswith("tools/execute"):
             self._json(404, {"ok": False, "error": "unknown rite"}); return
         try:
@@ -349,6 +457,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global ROOT, ALLOW_EXEC, ALLOW_GIT_WRITE, ALLOW_ANY_ORIGIN, ALLOW_FILE_ORIGIN, PORT
+    global TOKEN, TOKEN_PATH
     ap = argparse.ArgumentParser(description="Cogitator tool bridge")
     ap.add_argument("--root", default=os.getcwd(), help="project root jail (default: cwd)")
     ap.add_argument("--port", type=int, default=8931)
@@ -356,10 +465,14 @@ def main():
     ap.add_argument("--allow-git-write", action="store_true", help="enable write git rites")
     ap.add_argument("--allow-any-origin", action="store_true", help="allow non-local web origins (not recommended)")
     ap.add_argument("--allow-file-origin", action="store_true", help="trust a null Origin (file:// page) — not recommended")
+    ap.add_argument("--token-file", default=None,
+                    help="path to the per-install token file (default: <this dir>/.cogitator-token)")
     a = ap.parse_args()
     ROOT = os.path.abspath(a.root); ALLOW_EXEC = a.allow_exec
     ALLOW_GIT_WRITE = a.allow_git_write; ALLOW_ANY_ORIGIN = a.allow_any_origin
     ALLOW_FILE_ORIGIN = a.allow_file_origin; PORT = a.port
+    TOKEN_PATH = os.path.abspath(a.token_file) if a.token_file else TOKEN_PATH
+    TOKEN = load_or_create_token(TOKEN_PATH)
     print("=" * 56)
     print(" COGITATOR BRIDGE v2 — the machine extends into the physical")
     print("   root       : %s" % ROOT)
@@ -367,6 +480,8 @@ def main():
     print("   git write  : %s" % ("ENABLED" if ALLOW_GIT_WRITE else "disabled (read-only)"))
     print("   exec       : %s" % ("ENABLED" if ALLOW_EXEC else "disabled"))
     print("   origins    : %s" % origins_desc())
+    print("   token file : %s" % TOKEN_PATH)
+    print("   paste      : cat \"%s\"" % TOKEN_PATH)
     print("   health     : http://localhost:%d/health" % PORT)
     print("=" * 56)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
