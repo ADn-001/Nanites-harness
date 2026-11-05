@@ -30,7 +30,7 @@ const SHELL = ['./index.html','./appcore.js','./manifest.webmanifest','./sw.js',
    test_e2e.py runs that check. CR-Nanites-harness-0007: this map is what makes
    CACHE a derivation rather than a human-remembered literal. */
 const ASSET_DIGESTS = {
-  './index.html': '96db13476fb74018',
+  './index.html': '47360252333b2a8e',
   './appcore.js': 'dea77ef8dcf9e874',
   './manifest.webmanifest': '438b41770fc283e5',
   './sw.js': '' /* excluded: embeds this map */,

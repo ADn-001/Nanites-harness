@@ -1,10 +1,10 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 23 — Report a stream timeout as a timeout, and send the auth header the LM Studio probe omits**
-(Phase 22 is DONE in PR #9, which targets PR #8's branch (`fix/phase21-sw-offline-html`), NOT
-main. The chain is now #4 -> #5 -> #6 -> #7 -> #8 -> #9, all six unmerged: merge in that order.
-Phase 23 must branch from `fix/phase22-request-and-ledger-integrity` unless #9 has merged.
-`gh pr view 4 5 6 7 8 9` before starting.)
+Next phase to work on: **Phase 24 — Docs: tell the truth about completion status, and make a fresh clone work**
+(Phase 23 is DONE in PR #10, which targets PR #9's branch (`fix/phase22-request-and-ledger-integrity`), NOT
+main. The chain is now #4 -> #5 -> #6 -> #7 -> #8 -> #9 -> #10, all seven unmerged: merge in that order.
+Phase 24 must branch from `fix/phase23-timeout-diagnostics` unless #10 has merged.
+`gh pr view 4 5 6 7 8 9 10` before starting.)
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1848,25 +1848,95 @@ on the request path (cheap — the directory holds <= 2 files — but not optimi
 ---
 
 ## Phase 23 — Report a stream timeout as a timeout, and send the auth header the LM Studio probe omits
-Status: **not started**
+Status: **DONE** — PR #10 (targets `fix/phase22-request-and-ledger-integrity`, NOT main; chain #4..#10, merge in order)
 Ticket: `TICKET-2026-10-01-frontend-probe-and-timeout-diagnostics` (CR-Nanites-harness-0005 medium, 0029 medium)
 
-Deliverable: `stream()`'s catch distinguishes the two abort causes (`TimeoutError` vs the
-operator's own `abortCtl`), reports a timeout as a timeout, and does NOT fire the LM Studio
-soul-load retry on one — that retry is a second 120 s model load on top of a turn that already ran
-180 s (0005); the agent loop's budget becomes per-iteration while the operator's `abortCtl` stays
-the loop-wide kill switch (0005); `fetchLMSLoaded()` passes `authHeaders()` like all five sibling
-probes (0029).
-Gate: a new frontend suite must first INJECT a fake `AbortSignal`/timer — jsdom here DOES supply
-`AbortSignal.timeout` via Node 24, so the Phase 5 gatelog's claim that it does not is wrong and
-must not be relied on; delete the static and assert the defensive path still resolves. Assert the
-timeout message is not `VERIFY ENDPOINT LINK`, that no retry fires on a timeout, that an operator
-abort still reads as a halt, and that every probe hitting `/api/v0/models` carries the header.
-Stubbing an endpoint without inspecting request headers cannot catch 0029 — every frontend fetch in
-this project is tested for "does it get a 200" and not for "does it send the right headers". Done =
-the operator is sent to debug the component that is actually wrong.
+Gate evidence: `python3 test_e2e.py` -> **0 FAILURES**; `npm run test:front` -> ALL GREEN;
+`tests/frontend/phase23_probe_and_timeout.test.js` -> 0 FAILURES (20 checks);
+`node tests/frontend/phase23_mutcheck.js` -> **6/6 caught, 0 escaped, 1 documented-equivalent,
+0 not applied**. PR: https://github.com/ADn-001/Nanites-harness/pull/10
 
-### Findings
+### Findings (Phase 23)
+
+**THE FIRST ATTEMPT WAS BEHAVIOURALLY INERT, AND EVERY ASSERTION STILL PASSED. Read this
+before trusting any "the loop now has a per-iteration budget" claim.** I built `iterSig` inside
+`runAgentLoop` and threaded it to `callModel` — but `sig` was STILL `streamSignal()`, i.e. it
+still carried `AbortSignal.timeout(180000)`, and all four loop guards tested `sig`. So the
+turn-wide budget was still the binding constraint and the loop died at exactly the same place.
+A second defect rode along: those guards hardcoded `throw new DOMException('Aborted','AbortError')`,
+so when the turn-wide budget DID expire the operator was told `TRANSMISSION HALTED BY OPERATOR`
+and the new `TimeoutError` branch was unreachable from every loop-guard path. An independent
+reviewer caught both. **The fix that actually works separates the two signals**:
+`sig = operatorSignal()` (abortCtl with NO timer) and a fresh `streamSignal()` per model call.
+
+**The lesson generalises: a per-iteration signal that is not the binding constraint is a
+comment, not a fix.** Ask what already holds the constraint at the NEXT line, not just whether
+the new thing exists.
+
+**A test whose input cannot distinguish the two implementations pins nothing.** My multi-iteration
+test asserted `chatCalls >= 2` with instant mock replies — and the PRE-FIX build passed it,
+because both builds finished all 12 iterations. Fixed by (a) ~200 ms per model call and (b) a
+600 ms budget against ~2.4 s of work. Measured A/B on the shipped fixture: **pre-fix stops at 3
+iterations, post-fix completes 12.** This is the whole test. Do not "simplify" the latency away.
+
+**jsdom landmines hit in this phase, both of which fail for reasons unrelated to the defect:**
+- The stream pump reads **`response.body.getReader()`**, NOT a string `body`. A fake that sets
+  `body` to the SSE text dies with `body.getReader is not a function` — the turn aborts for a
+  reason that has nothing to do with the budget. Copy the reader shape from
+  `phase17_agent_turn.test.js`'s `sseBody()`.
+- `TextDecoder` is not wired to the fake body in jsdom (the Phase 13/14/17 landmine). Without
+  the stub every iteration decodes to nothing.
+- `send()` returns early with `alert('NO SOUL-MODEL SELECTED')` when `settings.model` is empty,
+  so an **unseeded** app never starts a turn and the transcript assertions read empty. Seed
+  `cogitator.settings` with a real model (see `baseSettings()`).
+- `c` is a local in `stream()`, not a global: read transcripts via `active().messages`, or
+  `win.eval('c.messages...')` throws `ReferenceError`.
+
+**`STREAM_BUDGET_MS` is `let`, not `const`, ON PURPOSE.** It exists so the 180 s budget is
+reachable from a test in milliseconds instead of three minutes. Production never assigns it.
+Do not "tidy" it back to `const` — that makes this class of defect untestable.
+
+**A loose regex made this defect pass on the broken code.** `check(/timed out/i)` was satisfied
+by the raw error text `The operation timed out.` sitting inside `[ RITE FAILED: ... ]`. The
+assertion now requires the bracketed notice the catch block itself emits.
+
+**A guard that reads prose cannot see the difference between a rule and a ban.** My first
+0005(d) check sliced the source and grepped for `TimeoutError` — which **my own explanatory
+comment** satisfied, so it stayed green with the feature deleted. Replaced with a behavioural
+assertion: the loop-wide signal reports no cause when un-fired, i.e. it is not a timer.
+
+**MUTATION NOTE — 1 documented-equivalent, and it is NOT a test gap.** Replacing
+`throwAbort(sig)` with a hardcoded `'AbortError'` at the loop guards leaves the suite GREEN,
+because `sig` is now `operatorSignal()` and the only thing that ever aborts it is
+`halt() -> abortCtl.abort()` with no reason argument. The branches **cannot** differ there.
+Verified by reading the only `.abort()` call site. Do not spend an hour writing a test for it —
+a test would have to mock a reason onto `sig`, which asserts the code's shape, not its
+behaviour. The guarantee that actually matters (a budget expiry is NEVER reported as an
+operator halt) is pinned behaviourally by tests 0005(f)/(g), which drive a genuinely slow model
+call and assert the report is a timeout.
+
+**The mutation harness runs in a temp-dir COPY of the project.** An earlier version rewrote
+`index.html` in place and restored it in a `finally` — a live mutation on a tracked file, where
+a SIGKILL or a parallel session's commit leaves a mutated tree that then goes green and is
+pushed. The sandbox symlinks `node_modules`; it never writes to the working tree, and it
+verifies the repo copy is byte-identical at the end rather than assuming the restore worked.
+
+**Editing `index.html` invalidates `sw.js`'s asset digests** and `test_e2e.py` fails with
+`sw.js asset digests are stale`. Run `python3 tools/gen_sw_cache.py --write` before the Python
+suite. This is the only generated file; do not hand-edit the digest.
+
+**Fixed but worth knowing:** the soul-load retry is now suppressed ONLY for `TimeoutError`. A
+genuine endpoint fault on LM Studio still fires it, and there is a positive-direction control
+asserting exactly that — without it, a guard that suppressed everything would satisfy the
+timeout assertion while silently disabling recovery.
+
+**NOT FIXED — inherited:** (1) each per-iteration `streamSignal()` creates an
+`AbortSignal.timeout` whose timer is never cleared, so a 12-iteration turn can leave up to 12
+live 180 s timers; (2) `anySignal()` falls back to `signals[0]` when `AbortSignal.any` is
+missing, which is `abortCtl.signal` — so on such a platform the per-iteration signal carries
+**no budget at all** and a hung call hangs forever (pre-existing, but the fix leans on it
+harder now); (3) `STREAM_BUDGET_MS` is not operator-configurable, so the timeout notice says
+"RAISE THE BUDGET" with no indicated mechanism — wording could be softened or wired to settings.
 
 ---
 
