@@ -1,6 +1,10 @@
 # GATELOG — COGITATOR feature work tracker
 
-Next phase to work on: **Phase 18 — Sidecar: RLock the model lock, bound the pool, fence child teardown by generation**
+Next phase to work on: **Phase 19 — Daemon auth: per-install token on privileged routes, provenance-checked atomic start**
+(Phase 18 is DONE but sits in PR #5, which targets PR #4's branch, NOT main — if #4 and #5 are
+still unmerged when the next run starts, Phase 19 will conflict with both. Check `gh pr view 4 5`
+before starting, and branch from `feat/phase16-bridge-jail` unless #4 has merged, in which case
+branch from main.)
 
 Format: current phase first. A phase is DONE only when its dedicated e2e suite is green and
 the regression suite (`python3 test_e2e.py`) still reports `0 FAILURES`.
@@ -1335,8 +1339,12 @@ Evidence: `npm test` -> FRONTEND SUITE: ALL GREEN (20 files) + `0 FAILURES` from
 ---
 
 ## Phase 18 — Sidecar: RLock the model lock, bound the pool, fence child teardown by generation
-Status: **not started**
+Status: **DONE** (two review rounds: an independent review of the first cut, then a mutation
+re-run — see Findings)
 Ticket: `TICKET-2026-10-01-sidecar-concurrency-deadlock` (CR-Nanites-harness-0010 critical, 0019 high, 0020 high)
+PR: **#5** — https://github.com/ADn-001/Nanites-harness/pull/5
+**Targets `feat/phase16-bridge-jail` (PR #4), NOT main. Merge #4 first.** One commit on top of
+it; same files, so it cannot be reviewed or merged alone.
 
 Deliverable: `localmodels/needle_backend.py` `_LOCK` becomes `threading.RLock()` (0010);
 `MODEL_POOL` gains a queue bound plus `future.cancel()` on the timeout path so a stale work item
@@ -1352,6 +1360,73 @@ which is precisely why a guaranteed deadlock shipped green. Done = the documente
 configuration serves a first `/repair` and a child reap cannot fail the live child's work.
 
 ### Findings
+
+- **The phase was already ~90% implemented on disk, uncommitted, when this run picked it up.**
+  A prior session exited mid-phase: 1015 lines of changes across `needle_backend.py`,
+  `local_models_daemon.py`, `test_e2e.py` and a new `tools/mutate_phase18.py`, with no commit
+  and no gatelog update. **Resume means "verify the claim", not "trust the tree"** — the suite
+  was run first and was green, which is exactly what a nearly-finished phase looks like.
+- **`NEEDLE_WEIGHTS` had 0 occurrences in the whole suite.** That is the mechanical reason a
+  *guaranteed* deadlock (CR-0010) shipped green: `repair()` holds `_LOCK` across `_build()`,
+  which re-acquires it on the tuned-weights path. The gate now sets it to a real file, and the
+  assertion is a `thread.join(timeout)` — a deadlock must **fail**, not stall the run. Do not
+  "simplify" that case back into a plain call; the timeout is the assertion.
+- **A green suite and a green mutation harness both missed four real defects.** The first cut
+  scored 11/12 caught, 0 escaped — and an independent review of the same diff found four more,
+  all in the CR-0020 fence. The common shape: **each needs a case with NO request in flight, or
+  a respawn reordered against a stamp**, and every existing case had a request registered.
+  - `self.loaded = False` sat **after** `if not doomed: return False`, so a child dying
+    *between* two requests (the ordinary case — an idle reap, or a crash while idle) stayed
+    `loaded=True` forever and `/health` reported a live engine that no longer existed.
+  - the same reset was also **unfenced**, so a dying child's teardown cleared the flag on a
+    newer, live, loaded child — CR-0020 again, one line below where it was being fixed.
+    Fix: fence the flag by `generation == self._generation` and reset it **inside** the lock,
+    independent of whether any request was doomed.
+  - `_stamp` re-read `self._generation` *after* releasing `_proc_lock` and `_write_lock`, so a
+    respawn in that window re-bound the request to the NEW child and the teardown of the child
+    actually serving it never matched. Fix: capture the generation in `_write` under
+    `_write_lock` (next to the proc handle, which *is* the identity) and **pass it in**;
+    `_stamp(rid, generation)` now requires it, for the same reason `_fail_pending` does.
+  - `_read_stdout` popped `_futures` with **no lock**, against a drain whose atomicity claim
+    rests on holding it. Now `_take_future(rid)`.
+  **The lesson generalises: a mutation harness proves the guards you thought to write. It does
+  not enumerate the guards nobody wrote.** Spawn the review pass even when the harness is green.
+- **The `loaded` flag is a second, independent fence — remember it when touching child
+  teardown.** The phase was scoped as "don't fail the live child's *requests*", and the flag was
+  left outside that scope for a full round. When a fence is introduced, ask what *else* the
+  stale actor can corrupt.
+- **A killed harness run leaks a live mutation, and the next run scores it as a pass.** An
+  outer 420 s tool timeout killed `mutate_phase18.py` mid-sweep with M15 applied. The next run
+  inherited the dirty file, so M15's own pattern matched nothing and scored **`no-change` —
+  which reads exactly like a pass** — and M2, a documented equivalent, went red for reasons
+  unrelated to M2. Three harness results were wrong and none of them said so.
+  - Fixed at the class level: `tools/mutate_phase18.py` now calls `assert_clean_tree()` and
+    **refuses to score** unless `needle_backend.py` and `local_models_daemon.py` match
+    `git HEAD`. A harness that measures a dirty tree measures someone else's edit.
+  - Two anchors had gone stale (`M12` named the pre-fix comment and the old `_stamp(rid)`
+    call). `no-change` is a *finding*, not a neutral outcome — treat it as "my anchor is wrong".
+  - **If a run is ever killed, check the tree for the marker before believing anything after
+    it.** Restoring with `git checkout --` would have discarded this phase's real work; the
+    leak was undone with a targeted one-line patch.
+- **`test_e2e.py` has a KNOWN PRE-EXISTING FLAKE at line 210** (the bridge 413 case: the server
+  answers 413 without draining the body, so the client can get an RST instead of a response).
+  It aborts roughly half of all runs *before* the phase-18 block. `mutate_phase18.py`
+  therefore scores **phase-18 cases only** and retries up to 6 attempts; scoring the whole suite
+  would report that flake as a "caught" mutation. Left unfixed — it belongs to whatever phase
+  owns bridge request draining.
+- **Phase ordering note for Phase 22:** it must land after Phase 19 (both edit the servers'
+  body-parsing lines). Phases 16-18 all touch `local_models_daemon.py`, so 19 and 22 are the
+  next two editors of that file.
+- **Repo hygiene done here:** `bridge_daemon.log` was tracked since phase 7/8, is read by no
+  code, and carried absolute paths from another machine (`D:\Projects`, `/tmp/cogwd*`). Removed
+  with `git rm --cached` and `*.log` added to `.gitignore`. `tools/mutate_phase16.py` and
+  `mutate_phase17.py` had a hard-coded `/home/user/projects/Nanites-harness`; both now derive
+  `BASE` from `__file__` (and `os` was already imported in both). Scanned every added line for
+  secrets, absolute paths and private IPs: none.
+- **Verification, at close:** `test_e2e.py` 195 ok / 0 FAILURES (12 phase-18 cases);
+  `npm run test:front` ALL GREEN; `mutate_phase18.py` **16 mutations, 15 caught, 0 escaped,
+  1 documented equivalent** (M2: dropping the inner `with _LOCK:` in `_build` is unobservable
+  because `repair()`/`load()` already hold the reentrant lock — kept as defence in depth).
 
 ---
 

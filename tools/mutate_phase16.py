@@ -19,7 +19,10 @@ import subprocess
 import sys
 import tempfile
 
-BASE = "/home/user/projects/Nanites-harness"
+# Derived from this file's location, never a hard-coded absolute path: this repo is
+# shared, and a personal home path in a tracked file is both a leak and wrong on every
+# other machine (the convention gen_git_policy.py already follows).
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = [sys.executable, "test_e2e.py"]
 JS = ["node", "tests/frontend/phase16_git_policy.test.js"]
 

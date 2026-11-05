@@ -14,3 +14,8 @@ localmodels/.localmodels-env
 # repo is share-ready — bytecode must never be tracked.
 __pycache__/
 *.py[cod]
+
+# Daemon runtime logs. bridge_daemon.log was tracked by accident in phase 7/8 and
+# only ever accumulated e2e-harness churn; no code reads it. `git rm --cached` so the
+# file stays on disk (the daemon appends to it) while the repo stops carrying it.
+*.log

@@ -81,7 +81,77 @@ BACKEND = needle_backend.NeedleBackend(generation=NEEDLE_GENERATION)
 # thread can return a bounded, degraded answer when the engine overruns. /select shares it:
 # the engine bakes the candidate tools in, so both are the same model call on the same
 # process-global instance, and serialising them keeps that instance single-threaded.
-MODEL_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix='needle')
+#
+# The queue is BOUNDED (CR-Nanites-harness-0019). A ThreadPoolExecutor's work queue is
+# unbounded by default, so N concurrent /repair calls queued N items behind one worker -
+# and because the timeout path did not cancel, a caller that had ALREADY given up left
+# its item behind as well. The worker then spent its life producing answers nobody would
+# ever read, while every later request timed out behind them. Refusing past the bound is
+# the honest answer: the engine is saturated, and saying so beats an unbounded queue.
+MODEL_POOL_MAX_QUEUE = 4
+
+
+class ModelBusy(Exception):
+    """The single model worker is saturated past MODEL_POOL_MAX_QUEUE."""
+
+
+class _BoundedModelPool:
+    """The single needle worker behind a FINITE admission queue.
+
+    `submit` raises ModelBusy rather than queueing without limit. The count is
+    admission-based (submitted, not yet finished), so a finished item frees its slot
+    whether it succeeded, raised, or timed out.
+    """
+
+    def __init__(self, max_workers=1, max_queue=MODEL_POOL_MAX_QUEUE, **kw):
+        self._pool = ThreadPoolExecutor(max_workers=max_workers, **kw)
+        self._max_queue = max_queue
+        self._lock = threading.Lock()
+        self._admitted = 0
+
+    @property
+    def max_queue(self):
+        return self._max_queue
+
+    def submit(self, fn, *args, **kwargs):
+        # The whole admission check happens under one lock, and the increment happens
+        # with it: two callers racing past the bound cannot both observe the last slot
+        # as free.
+        with self._lock:
+            if self._admitted >= self._max_queue:
+                raise ModelBusy('model pool saturated (%d in flight)' % self._admitted)
+            self._admitted += 1
+        try:
+            fut = self._pool.submit(fn, *args, **kwargs)
+        except Exception:
+            self._release()
+            raise
+        fut.add_done_callback(lambda _f: self._release())
+        return fut
+
+    def _release(self):
+        with self._lock:
+            if self._admitted > 0:
+                self._admitted -= 1
+
+    def shutdown(self, wait=True):
+        return self._pool.shutdown(wait=wait)
+
+
+MODEL_POOL = _BoundedModelPool(max_workers=1, thread_name_prefix='needle')
+
+
+def submit_model_call(fn, *args, **kwargs):
+    """Admit one model call, or raise ModelBusy. Callers degrade, never 500.
+
+    The returned future is cancelled by the caller on its timeout path - see
+    `_repair_call` - so a stale work item does not occupy the single worker after
+    the caller has stopped waiting for it. `cancel()` only succeeds while the item is
+    still QUEUED; a call already executing must be allowed to finish, because the
+    engine is a process-global instance and tearing it down mid-call would be worse
+    than the wait. That is why the bound exists: it caps how many can be waiting.
+    """
+    return MODEL_POOL.submit(fn, *args, **kwargs)
 
 # The Laya child manager; created in main() when Laya is enabled (None => never spawned).
 LAYA = None
@@ -115,6 +185,12 @@ class LayaChild:
         self._futures = {}
         self._inflight = 0
         self._next_id = 0
+        # Monotonic child identity (CR-Nanites-harness-0020). Every spawn bumps it.
+        # A child's reader threads capture the value it was spawned with, so a DYING
+        # child can tell that it is no longer the current one and must not fail the
+        # live child's pending requests - a dead child's EOF says nothing about work
+        # running against its successor.
+        self._generation = 0
         self.stderr_tail = collections.deque(maxlen=20)
 
     # ---- process lifecycle ----
@@ -133,13 +209,21 @@ class LayaChild:
         self.pid = proc.pid
         self.loaded = False
         self.last_used = time.monotonic()
-        threading.Thread(target=self._read_stdout, args=(proc,), daemon=True,
+        # Claim the next generation BEFORE the readers start: a reader must never be
+        # able to observe itself as current after a respawn has already replaced it.
+        # Bumped under _fut_lock so the bump is ordered against `_fail_pending`'s
+        # fence+drain critical section - that pairing is what makes CR-0020's fix
+        # atomic rather than a TOCTOU (see _fail_pending).
+        with self._fut_lock:
+            self._generation += 1
+            gen = self._generation
+        threading.Thread(target=self._read_stdout, args=(proc, gen), daemon=True,
                          name='laya-stdout').start()
         threading.Thread(target=self._read_stderr, args=(proc,), daemon=True,
                          name='laya-stderr').start()
         return proc
 
-    def _read_stdout(self, proc):
+    def _read_stdout(self, proc, generation):
         """Parse one JSON object per stdout line and hand it to the waiting future."""
         try:
             for line in proc.stdout:
@@ -154,13 +238,14 @@ class LayaChild:
                     continue
                 if not isinstance(msg, dict):
                     continue
-                fut = self._futures.pop(msg.get('id'), None)
-                if fut is not None and not fut.done():
-                    fut.set_result(msg)
+                fut = self._take_future(msg.get('id'))
+                if fut is not None:
+                    if not fut.done():
+                        fut.set_result(msg)
         except Exception:
             pass
         finally:
-            self._fail_pending(ChildGone('child stdout closed'))
+            self._fail_pending(ChildGone('child stdout closed'), generation)
 
     def _read_stderr(self, proc):
         try:
@@ -169,21 +254,66 @@ class LayaChild:
         except Exception:
             pass
 
-    def _fail_pending(self, exc):
+    def _fail_pending(self, exc, generation):
+        """Fail every in-flight request - but ONLY those belonging to `generation`.
+
+        `generation` is a REQUIRED parameter, deliberately. An optional one defaulting to
+        None leaves the pre-0020 "fail everything, scoped to nothing" behaviour reachable,
+        so a future call site that forgets the argument silently reinstates the bug and
+        every test still passes. Making the signature enforce it means a caller must
+        state WHICH child its teardown is about. There is no unscoped teardown: if some
+        future caller genuinely has no child in hand, it should say so out loud by
+        passing the current `self._generation`, not by omitting the argument.
+        """
+        # The fence and the drain MUST be one critical section. Checking the generation
+        # outside the lock is a TOCTOU: a dying child's reader could pass the check,
+        # then a respawn could bump the generation and REGISTER a new request, and the
+        # drain would then fail that brand-new request - exactly CR-0020. Because
+        # `_spawn_locked` bumps `_generation` under this same lock, holding it across
+        # both makes the two orderings exhaustive: either the drain completes before the
+        # respawn (and only touches the old child's requests), or it starts after (and
+        # sees a generation that no longer matches, so it is a no-op).
+        #
+        # The fence is PER REQUEST, not per child: a stale teardown must still fail the
+        # requests that belonged to the child that died. Returning early on a generation
+        # mismatch would leave those futures unresolved until their caller's timeout -
+        # the work is genuinely gone, and a dead child's work must be failed, just not
+        # its successor's. Each entry records the generation it was registered against,
+        # so exactly the dying child's requests are failed and nothing else.
         with self._fut_lock:
-            pending = list(self._futures.values())
-            self._futures = {}
-        self.loaded = False
-        for fut in pending:
+            doomed = [fut for (gen, fut) in self._futures.values() if gen == generation]
+            for rid in [r for r, (gen, _f) in self._futures.items() if gen == generation]:
+                self._futures.pop(rid, None)
+            # `loaded` describes THE CHILD, so it is fenced by the child's own identity
+            # rather than by whether it had work in flight. Two errors meet here, and
+            # both were live in the first cut of this phase:
+            #   - gating the reset on `doomed` left `loaded=True` forever on a child that
+            #     died between two requests (the ordinary case - an idle reap, or a crash
+            #     while idle), so /health reported a live engine that no longer existed;
+            #   - leaving it unfenced let a DYING child's teardown clear the flag on a
+            #     NEWER, live, loaded child, which is CR-0020 all over again one line
+            #     below where it was fixed.
+            # It is only cleared when `generation` is still the current child, i.e. when
+            # this teardown is about the child that exists. A stale teardown touches
+            # nothing but its own already-dead requests.
+            is_current = (generation == self._generation)
+            if is_current:
+                self.loaded = False
+        if not doomed:
+            return False
+        for fut in doomed:
             if not fut.done():
                 fut.set_exception(exc)
+        return True
 
     def _register(self):
         with self._fut_lock:
             self._next_id += 1
             rid = 'ly%d' % self._next_id
             fut = Future()
-            self._futures[rid] = fut
+            # Paired with the generation the request was issued against, so a teardown
+            # can fail exactly ITS OWN child's requests and never a successor's (CR-0020).
+            self._futures[rid] = (self._generation, fut)
             self._inflight += 1
             return rid, fut
 
@@ -205,6 +335,44 @@ class LayaChild:
         finally:
             self._unregister(rid)
 
+    def _stamp(self, rid, generation):
+        """Bind a pending request to the child it was actually WRITTEN to.
+
+        Registration happens BEFORE `_write`, and `_write` may spawn a fresh child (the
+        first request ever, or any request after the previous child died). So the
+        generation captured in `_register` is the generation of the child that was
+        current *then* - which is not necessarily the child that receives the bytes.
+        Without this re-stamp a dying child's teardown misses the very request it was
+        serving, and the caller waits out its whole timeout instead of being told the
+        child is gone (CR-0020 regression, caught by the phase-13 child_gone case).
+
+        `generation` is a REQUIRED argument and must be the identity of the child the
+        bytes went to, captured by `_write` under `_proc_lock`. Reading `self._generation`
+        here instead would re-open exactly the leak this exists to close: the stamp runs
+        after `_proc_lock` and `_write_lock` are both released, so a respawn in that
+        window (any other thread reaching `_write` while the child is being replaced)
+        stamps the request with the NEW child's generation - and then the teardown of the
+        child that is actually serving it never matches. The counter read at stamp time
+        answers "who is current", which is a different question from "who got the bytes".
+        """
+        with self._fut_lock:
+            entry = self._futures.get(rid)
+            if entry is not None:
+                self._futures[rid] = (generation, entry[1])
+
+    def _take_future(self, rid):
+        """Pop a resolved request's future under the lock every mutation holds.
+
+        `_read_stdout` resolves a request from the reader thread while `_fail_pending`
+        drains the same dict. The drain's whole atomicity claim rests on the fence and
+        the drain being ONE critical section, which is only true if every writer takes
+        the lock - an unlocked `pop` here lets the reader interleave with the drain's
+        iteration (CR-0020).
+        """
+        with self._fut_lock:
+            entry = self._futures.pop(rid, None)
+        return entry[1] if entry is not None else None
+
     def _write(self, rid, payload):
         with self._proc_lock:
             if not self.alive():
@@ -213,22 +381,35 @@ class LayaChild:
             proc = self._proc
             if proc is None or proc.poll() is not None:
                 raise ChildGone('child gone')
+            # The child's identity is captured HERE, under the same lock that chose the
+            # proc handle, and is what the bytes are about to be written to. It is read
+            # once and carried, never re-read after the locks are dropped.
+            gen = self._generation
             self.last_used = time.monotonic()
             try:
                 proc.stdin.write(json.dumps(dict(payload, id=rid)) + '\n')
                 proc.stdin.flush()
             except Exception as e:
                 raise ChildGone('child stdin closed: %s' % e)
+        # The bytes are with THAT child now - bind the request to it.
+        self._stamp(rid, gen)
 
     def shutdown(self):
-        """Politely close (op:'close') then kill; never raises; clears pid/loaded."""
+        """Politely close (op:'close') then kill; never raises; clears pid/loaded.
+
+        The generation is captured together with the proc handle, so the teardown
+        fails exactly the requests that were in flight against THAT child. If a
+        respawn has already happened, the captured generation no longer matches and
+        the teardown is a no-op instead of failing the new child's work (CR-0020).
+        """
         with self._proc_lock:
             proc = self._proc
+            gen = self._generation
             self._proc = None
         self.pid = None
         self.loaded = False
         if proc is None or proc.poll() is not None:
-            self._fail_pending(ChildGone('child closed'))
+            self._fail_pending(ChildGone('child closed'), gen)
             return
         try:
             stdin = proc.stdin
@@ -246,7 +427,7 @@ class LayaChild:
             except Exception: pass
             try: proc.wait(timeout=1.0)
             except Exception: pass
-        self._fail_pending(ChildGone('child closed'))
+        self._fail_pending(ChildGone('child closed'), gen)
 
     def maybe_reap(self, idle_s):
         """Kill the child if it has been idle for more than idle_s (0 disables)."""
@@ -453,10 +634,21 @@ def _repair_call(suspect, candidates, timeout_ms, trace_id):
                 'confidence': None, 'reasoning': ''}
     timeout_s = max(timeout_ms, 1) / 1000.0
     text = needle_backend.build_repair_prompt(suspect)
-    future = MODEL_POOL.submit(BACKEND.repair, text, candidates)
+    try:
+        future = submit_model_call(BACKEND.repair, text, candidates)
+    except ModelBusy:
+        return {'ok': False, 'degraded': True, 'reason': 'engine busy',
+                'latency_ms': elapsed(), 'trace_id': trace_id, 'calls': [],
+                'confidence': None, 'reasoning': ''}
     try:
         res = future.result(timeout=timeout_s)
     except TimeoutError:
+        # Abandon the work item (CR-Nanites-harness-0019). Without this the caller
+        # stops waiting but the item stays queued, and the single worker keeps
+        # computing an answer nobody will read while every later request queues
+        # behind it. cancel() is False when the call is already RUNNING; that is
+        # deliberate and is why the queue is bounded.
+        future.cancel()
         if getattr(BACKEND, '_tools_key', None) is None:
             # The engine was still (re)building for this candidate set when the budget
             # expired - 'needle loading', not a model timeout.
@@ -509,10 +701,18 @@ def _select_call(input_text, candidates, timeout_ms, trace_id):
     text = needle_backend.build_select_prompt(input_text, candidates)
     # The Needle engine bakes the tools in at construction and answers one prompt with one
     # envelope, so a proposal is the same model call as a repair - only the prompt differs.
-    future = MODEL_POOL.submit(BACKEND.repair, text, candidates)
+    # Same bounded admission and same cancel-on-timeout as _repair_call (CR-Nanites-harness-0019):
+    # /select shares the ONE worker, so an unbounded queue here starves /repair identically.
+    try:
+        future = submit_model_call(BACKEND.repair, text, candidates)
+    except ModelBusy:
+        return {'ok': False, 'degraded': True, 'reason': 'engine busy',
+                'latency_ms': elapsed(), 'trace_id': trace_id, 'calls': [],
+                'confidence': None, 'reasoning': ''}
     try:
         res = future.result(timeout=timeout_s)
     except TimeoutError:
+        future.cancel()
         if getattr(BACKEND, '_tools_key', None) is None:
             # The engine was still (re)building for this candidate set when the budget
             # expired - 'needle loading', not a model timeout.
